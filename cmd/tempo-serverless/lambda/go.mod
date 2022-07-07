@@ -92,7 +92,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/prometheus/client_golang v1.12.1 // indirect
 	github.com/prometheus/client_model v0.2.0 // indirect
-	github.com/prometheus/common v0.32.1 // indirect
+	github.com/prometheus/common v0.35.0 // indirect
 	github.com/prometheus/node_exporter v1.0.0-rc.0.0.20200428091818-01054558c289 // indirect
 	github.com/prometheus/procfs v0.7.3 // indirect
 	github.com/prometheus/prometheus v1.8.2-0.20220228151929-e25a59925555 // indirect
