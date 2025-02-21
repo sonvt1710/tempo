@@ -131,15 +131,15 @@ func (w *GzipResponseWriter) Write(b []byte) (int, error) {
 
 			// If the Content-Length is larger than minSize or the current buffer is larger than minSize, then continue.
 			if cl >= w.minSize || len(w.buf) >= w.minSize {
-				// If a Content-Type wasn't specified, infer it from the current buffer.
-				if ct == "" {
+				// If a Content-Type wasn't specified, infer it from the current buffer when the response has a body.
+				if ct == "" && bodyAllowedForStatus(w.code) && len(w.buf) > 0 {
 					ct = http.DetectContentType(w.buf)
-				}
 
-				// Handles the intended case of setting a nil Content-Type (as for http/server or http/fs)
-				// Set the header only if the key does not exist
-				if _, ok := hdr[contentType]; w.setContentType && !ok {
-					hdr.Set(contentType, ct)
+					// Handles the intended case of setting a nil Content-Type (as for http/server or http/fs)
+					// Set the header only if the key does not exist
+					if _, ok := hdr[contentType]; w.setContentType && !ok {
+						hdr.Set(contentType, ct)
+					}
 				}
 
 				// If the Content-Type is acceptable to GZIP, initialize the GZIP writer.
@@ -167,6 +167,10 @@ func (w *GzipResponseWriter) Write(b []byte) (int, error) {
 		}
 	}
 	return len(b), nil
+}
+
+func (w *GzipResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
@@ -298,7 +302,15 @@ func (w *GzipResponseWriter) startPlain() error {
 }
 
 // WriteHeader just saves the response code until close or GZIP effective writes.
+// In the specific case of 1xx status codes, WriteHeader is directly calling the wrapped ResponseWriter.
 func (w *GzipResponseWriter) WriteHeader(code int) {
+	// Handle informational headers
+	// This is gated to not forward 1xx responses on builds prior to go1.20.
+	if code >= 100 && code <= 199 {
+		w.ResponseWriter.WriteHeader(code)
+		return
+	}
+
 	if w.code == 0 {
 		w.code = code
 	}
@@ -312,6 +324,20 @@ func (w *GzipResponseWriter) init() {
 	w.gw = w.gwFactory.New(w.ResponseWriter, w.level)
 }
 
+// bodyAllowedForStatus reports whether a given response status code
+// permits a body. See RFC 7230, section 3.3.
+func bodyAllowedForStatus(status int) bool {
+	switch {
+	case status >= 100 && status <= 199:
+		return false
+	case status == 204:
+		return false
+	case status == 304:
+		return false
+	}
+	return true
+}
+
 // Close will close the gzip.Writer and will put it back in the gzipWriterPool.
 func (w *GzipResponseWriter) Close() error {
 	if w.ignore {
@@ -323,7 +349,18 @@ func (w *GzipResponseWriter) Close() error {
 			ce = w.Header().Get(contentEncoding)
 			cr = w.Header().Get(contentRange)
 		)
-		// fmt.Println(len(w.buf) == 0, len(w.buf) < w.minSize, len(w.Header()[HeaderNoCompression]) != 0, ce != "", cr != "", !w.contentTypeFilter(ct))
+
+		// Detects the response content-type when it does not exist and the response has a body.
+		if ct == "" && bodyAllowedForStatus(w.code) && len(w.buf) > 0 {
+			ct = http.DetectContentType(w.buf)
+
+			// Handles the intended case of setting a nil Content-Type (as for http/server or http/fs)
+			// Set the header only if the key does not exist
+			if _, ok := w.Header()[contentType]; w.setContentType && !ok {
+				w.Header().Set(contentType, ct)
+			}
+		}
+
 		if len(w.buf) == 0 || len(w.buf) < w.minSize || len(w.Header()[HeaderNoCompression]) != 0 || ce != "" || cr != "" || !w.contentTypeFilter(ct) {
 			// GZIP not triggered, write out regular response.
 			return w.startPlain()
@@ -358,7 +395,8 @@ func (w *GzipResponseWriter) Flush() {
 			cr    = w.Header().Get(contentRange)
 		)
 
-		if ct == "" {
+		// Detects the response content-type when it does not exist and the response has a body.
+		if ct == "" && bodyAllowedForStatus(w.code) && len(w.buf) > 0 {
 			ct = http.DetectContentType(w.buf)
 
 			// Handles the intended case of setting a nil Content-Type (as for http/server or http/fs)
@@ -443,6 +481,11 @@ func NewWrapper(opts ...option) (func(http.Handler) http.HandlerFunc, error) {
 	return func(h http.Handler) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(vary, acceptEncoding)
+			if c.allowCompressedRequests && contentGzip(r) {
+				r.Header.Del(contentEncoding)
+				r.Body = &gzipReader{body: r.Body}
+			}
+
 			if acceptsGzip(r) {
 				gw := grwPool.Get().(*GzipResponseWriter)
 				*gw = GzipResponseWriter{
@@ -515,17 +558,18 @@ func (pct parsedContentType) equals(mediaType string, params map[string]string) 
 
 // Used for functional configuration.
 type config struct {
-	minSize          int
-	level            int
-	writer           writer.GzipWriterFactory
-	contentTypes     func(ct string) bool
-	keepAcceptRanges bool
-	setContentType   bool
-	suffixETag       string
-	dropETag         bool
-	jitterBuffer     int
-	randomJitter     string
-	sha256Jitter     bool
+	minSize                 int
+	level                   int
+	writer                  writer.GzipWriterFactory
+	contentTypes            func(ct string) bool
+	keepAcceptRanges        bool
+	setContentType          bool
+	suffixETag              string
+	dropETag                bool
+	jitterBuffer            int
+	randomJitter            string
+	sha256Jitter            bool
+	allowCompressedRequests bool
 }
 
 func (c *config) validate() error {
@@ -555,6 +599,15 @@ type option func(c *config)
 func MinSize(size int) option {
 	return func(c *config) {
 		c.minSize = size
+	}
+}
+
+// AllowCompressedRequests will enable or disable RFC 7694 compressed requests.
+// By default this is Disabled.
+// See https://datatracker.ietf.org/doc/html/rfc7694
+func AllowCompressedRequests(b bool) option {
+	return func(c *config) {
+		c.allowCompressedRequests = b
 	}
 }
 
@@ -729,6 +782,12 @@ func RandomJitter(n, buffer int, paranoid bool) option {
 			c.jitterBuffer = 0
 		}
 	}
+}
+
+// contentGzip returns true if the given HTTP request indicates that it gzipped.
+func contentGzip(r *http.Request) bool {
+	// See more detail in `acceptsGzip`
+	return r.Method != http.MethodHead && r.Body != nil && parseEncodingGzip(r.Header.Get(contentEncoding)) > 0
 }
 
 // acceptsGzip returns true if the given HTTP request indicates that it will
@@ -919,6 +978,10 @@ func atoi(s string) (int, bool) {
 	return int(i64), err == nil
 }
 
+type unwrapper interface {
+	Unwrap() http.ResponseWriter
+}
+
 // newNoGzipResponseWriter will return a response writer that
 // cleans up compression artifacts.
 // Depending on whether http.Hijacker is supported the returned will as well.
@@ -929,10 +992,12 @@ func newNoGzipResponseWriter(w http.ResponseWriter) http.ResponseWriter {
 			http.ResponseWriter
 			http.Hijacker
 			http.Flusher
+			unwrapper
 		}{
 			ResponseWriter: n,
 			Hijacker:       hj,
 			Flusher:        n,
+			unwrapper:      n,
 		}
 		return x
 	}
@@ -981,4 +1046,8 @@ func (n *NoGzipResponseWriter) WriteHeader(statusCode int) {
 		n.hdrCleaned = true
 	}
 	n.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (n *NoGzipResponseWriter) Unwrap() http.ResponseWriter {
+	return n.ResponseWriter
 }

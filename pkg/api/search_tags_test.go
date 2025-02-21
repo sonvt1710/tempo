@@ -12,9 +12,10 @@ import (
 // TestParseSearchTagValues tests the SearchTagValues function
 func TestParseSearchTagValuesRequest(t *testing.T) {
 	tcs := []struct {
-		tagName, query string
-		enforceTraceQL bool
-		expectError    bool
+		tagName, query  string
+		enforceTraceQL  bool
+		expectError     bool
+		expectedTagName string
 	}{
 		{
 			expectError: true,
@@ -41,6 +42,14 @@ func TestParseSearchTagValuesRequest(t *testing.T) {
 			query:          `{"foo":"bar"}`,
 			enforceTraceQL: true,
 		},
+		{
+			tagName:         "span.encoded%2FtagName",
+			expectedTagName: "span.encoded/tagName",
+		},
+		{
+			tagName:         "span.encoded%2DtagName",
+			expectedTagName: "span.encoded-tagName",
+		},
 	}
 
 	for _, tc := range tcs {
@@ -50,14 +59,19 @@ func TestParseSearchTagValuesRequest(t *testing.T) {
 		}
 
 		httpReq := httptest.NewRequest("GET", url, nil)
-		r := mux.SetURLVars(httpReq, map[string]string{muxVarTagName: tc.tagName})
+		r := mux.SetURLVars(httpReq, map[string]string{MuxVarTagName: tc.tagName})
 
 		req, err := parseSearchTagValuesRequest(r, tc.enforceTraceQL)
 		if tc.expectError {
 			require.Error(t, err)
 			continue
 		}
-		require.Equal(t, tc.tagName, req.TagName)
+
+		expectedTagName := tc.expectedTagName
+		if expectedTagName == "" {
+			expectedTagName = tc.tagName
+		}
+		require.Equal(t, expectedTagName, req.TagName)
 	}
 }
 

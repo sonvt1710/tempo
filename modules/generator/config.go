@@ -1,38 +1,50 @@
 package generator
 
 import (
+	"errors"
 	"flag"
+	"fmt"
+	"os"
 	"time"
-
-	"github.com/pkg/errors"
 
 	"github.com/grafana/tempo/modules/generator/processor/localblocks"
 	"github.com/grafana/tempo/modules/generator/processor/servicegraphs"
 	"github.com/grafana/tempo/modules/generator/processor/spanmetrics"
 	"github.com/grafana/tempo/modules/generator/registry"
 	"github.com/grafana/tempo/modules/generator/storage"
+	"github.com/grafana/tempo/pkg/ingest"
 	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/wal"
 )
 
 const (
-	// RingKey is the key under which we store the metric-generator's ring in the KVStore.
-	RingKey = "metrics-generator"
+	// generatorRingKey is the default key under which we store the metric-generator's ring in the KVStore.
+	generatorRingKey = "metrics-generator"
 
 	// ringNameForServer is the name of the ring used by the metrics-generator server.
 	ringNameForServer = "metrics-generator"
+
+	ConsumerGroup = "metrics-generator"
 )
 
 // Config for a generator.
 type Config struct {
-	Ring      RingConfig      `yaml:"ring"`
-	Processor ProcessorConfig `yaml:"processor"`
-	Registry  registry.Config `yaml:"registry"`
-	Storage   storage.Config  `yaml:"storage"`
-	TracesWAL wal.Config      `yaml:"traces_storage"`
-	// MetricsIngestionSlack is the max amount of time passed since a span's start time
+	Ring           RingConfig      `yaml:"ring"`
+	Processor      ProcessorConfig `yaml:"processor"`
+	Registry       registry.Config `yaml:"registry"`
+	Storage        storage.Config  `yaml:"storage"`
+	TracesWAL      wal.Config      `yaml:"traces_storage"`
+	TracesQueryWAL wal.Config      `yaml:"traces_query_storage"`
+	// MetricsIngestionSlack is the max amount of time passed since a span's end time
 	// for the span to be considered in metrics generation
 	MetricsIngestionSlack time.Duration `yaml:"metrics_ingestion_time_range_slack"`
+	QueryTimeout          time.Duration `yaml:"query_timeout"`
+	OverrideRingKey       string        `yaml:"override_ring_key"`
+
+	// This config is dynamically injected because defined outside the generator config.
+	Ingest            ingest.Config `yaml:"-"`
+	IngestConcurrency uint          `yaml:"ingest_concurrency"`
+	InstanceID        string        `yaml:"instance_id" doc:"default=<hostname>" category:"advanced"`
 }
 
 // RegisterFlagsAndApplyDefaults registers the flags.
@@ -41,10 +53,52 @@ func (cfg *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet)
 	cfg.Processor.RegisterFlagsAndApplyDefaults(prefix, f)
 	cfg.Registry.RegisterFlagsAndApplyDefaults(prefix, f)
 	cfg.Storage.RegisterFlagsAndApplyDefaults(prefix, f)
+	cfg.TracesWAL.RegisterFlags(f)
 	cfg.TracesWAL.Version = encoding.DefaultEncoding().Version()
+	cfg.TracesQueryWAL.RegisterFlags(f)
+	cfg.TracesQueryWAL.Version = encoding.DefaultEncoding().Version()
+	cfg.Ingest.RegisterFlagsAndApplyDefaults(prefix, f)
+	cfg.IngestConcurrency = 16
 
 	// setting default for max span age before discarding to 30s
 	cfg.MetricsIngestionSlack = 30 * time.Second
+	cfg.QueryTimeout = 30 * time.Second
+	cfg.OverrideRingKey = generatorRingKey
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		fmt.Printf("failed to get hostname: %v", err)
+		os.Exit(1)
+	}
+	f.StringVar(&cfg.InstanceID, prefix+".instance-id", hostname, "Instance id.")
+}
+
+func (cfg *Config) Validate() error {
+	if err := cfg.Ingest.Validate(); err != nil {
+		return err
+	}
+
+	if cfg.IngestConcurrency == 0 {
+		return errors.New("ingest concurrency must be greater than zero")
+	}
+
+	if err := cfg.Processor.Validate(); err != nil {
+		return err
+	}
+
+	// Only validate if being used
+	if cfg.TracesWAL.Filepath != "" {
+		if err := cfg.TracesWAL.Validate(); err != nil {
+			return err
+		}
+	}
+	if cfg.TracesQueryWAL.Filepath != "" {
+		if err := cfg.TracesQueryWAL.Validate(); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 type ProcessorConfig struct {
@@ -59,6 +113,10 @@ func (cfg *ProcessorConfig) RegisterFlagsAndApplyDefaults(prefix string, f *flag
 	cfg.LocalBlocks.RegisterFlagsAndApplyDefaults(prefix, f)
 }
 
+func (cfg *ProcessorConfig) Validate() error {
+	return cfg.LocalBlocks.Validate()
+}
+
 // copyWithOverrides creates a copy of the config using values set in the overrides.
 func (cfg *ProcessorConfig) copyWithOverrides(o metricsGeneratorOverrides, userID string) (ProcessorConfig, error) {
 	copyCfg := *cfg
@@ -69,6 +127,9 @@ func (cfg *ProcessorConfig) copyWithOverrides(o metricsGeneratorOverrides, userI
 	if dimensions := o.MetricsGeneratorProcessorServiceGraphsDimensions(userID); dimensions != nil {
 		copyCfg.ServiceGraphs.Dimensions = dimensions
 	}
+	if peerAttrs := o.MetricsGeneratorProcessorServiceGraphsPeerAttributes(userID); peerAttrs != nil {
+		copyCfg.ServiceGraphs.PeerAttributes = peerAttrs
+	}
 	if buckets := o.MetricsGeneratorProcessorSpanMetricsHistogramBuckets(userID); buckets != nil {
 		copyCfg.SpanMetrics.HistogramBuckets = buckets
 	}
@@ -78,7 +139,7 @@ func (cfg *ProcessorConfig) copyWithOverrides(o metricsGeneratorOverrides, userI
 	if dimensions := o.MetricsGeneratorProcessorSpanMetricsIntrinsicDimensions(userID); dimensions != nil {
 		err := copyCfg.SpanMetrics.IntrinsicDimensions.ApplyFromMap(dimensions)
 		if err != nil {
-			return ProcessorConfig{}, errors.Wrap(err, "fail to apply overrides")
+			return ProcessorConfig{}, fmt.Errorf("fail to apply overrides: %w", err)
 		}
 	}
 	if filterPolicies := o.MetricsGeneratorProcessorSpanMetricsFilterPolicies(userID); filterPolicies != nil {
@@ -108,6 +169,29 @@ func (cfg *ProcessorConfig) copyWithOverrides(o metricsGeneratorOverrides, userI
 	if timeout := o.MetricsGeneratorProcessorLocalBlocksCompleteBlockTimeout(userID); timeout > 0 {
 		copyCfg.LocalBlocks.CompleteBlockTimeout = timeout
 	}
+
+	if histograms := o.MetricsGeneratorGenerateNativeHistograms(userID); histograms != "" {
+		copyCfg.ServiceGraphs.HistogramOverride = registry.HistogramModeToValue[string(histograms)]
+		copyCfg.SpanMetrics.HistogramOverride = registry.HistogramModeToValue[string(histograms)]
+	}
+
+	copyCfg.SpanMetrics.DimensionMappings = o.MetricsGeneratorProcessorSpanMetricsDimensionMappings(userID)
+
+	copyCfg.SpanMetrics.EnableTargetInfo = o.MetricsGeneratorProcessorSpanMetricsEnableTargetInfo(userID)
+
+	copyCfg.SpanMetrics.TargetInfoExcludedDimensions = o.MetricsGeneratorProcessorSpanMetricsTargetInfoExcludedDimensions(userID)
+
+	copyCfg.ServiceGraphs.EnableClientServerPrefix = o.MetricsGeneratorProcessorServiceGraphsEnableClientServerPrefix(userID)
+
+	copyCfg.ServiceGraphs.EnableMessagingSystemLatencyHistogram = o.MetricsGeneratorProcessorServiceGraphsEnableMessagingSystemLatencyHistogram(userID)
+
+	copyCfg.ServiceGraphs.EnableVirtualNodeLabel = o.MetricsGeneratorProcessorServiceGraphsEnableVirtualNodeLabel(userID)
+
+	copySubprocessors := make(map[spanmetrics.Subprocessor]bool)
+	for sp, enabled := range cfg.SpanMetrics.Subprocessors {
+		copySubprocessors[sp] = enabled
+	}
+	copyCfg.SpanMetrics.Subprocessors = copySubprocessors
 
 	return copyCfg, nil
 }

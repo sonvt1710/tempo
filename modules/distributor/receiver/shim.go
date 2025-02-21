@@ -7,34 +7,34 @@ import (
 	"time"
 
 	"github.com/go-kit/log/level"
+	dslog "github.com/grafana/dskit/log"
 	"github.com/grafana/dskit/services"
 	zaplogfmt "github.com/jsternberg/zap-logfmt"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/jaegerreceiver"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kafkareceiver"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/opencensusreceiver"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/zipkinreceiver"
-	"github.com/opentracing/opentracing-go"
+	"github.com/prometheus/client_golang/prometheus"
 	prom_client "github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/sirupsen/logrus"
-	"github.com/weaveworks/common/logging"
-	"go.opencensus.io/stats/view"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exportertest"
-	"go.opentelemetry.io/collector/extension"
 	"go.opentelemetry.io/collector/otelcol"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/receiver"
-
 	"go.opentelemetry.io/collector/receiver/otlpreceiver"
-	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/usagestats"
@@ -47,10 +47,13 @@ const (
 
 var (
 	metricPushDuration = promauto.NewHistogram(prom_client.HistogramOpts{
-		Namespace: "tempo",
-		Name:      "distributor_push_duration_seconds",
-		Help:      "Records the amount of time to push a batch to the ingester.",
-		Buckets:   prom_client.DefBuckets,
+		Namespace:                       "tempo",
+		Name:                            "distributor_push_duration_seconds",
+		Help:                            "Records the amount of time to push a batch to the ingester.",
+		Buckets:                         prom_client.DefBuckets,
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: 1 * time.Hour,
 	})
 
 	statReceiverOtlp       = usagestats.NewInt("receiver_enabled_otlp")
@@ -59,6 +62,50 @@ var (
 	statReceiverOpencensus = usagestats.NewInt("receiver_enabled_opencensus")
 	statReceiverKafka      = usagestats.NewInt("receiver_enabled_kafka")
 )
+
+var tracer = otel.Tracer("modules/distributor/receiver")
+
+type RetryableError struct {
+	err error
+	st  *status.Status
+}
+
+func (r *RetryableError) GRPCStatus() *status.Status {
+	return r.st
+}
+
+func (r *RetryableError) Error() string {
+	return r.err.Error()
+}
+
+// wrapErrorIfRetryable wraps the passed in error to meet expectations of the otel collector exporter code:
+// https://github.com/open-telemetry/opentelemetry-collector/blob/d7b49df5d9e922df6ce56ad4b64ee1c79f9dbdbe/exporter/otlpexporter/otlp.go#L172
+// The otel collector considers some errors retryable and other not. "ResourceExhausted" is special in that it requires a
+// RetryInfo detail along with the error code
+func wrapErrorIfRetryable(err error, dur *durationpb.Duration) error {
+	if dur == nil {
+		return err
+	}
+
+	s, ok := status.FromError(err)
+	if !ok {
+		return err
+	}
+
+	if s.Code() != codes.ResourceExhausted {
+		return err
+	}
+
+	// ignore error. code only errors if Code() == ok
+	s, _ = s.WithDetails(&errdetails.RetryInfo{
+		RetryDelay: dur,
+	})
+
+	return &RetryableError{
+		err: err,
+		st:  s,
+	}
+}
 
 type TracesPusher interface {
 	PushTraces(ctx context.Context, traces ptrace.Traces) (*tempopb.PushResponse, error)
@@ -69,12 +116,17 @@ var _ services.Service = (*receiversShim)(nil)
 type receiversShim struct {
 	services.Service
 
-	receivers   []receiver.Traces
-	pusher      TracesPusher
-	logger      *log.RateLimitedLogger
-	metricViews []*view.View
-	fatal       chan error
+	retryDelay *durationpb.Duration
+	receivers  []receiver.Traces
+	pusher     TracesPusher
+	logger     *log.RateLimitedLogger
+	fatal      chan error
 }
+
+var (
+	_ consumer.Traces = (*receiversShim)(nil)
+	_ component.Host  = (*receiversShim)(nil)
+)
 
 func (r *receiversShim) Capabilities() consumer.Capabilities {
 	return consumer.Capabilities{MutatesData: false}
@@ -95,20 +147,19 @@ func (m *mapProvider) Scheme() string { return "mock" }
 
 func (m *mapProvider) Shutdown(context.Context) error { return nil }
 
-func New(receiverCfg map[string]interface{}, pusher TracesPusher, middleware Middleware, logLevel logging.Level) (services.Service, error) {
+func New(receiverCfg map[string]interface{}, pusher TracesPusher, middleware Middleware, retryAfterDuration time.Duration, logLevel dslog.Level, reg prometheus.Registerer) (services.Service, error) {
 	shim := &receiversShim{
 		pusher: pusher,
 		logger: log.NewRateLimitedLogger(logsPerSecond, level.Error(log.Logger)),
 		fatal:  make(chan error),
 	}
 
+	if retryAfterDuration > 0 {
+		shim.retryDelay = durationpb.New(retryAfterDuration)
+	}
+
 	// shim otel observability
 	zapLogger := newLogger(logLevel)
-	views, err := newMetricViews()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create metric traceReceiverViews: %w", err)
-	}
-	shim.metricViews = views
 
 	// load config
 	receiverFactories, err := receiver.MakeFactoryMap(
@@ -142,12 +193,10 @@ func New(receiverCfg map[string]interface{}, pusher TracesPusher, middleware Mid
 		receivers = append(receivers, k)
 	}
 
-	// Creates a config provider with the given config map.
-	// The provider will be used to retrieve the actual config for the pipeline (although we only need the receivers).
-	pro, err := otelcol.NewConfigProvider(otelcol.ConfigProviderSettings{
-		ResolverSettings: confmap.ResolverSettings{
-			URIs: []string{"mock:/"},
-			Providers: map[string]confmap.Provider{"mock": &mapProvider{raw: map[string]interface{}{
+	// Define a factory function to create the mock provider
+	mockProviderFactory := confmap.NewProviderFactory(func(confmap.ProviderSettings) confmap.Provider {
+		return &mapProvider{
+			raw: map[string]interface{}{
 				"receivers": receiverCfg,
 				"exporters": map[string]interface{}{
 					"nop": map[string]interface{}{},
@@ -160,7 +209,19 @@ func New(receiverCfg map[string]interface{}, pusher TracesPusher, middleware Mid
 						},
 					},
 				},
-			}}},
+			},
+		}
+	})
+
+	// Creates a config provider with the given config map.
+	// The provider will be used to retrieve the actual config for the pipeline (although we only need the receivers).
+	pro, err := otelcol.NewConfigProvider(otelcol.ConfigProviderSettings{
+		ResolverSettings: confmap.ResolverSettings{
+			URIs: []string{"mock:/"},
+			ProviderFactories: []confmap.ProviderFactory{
+				mockProviderFactory,
+			},
+			DefaultScheme: "mock",
 		},
 	})
 	if err != nil {
@@ -171,28 +232,26 @@ func New(receiverCfg map[string]interface{}, pusher TracesPusher, middleware Mid
 	// We only need the receivers, the rest of the configuration is not used.
 	conf, err := pro.Get(context.Background(), otelcol.Factories{
 		Receivers: receiverFactories,
-		Exporters: map[component.Type]exporter.Factory{"nop": exportertest.NewNopFactory()}, // nop exporter to avoid errors
+		Exporters: map[component.Type]exporter.Factory{component.MustNewType("nop"): exportertest.NewNopFactory()}, // nop exporter to avoid errors
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	nopType := component.MustNewType("tempo")
+	traceProvider := tracenoop.NewTracerProvider()
+	meterProvider := NewMeterProvider(reg)
 	// todo: propagate a real context?  translate our log configuration into zap?
 	ctx := context.Background()
-	params := receiver.CreateSettings{TelemetrySettings: component.TelemetrySettings{
-		Logger:         zapLogger,
-		TracerProvider: trace.NewNoopTracerProvider(),
-		MeterProvider:  metric.NewNoopMeterProvider(),
-	}}
-
 	for componentID, cfg := range conf.Receivers {
+
 		factoryBase := receiverFactories[componentID.Type()]
 		if factoryBase == nil {
 			return nil, fmt.Errorf("receiver factory not found for type: %s", componentID.Type())
 		}
 
 		// Make sure that the headers are added to context. Required for Authentication.
-		switch componentID.Type() {
+		switch componentID.Type().String() {
 		case "otlp":
 			otlpRecvCfg := cfg.(*otlpreceiver.Config)
 
@@ -204,7 +263,7 @@ func New(receiverCfg map[string]interface{}, pusher TracesPusher, middleware Mid
 		case "zipkin":
 			zipkinRecvCfg := cfg.(*zipkinreceiver.Config)
 
-			zipkinRecvCfg.HTTPServerSettings.IncludeMetadata = true
+			zipkinRecvCfg.ServerConfig.IncludeMetadata = true
 			cfg = zipkinRecvCfg
 
 		case "jaeger":
@@ -217,7 +276,15 @@ func New(receiverCfg map[string]interface{}, pusher TracesPusher, middleware Mid
 			cfg = jaegerRecvCfg
 		}
 
-		receiver, err := factoryBase.CreateTracesReceiver(ctx, params, cfg, middleware.Wrap(shim))
+		params := receiver.Settings{
+			ID: component.NewIDWithName(nopType, fmt.Sprintf("%s_receiver", componentID.Type().String())),
+			TelemetrySettings: component.TelemetrySettings{
+				Logger:         zapLogger,
+				TracerProvider: traceProvider,
+				MeterProvider:  meterProvider,
+			},
+		}
+		receiver, err := factoryBase.CreateTraces(ctx, params, cfg, middleware.Wrap(shim))
 		if err != nil {
 			return nil, err
 		}
@@ -243,7 +310,7 @@ func (r *receiversShim) starting(ctx context.Context) error {
 	for _, receiver := range r.receivers {
 		err := receiver.Start(ctx, r)
 		if err != nil {
-			return fmt.Errorf("error starting receiver %w", err)
+			return fmt.Errorf("error starting receiver: %w", err)
 		}
 	}
 
@@ -252,12 +319,6 @@ func (r *receiversShim) starting(ctx context.Context) error {
 
 // Called after distributor is asked to stop via StopAsync.
 func (r *receiversShim) stopping(_ error) error {
-	// when shutdown is called on the receiver it immediately shuts down its connection
-	// which drops requests on the floor. at this point in the shutdown process
-	// the readiness handler is already down so we are not receiving any more requests.
-	// sleep for 30 seconds to here to all pending requests to finish.
-	time.Sleep(30 * time.Second)
-
 	ctx, cancelFn := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelFn()
 
@@ -277,10 +338,10 @@ func (r *receiversShim) stopping(_ error) error {
 	return nil
 }
 
-// ConsumeTraces implements consumer.Trace
+// ConsumeTraces implements consumer.Traces
 func (r *receiversShim) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "distributor.ConsumeTraces")
-	defer span.Finish()
+	ctx, span := tracer.Start(ctx, "distributor.ConsumeTraces")
+	defer span.End()
 
 	var err error
 
@@ -289,46 +350,27 @@ func (r *receiversShim) ConsumeTraces(ctx context.Context, td ptrace.Traces) err
 	metricPushDuration.Observe(time.Since(start).Seconds())
 	if err != nil {
 		r.logger.Log("msg", "pusher failed to consume trace data", "err", err)
+		err = wrapErrorIfRetryable(err, r.retryDelay)
 	}
 
 	return err
 }
 
-// ReportFatalError implements component.Host
-func (r *receiversShim) ReportFatalError(err error) {
-	_ = level.Error(log.Logger).Log("msg", "fatal error reported", "err", err)
-	r.fatal <- err
-}
-
-// GetFactory implements component.Host
-func (r *receiversShim) GetFactory(component.Kind, component.Type) component.Factory {
-	return nil
-}
-
 // GetExtensions implements component.Host
-func (r *receiversShim) GetExtensions() map[component.ID]extension.Extension { return nil }
-
-func (r *receiversShim) GetExporters() map[component.DataType]map[component.ID]component.Component {
-	return nil
-}
+func (r *receiversShim) GetExtensions() map[component.ID]component.Component { return nil }
 
 // observability shims
-func newLogger(level logging.Level) *zap.Logger {
+func newLogger(level dslog.Level) *zap.Logger {
 	zapLevel := zapcore.InfoLevel
 
-	switch level.Logrus {
-	case logrus.PanicLevel:
-		zapLevel = zapcore.PanicLevel
-	case logrus.FatalLevel:
-		zapLevel = zapcore.FatalLevel
-	case logrus.ErrorLevel:
+	switch level.String() {
+	case "error":
 		zapLevel = zapcore.ErrorLevel
-	case logrus.WarnLevel:
+	case "warn":
 		zapLevel = zapcore.WarnLevel
-	case logrus.InfoLevel:
+	case "info":
 		zapLevel = zapcore.InfoLevel
-	case logrus.DebugLevel:
-	case logrus.TraceLevel:
+	case "debug":
 		zapLevel = zapcore.DebugLevel
 	}
 

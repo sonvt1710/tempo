@@ -22,7 +22,8 @@ func Parse(s string) (expr *RootExpr, err error) {
 		if r := recover(); r != nil {
 			var ok bool
 			if err, ok = r.(error); ok {
-				if errors.Is(err, ParseError{}) {
+				var parseErr *ParseError
+				if errors.As(err, &parseErr) {
 					return
 				}
 				err = newParseError(err.Error(), 0, 0)
@@ -59,6 +60,12 @@ func ParseIdentifier(s string) (Attribute, error) {
 		return NewScopedAttribute(AttributeScopeResource, false, strings.TrimPrefix(s, "resource.")), nil
 	case strings.HasPrefix(s, "span."):
 		return NewScopedAttribute(AttributeScopeSpan, false, strings.TrimPrefix(s, "span.")), nil
+	case strings.HasPrefix(s, "instrumentation."):
+		return NewScopedAttribute(AttributeScopeInstrumentation, false, strings.TrimPrefix(s, "instrumentation.")), nil
+	case strings.HasPrefix(s, "event."):
+		return NewScopedAttribute(AttributeScopeEvent, false, strings.TrimPrefix(s, "event.")), nil
+	case strings.HasPrefix(s, "link."):
+		return NewScopedAttribute(AttributeScopeLink, false, strings.TrimPrefix(s, "link.")), nil
 	default:
 		return Attribute{}, fmt.Errorf("tag name is not valid intrinsic or scoped attribute: %s", s)
 	}
@@ -78,15 +85,15 @@ type ParseError struct {
 	line, col int
 }
 
-func (p ParseError) Error() string {
+func (p *ParseError) Error() string {
 	if p.col == 0 && p.line == 0 {
 		return fmt.Sprintf("parse error : %s", p.msg)
 	}
 	return fmt.Sprintf("parse error at line %d, col %d: %s", p.line, p.col, p.msg)
 }
 
-func newParseError(msg string, line, col int) ParseError {
-	return ParseError{
+func newParseError(msg string, line, col int) *ParseError {
+	return &ParseError{
 		msg:  msg,
 		line: line,
 		col:  col,

@@ -1,5 +1,12 @@
+# Adapted from https://www.thapaliya.com/en/writings/well-documented-makefiles/
+.PHONY: help
+help:  ## Display this help
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+
+.DEFAULT_GOAL:=help
+
 # Version number
-VERSION=$(shell ./tools/image-tag | cut -d, -f 1)
+VERSION=$(shell ./tools/version-tag.sh | cut -d, -f 1)
 
 GIT_REVISION := $(shell git rev-parse --short HEAD)
 GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
@@ -11,22 +18,22 @@ GOPATH := $(shell go env GOPATH)
 GORELEASER := $(GOPATH)/bin/goreleaser
 
 # Build Images
-DOCKER_PROTOBUF_IMAGE ?= otel/build-protobuf:0.14.0
-LOKI_BUILD_IMAGE ?= grafana/loki-build-image:0.21.0
+DOCKER_PROTOBUF_IMAGE ?= otel/build-protobuf:0.23.0
+LOKI_BUILD_IMAGE ?= grafana/loki-build-image:0.33.2
 DOCS_IMAGE ?= grafana/docs-base:latest
 
 # More exclusions can be added similar with: -not -path './testbed/*'
 ALL_SRC := $(shell find . -name '*.go' \
+								-not -path './tools*/*' \
 								-not -path './vendor*/*' \
 								-not -path './integration/*' \
-								-not -path './cmd/tempo-serverless/*' \
                                 -type f | sort)
 
 # ALL_SRC but without pkg and tempodb packages
 OTHERS_SRC := $(shell find . -name '*.go' \
+								-not -path './tools*/*' \
 								-not -path './vendor*/*' \
 								-not -path './integration/*' \
-								-not -path './cmd/tempo-serverless/*' \
 								-not -path './pkg*/*' \
 								-not -path './tempodb*/*' \
                                 -type f | sort)
@@ -43,9 +50,9 @@ ifeq ($(BUILD_DEBUG), 1)
 	GO_OPT+= -gcflags="all=-N -l"
 endif
 
-GOTEST_OPT?= -race -timeout 20m -count=1 -v
+GOTEST_OPT?= -race -timeout 25m -count=1 -v
 GOTEST_OPT_WITH_COVERAGE = $(GOTEST_OPT) -cover
-GOTEST=go test
+GOTEST=gotestsum --format=testname --
 LINT=golangci-lint
 
 UNAME := $(shell uname -s)
@@ -53,139 +60,157 @@ ifeq ($(UNAME), Darwin)
     SED_OPTS := ''
 endif
 
-FILES_TO_FMT=$(shell find . -type d \( -path ./vendor -o -path ./opentelemetry-proto -o -path ./vendor-fix \) -prune -o -name '*.go' -not -name "*.pb.go" -not -name '*.y.go' -print)
+FILES_TO_FMT=$(shell find . -type d \( -path ./vendor -o -path ./opentelemetry-proto -o -path ./vendor-fix \) -prune -o -name '*.go' -not -name "*.pb.go" -not -name '*.y.go' -not -name '*.gen.go' -print)
 FILES_TO_JSONNETFMT=$(shell find ./operations/jsonnet ./operations/tempo-mixin -type f \( -name '*.libsonnet' -o -name '*.jsonnet' \) -not -path "*/vendor/*" -print)
 
-### Build
-
-.PHONY: tempo
-tempo:
-	GO111MODULE=on CGO_ENABLED=0 go build $(GO_OPT) -o ./bin/$(GOOS)/tempo-$(GOARCH) $(BUILD_INFO) ./cmd/tempo
+##@ Building
+.PHONY: tempo 	
+tempo: ## Build tempo
+	GO111MODULE=on CGO_ENABLED=0 go build $(GO_OPT) -o ./bin/$(GOOS)/tempo-$(GOARCH) $(BUILD_INFO) ./cmd/tempo 
 
 .PHONY: tempo-query
-tempo-query:
+tempo-query: ## Build tempo-query
 	GO111MODULE=on CGO_ENABLED=0 go build $(GO_OPT) -o ./bin/$(GOOS)/tempo-query-$(GOARCH) $(BUILD_INFO) ./cmd/tempo-query
 
 .PHONY: tempo-cli
-tempo-cli:
+tempo-cli: ## Build tempo-cli
 	GO111MODULE=on CGO_ENABLED=0 go build $(GO_OPT) -o ./bin/$(GOOS)/tempo-cli-$(GOARCH) $(BUILD_INFO) ./cmd/tempo-cli
 
-.PHONY: tempo-vulture
+.PHONY: tempo-vulture  ## Build tempo-vulture
 tempo-vulture:
 	GO111MODULE=on CGO_ENABLED=0 go build $(GO_OPT) -o ./bin/$(GOOS)/tempo-vulture-$(GOARCH) $(BUILD_INFO) ./cmd/tempo-vulture
 
-.PHONY: exe
+.PHONY: exe  ## Build exe
 exe:
-	GOOS=linux $(MAKE) $(COMPONENT)
+	GOOS=linux make $(COMPONENT)
 
-.PHONY: exe-debug
+.PHONY: exe-debug  ## Build exe-debug
 exe-debug:
-	BUILD_DEBUG=1 GOOS=linux $(MAKE) $(COMPONENT)
+	BUILD_DEBUG=1 GOOS=linux make $(COMPONENT)
 
-### Testin' and Lintin'
+##@  Testin' and Lintin'
 
 .PHONY: test
-test:
+test: ## Run tests
 	$(GOTEST) $(GOTEST_OPT) $(ALL_PKGS)
 
 .PHONY: benchmark
-benchmark:
+benchmark: tools ## Run benchmarks
 	$(GOTEST) -bench=. -run=notests $(ALL_PKGS)
 
 # Not used in CI, tests are split in pkg, tempodb, tempodb-wal and others in CI jobs
-.PHONY: test-with-cover
-test-with-cover: test-serverless
+.PHONY: test-with-cover 
+test-with-cover: tools ## Run tests with code coverage
 	$(GOTEST) $(GOTEST_OPT_WITH_COVERAGE) $(ALL_PKGS)
 
 # tests in pkg
-.PHONY: test-with-cover-pkg
-test-with-cover-pkg:
+.PHONY: test-with-cover-pkg 
+test-with-cover-pkg: tools  ##  Run Tempo packages' tests with code coverage
 	$(GOTEST) $(GOTEST_OPT_WITH_COVERAGE) $(shell go list $(sort $(dir $(shell find . -name '*.go' -path './pkg*/*' -type f | sort))))
 
 # tests in tempodb (excluding tempodb/wal)
 .PHONY: test-with-cover-tempodb
-test-with-cover-tempodb:
-	$(GOTEST) $(GOTEST_OPT_WITH_COVERAGE) $(shell go list $(sort $(dir $(shell find . -name '*.go'  -not -path './tempodb/wal*/*' -path './tempodb*/*' -type f | sort))))
+test-with-cover-tempodb: tools ## Run tempodb tests with code coverage
+	GOMEMLIMIT=6GiB $(GOTEST) $(GOTEST_OPT_WITH_COVERAGE) $(shell go list $(sort $(dir $(shell find . -name '*.go'  -not -path './tempodb/wal*/*' -path './tempodb*/*' -type f | sort))))
 
 # tests in tempodb/wal
 .PHONY: test-with-cover-tempodb-wal
-test-with-cover-tempodb-wal:
+test-with-cover-tempodb-wal: tools  ## Test tempodb/wal with code coverage
 	$(GOTEST) $(GOTEST_OPT_WITH_COVERAGE) $(shell go list $(sort $(dir $(shell find . -name '*.go' -path './tempodb/wal*/*' -type f | sort))))
 
 # all other tests (excluding pkg & tempodb)
 .PHONY: test-with-cover-others
-test-with-cover-others: test-serverless
+test-with-cover-others: tools ## Run other tests with code coverage
 	$(GOTEST) $(GOTEST_OPT_WITH_COVERAGE) $(shell go list $(sort $(dir $(OTHERS_SRC))))
 
 # runs e2e tests in the top level integration/e2e directory
 .PHONY: test-e2e
-test-e2e: docker-tempo
+test-e2e: tools docker-tempo docker-tempo-query  ## Run end to end tests
 	$(GOTEST) -v $(GOTEST_OPT) ./integration/e2e
 
-# runs only serverless e2e tests
-.PHONY: test-e2e-serverless
-test-e2e-serverless: docker-tempo docker-serverless
-	$(GOTEST) -v $(GOTEST_OPT) ./integration/e2e/serverless
+# runs only deployment modes e2e tests
+.PHONY: test-e2e-deployments
+test-e2e-deployments: tools docker-tempo docker-tempo-query ## Run end to end tests for deployments
+	$(GOTEST) -v $(GOTEST_OPT) ./integration/e2e/deployments
+
+# runs only poller integration tests
+.PHONY: test-integration-poller
+test-integration-poller: tools ## Run poller integration tests
+	$(GOTEST) -v $(GOTEST_OPT) ./integration/poller
 
 # test-all/bench use a docker image so build it first to make sure we're up to date
-.PHONY: test-all
-test-all: test-with-cover test-e2e test-e2e-serverless
+.PHONY: test-all ## Run all tests
+test-all: test-with-cover test-e2e test-e2e-deployments test-integration-poller
 
 .PHONY: test-bench
-test-bench: docker-tempo
+test-bench: tools docker-tempo ## Run all benchmarks
 	$(GOTEST) -v $(GOTEST_OPT) ./integration/bench
 
 .PHONY: fmt check-fmt
-fmt:
-	@gofmt -s -w $(FILES_TO_FMT)
-	@goimports -w $(FILES_TO_FMT)
+fmt: tools-image ## Check fmt
+	@$(TOOLS_CMD) gofumpt -w $(FILES_TO_FMT)
+	@$(TOOLS_CMD) goimports -w $(FILES_TO_FMT)
 
 check-fmt: fmt
 	@git diff --exit-code -- $(FILES_TO_FMT)
 
-.PHONY: jsonnetfmt check-jsonnetfmt
-jsonnetfmt:
-	@jsonnetfmt -i $(FILES_TO_JSONNETFMT)
+.PHONY: jsonnetfmt check-jsonnetfmt ## Check jsonnetfmt
+jsonnetfmt: tools-image
+	@$(TOOLS_CMD) jsonnetfmt -i $(FILES_TO_JSONNETFMT)
 
 check-jsonnetfmt: jsonnetfmt
 	@git diff --exit-code -- $(FILES_TO_JSONNETFMT)
 
 .PHONY: lint
-lint:
-	$(LINT) run
+lint: # linting
+ifneq ($(base),)
+	$(LINT_CMD) $(LINT) run --config .golangci.yml --new-from-rev=$(base)
+else
+	$(LINT_CMD) $(LINT) run --config .golangci.yml
+endif
 
-### Docker Images
+##@ Docker Images
 
-.PHONY: docker-component # Not intended to be used directly
-docker-component: check-component exe
+.PHONY: docker-component 
+docker-component: check-component exe # not intended to be used directly
 	docker build -t grafana/$(COMPONENT) --build-arg=TARGETARCH=$(GOARCH) -f ./cmd/$(COMPONENT)/Dockerfile .
 	docker tag grafana/$(COMPONENT) $(COMPONENT)
 
+.PHONY: docker-component-multi
+docker-component-multi: check-component # not intended to be used directly
+	GOOS=linux GOARCH=amd64 make $(COMPONENT)
+	GOOS=linux GOARCH=arm64 make $(COMPONENT)
+	docker buildx build -t grafana/$(COMPONENT) --platform linux/amd64,linux/arm64 --output type=docker -f ./cmd/$(COMPONENT)/Dockerfile .
+
 .PHONY: docker-component-debug
-docker-component-debug: check-component exe-debug
+docker-component-debug: check-component exe-debug 
 	docker build -t grafana/$(COMPONENT)-debug --build-arg=TARGETARCH=$(GOARCH) -f ./cmd/$(COMPONENT)/Dockerfile_debug .
 	docker tag grafana/$(COMPONENT)-debug $(COMPONENT)-debug
 
-.PHONY: docker-tempo
-docker-tempo:
-	COMPONENT=tempo $(MAKE) docker-component
+.PHONY: docker-tempo 
+docker-tempo: ## Build tempo docker image
+	COMPONENT=tempo make docker-component
 
-docker-tempo-debug:
-	COMPONENT=tempo $(MAKE) docker-component-debug
+.PHONY: docker-tempo-multi
+docker-tempo-multi: ## Build multiarch image locally, requires containerd image store
+	COMPONENT=tempo make docker-component-multi
+
+docker-tempo-debug: ## Build tempo debug docker image
+	COMPONENT=tempo make docker-component-debug
 
 .PHONY: docker-cli
-docker-tempo-cli:
-	COMPONENT=tempo-cli $(MAKE) docker-component
+docker-tempo-cli: ## Build tempo cli docker image
+	COMPONENT=tempo-cli make docker-component
 
 .PHONY: docker-tempo-query
-docker-tempo-query:
-	COMPONENT=tempo-query $(MAKE) docker-component
+docker-tempo-query: ## Build tempo query docker image
+	COMPONENT=tempo-query make docker-component
 
 .PHONY: docker-tempo-vulture
-docker-tempo-vulture:
-	COMPONENT=tempo-vulture $(MAKE) docker-component
+docker-tempo-vulture: ## Build tempo vulture docker image
+	COMPONENT=tempo-vulture make docker-component
 
-.PHONY: docker-images
+.PHONY: docker-images ## Build all docker images
 docker-images: docker-tempo docker-tempo-query docker-tempo-vulture
 
 .PHONY: check-component
@@ -194,17 +219,17 @@ ifndef COMPONENT
 	$(error COMPONENT variable was not defined)
 endif
 
-# #########
-# Gen Proto
-# #########
+##@ Gen Proto
+
 PROTOC = docker run --rm -u ${shell id -u} -v${PWD}:${PWD} -w${PWD} ${DOCKER_PROTOBUF_IMAGE} --proto_path=${PWD}
 PROTO_INTERMEDIATE_DIR = pkg/.patched-proto
 PROTO_INCLUDES = -I$(PROTO_INTERMEDIATE_DIR)
 PROTO_GEN = $(PROTOC) $(PROTO_INCLUDES) --gogofaster_out=plugins=grpc,paths=source_relative:$(2) $(1)
 PROTO_GEN_WITH_VENDOR = $(PROTOC) $(PROTO_INCLUDES) -Ivendor -Ivendor/github.com/gogo/protobuf --gogofaster_out=plugins=grpc,paths=source_relative:$(2) $(1)
+PROTO_GEN_WITHOUT_RELATIVE = $(PROTOC) $(PROTO_INCLUDES) --gogofaster_out=plugins=grpc:$(2) $(1)
 
 .PHONY: gen-proto
-gen-proto:
+gen-proto:  ## Generate proto files
 	@echo --
 	@echo -- Deleting existing
 	@echo --
@@ -243,98 +268,87 @@ gen-proto:
 	$(call PROTO_GEN,$(PROTO_INTERMEDIATE_DIR)/resource/v1/resource.proto,./pkg/tempopb/)
 	$(call PROTO_GEN,$(PROTO_INTERMEDIATE_DIR)/trace/v1/trace.proto,./pkg/tempopb/)
 	$(call PROTO_GEN,pkg/tempopb/tempo.proto,./)
+	$(call PROTO_GEN_WITHOUT_RELATIVE,tempodb/backend/v1/v1.proto,./)
 	$(call PROTO_GEN_WITH_VENDOR,modules/frontend/v1/frontendv1pb/frontend.proto,./)
 
 	rm -rf $(PROTO_INTERMEDIATE_DIR)
 
-# ##############
-# Gen Traceql
-# ##############
-.PHONY: gen-traceql
-gen-traceql:
+##@ Gen Traceql
+
+.PHONY: gen-traceql 
+gen-traceql: ## Generate traceql 
 	docker run --rm -v${PWD}:/src/loki ${LOKI_BUILD_IMAGE} gen-traceql-local
 
-.PHONY: gen-traceql-local
-gen-traceql-local:
+.PHONY: gen-traceql-local 
+gen-traceql-local: ## Generate traceq local
 	goyacc -o pkg/traceql/expr.y.go pkg/traceql/expr.y && rm y.output
 
+
+##@ Gen Parquet-Query
+
+.PHONY: gen-parquet-query
+gen-parquet-query:  ## Generate Parquet query 
+	go run ./pkg/parquetquerygen/predicates.go > ./pkg/parquetquery/predicates.gen.go
+
+##@ Tempo tools
 ### Check vendored and generated files are up to date
 .PHONY: vendor-check
-vendor-check: gen-proto update-mod gen-traceql
+vendor-check: gen-proto update-mod gen-traceql gen-parquet-query ## Keep up to date vendorized files
 	git diff --exit-code -- **/go.sum **/go.mod vendor/ pkg/tempopb/ pkg/traceql/
 
-### Tidy dependencies for tempo and tempo-serverless modules
-.PHONY: update-mod
-update-mod:
+
+### Tidy dependencies for tempo modules
+.PHONY: update-mod 
+update-mod: tools-update-mod ## Update module
 	go mod vendor
 	go mod tidy -e
-	$(MAKE) -C cmd/tempo-serverless update-mod
 
 
 ### Release (intended to be used in the .github/workflows/release.yml)
 $(GORELEASER):
-	go install github.com/goreleaser/goreleaser@latest
+	go install github.com/goreleaser/goreleaser@v1.25.1
 
 .PHONY: release
-release: $(GORELEASER)
-	$(GORELEASER) release --rm-dist
+release: $(GORELEASER)  ## Release 
+	$(GORELEASER) release --rm-dist 
 
 .PHONY: release-snapshot
-release-snapshot: $(GORELEASER)
+release-snapshot: $(GORELEASER) ## Release snapshot
 	$(GORELEASER) release --skip-validate --rm-dist --snapshot
 
-### Docs
+##@ Docs
 .PHONY: docs
-docs:
+docs: ## Generate docs
 	docker pull ${DOCS_IMAGE}
 	docker run -v ${PWD}/docs/sources/tempo:/hugo/content/docs/tempo/latest:z -p 3002:3002 --rm $(DOCS_IMAGE) /bin/bash -c 'mkdir -p content/docs/grafana/latest/ && touch content/docs/grafana/latest/menu.yaml && make server'
 
-.PHONY: docs-test
+.PHONY: docs-test ## Generate docs tests
 docs-test:
 	docker pull ${DOCS_IMAGE}
 	docker run -v ${PWD}/docs/sources/tempo:/hugo/content/docs/tempo/latest:z -p 3002:3002 --rm $(DOCS_IMAGE) /bin/bash -c 'mkdir -p content/docs/grafana/latest/ && touch content/docs/grafana/latest/menu.yaml && make prod'
 
-### jsonnet
-.PHONY: jsonnet jsonnet-check
-jsonnet:
-	$(MAKE) -C operations/jsonnet-compiled/util gen
+##@ jsonnet
+.PHONY: jsonnet jsonnet-check jsonnet-test
+jsonnet: tools-image ## Generate jsonnet
+	$(TOOLS_CMD) make -C operations/jsonnet-compiled/util gen
 
-jsonnet-check:
-	$(MAKE) -C operations/jsonnet-compiled/util check
+jsonnet-check: tools-image ## Check jsonnet
+	$(TOOLS_CMD) make -C operations/jsonnet-compiled/util check
 
-
-### serverless
-.PHONY: docker-serverless test-serverless
-docker-serverless:
-	$(MAKE) -C cmd/tempo-serverless build-docker
-
-test-serverless:
-	$(MAKE) -C cmd/tempo-serverless test
+jsonnet-test: tools-image ## Test jsonnet
+	$(TOOLS_CMD) make -C operations/jsonnet/microservices test
 
 ### tempo-mixin
 .PHONY: tempo-mixin tempo-mixin-check
-tempo-mixin:
-	$(MAKE) -C operations/tempo-mixin all
+tempo-mixin: tools-image
+	$(TOOLS_CMD) make -C operations/tempo-mixin all
 
-tempo-mixin-check:
-	$(MAKE) -C operations/tempo-mixin check
+tempo-mixin-check: tools-image
+	$(TOOLS_CMD) make -C operations/tempo-mixin check
 
-### drone
-.PHONY: drone drone-jsonnet drone-signature
-# this requires the drone-cli https://docs.drone.io/cli/install/
-drone:
-	# piggyback on Loki's build image, this image contains a newer version of drone-cli than is
-	# released currently (1.4.0). The newer version of drone-clie keeps drone.yml human-readable.
-	# This will run 'make drone-jsonnet' from within the container
-	docker run -e DRONE_SERVER -e DRONE_TOKEN --rm -v $(shell pwd):/src/loki ${LOKI_BUILD_IMAGE} drone-jsonnet drone-signature
+.PHONY: generate-manifest
+generate-manifest:
+	GO111MODULE=on CGO_ENABLED=0 go run -v pkg/docsgen/generate_manifest.go
 
-	drone lint .drone/drone.yml --trusted
-
-drone-jsonnet:
-	drone jsonnet --stream --format --source .drone/drone.jsonnet --target .drone/drone.yml
-
-drone-signature:
-ifndef DRONE_TOKEN
-	$(error DRONE_TOKEN is not set, visit https://drone.grafana.net/account)
-endif
-	DRONE_SERVER=https://drone.grafana.net drone sign --save grafana/tempo .drone/drone.yml
+# Import fragments
+include build/tools.mk

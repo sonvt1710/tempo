@@ -9,8 +9,7 @@ import (
 	"github.com/grafana/tempo/pkg/tempopb"
 )
 
-type SegmentDecoder struct {
-}
+type SegmentDecoder struct{}
 
 var segmentDecoder = &SegmentDecoder{}
 
@@ -19,14 +18,14 @@ func NewSegmentDecoder() *SegmentDecoder {
 	return segmentDecoder
 }
 
-func (d *SegmentDecoder) PrepareForWrite(trace *tempopb.Trace, start uint32, end uint32) ([]byte, error) {
+func (d *SegmentDecoder) PrepareForWrite(trace *tempopb.Trace, _, _ uint32) ([]byte, error) {
 	// v1 encoding doesn't support start/end
 	return proto.Marshal(trace)
 }
 
 func (d *SegmentDecoder) PrepareForRead(segments [][]byte) (*tempopb.Trace, error) {
 	// each slice is a marshalled tempopb.Trace, unmarshal and combine
-	combiner := trace.NewCombiner()
+	combiner := trace.NewCombiner(0, false)
 	for i, s := range segments {
 		t := &tempopb.Trace{}
 		err := proto.Unmarshal(s, t)
@@ -34,7 +33,10 @@ func (d *SegmentDecoder) PrepareForRead(segments [][]byte) (*tempopb.Trace, erro
 			return nil, fmt.Errorf("error unmarshaling trace: %w", err)
 		}
 
-		combiner.ConsumeWithFinal(t, i == len(segments)-1)
+		_, err = combiner.ConsumeWithFinal(t, i == len(segments)-1)
+		if err != nil {
+			return nil, fmt.Errorf("error combining trace: %w", err)
+		}
 	}
 
 	combinedTrace, _ := combiner.Result()

@@ -3,8 +3,10 @@ package registry
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/prometheus/prometheus/model/exemplar"
+	prom_histogram "github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/storage"
@@ -12,8 +14,10 @@ import (
 
 type noopAppender struct{}
 
-var _ storage.Appendable = (*noopAppender)(nil)
-var _ storage.Appender = (*noopAppender)(nil)
+var (
+	_ storage.Appendable = (*noopAppender)(nil)
+	_ storage.Appender   = (*noopAppender)(nil)
+)
 
 func (n noopAppender) Appender(context.Context) storage.Appender { return n }
 
@@ -25,11 +29,19 @@ func (n noopAppender) AppendExemplar(storage.SeriesRef, labels.Labels, exemplar.
 	return 0, nil
 }
 
+func (n noopAppender) AppendHistogram(storage.SeriesRef, labels.Labels, int64, *prom_histogram.Histogram, *prom_histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, nil
+}
+
 func (n noopAppender) Commit() error { return nil }
 
 func (n noopAppender) Rollback() error { return nil }
 
 func (n noopAppender) UpdateMetadata(storage.SeriesRef, labels.Labels, metadata.Metadata) (storage.SeriesRef, error) {
+	return 0, nil
+}
+
+func (n noopAppender) AppendCTZeroSample(_ storage.SeriesRef, _ labels.Labels, _, _ int64) (storage.SeriesRef, error) {
 	return 0, nil
 }
 
@@ -52,16 +64,20 @@ type exemplarSample struct {
 }
 
 func newSample(lbls map[string]string, t int64, v float64) sample {
+	l := labels.FromMap(lbls)
+	sort.Slice(l, func(i, j int) bool { return l[i].Name < l[j].Name })
 	return sample{
-		l: labels.FromMap(lbls),
+		l: l,
 		t: t,
 		v: v,
 	}
 }
 
 func newExemplar(lbls map[string]string, e exemplar.Exemplar) exemplarSample {
+	l := labels.FromMap(lbls)
+	sort.Slice(l, func(i, j int) bool { return l[i].Name < l[j].Name })
 	return exemplarSample{
-		l: labels.FromMap(lbls),
+		l: l,
 		e: e,
 	}
 }
@@ -70,10 +86,12 @@ func (s sample) String() string {
 	return fmt.Sprintf("%s %d %g", s.l, s.t, s.v)
 }
 
-var _ storage.Appendable = (*capturingAppender)(nil)
-var _ storage.Appender = (*capturingAppender)(nil)
+var (
+	_ storage.Appendable = (*capturingAppender)(nil)
+	_ storage.Appender   = (*capturingAppender)(nil)
+)
 
-func (c *capturingAppender) Appender(ctx context.Context) storage.Appender {
+func (c *capturingAppender) Appender(context.Context) storage.Appender {
 	return c
 }
 
@@ -84,6 +102,10 @@ func (c *capturingAppender) Append(ref storage.SeriesRef, l labels.Labels, t int
 
 func (c *capturingAppender) AppendExemplar(ref storage.SeriesRef, l labels.Labels, e exemplar.Exemplar) (storage.SeriesRef, error) {
 	c.exemplars = append(c.exemplars, exemplarSample{l, e})
+	return ref, nil
+}
+
+func (c *capturingAppender) AppendHistogram(ref storage.SeriesRef, _ labels.Labels, _ int64, _ *prom_histogram.Histogram, _ *prom_histogram.FloatHistogram) (storage.SeriesRef, error) {
 	return ref, nil
 }
 
@@ -98,5 +120,9 @@ func (c *capturingAppender) Rollback() error {
 }
 
 func (c *capturingAppender) UpdateMetadata(storage.SeriesRef, labels.Labels, metadata.Metadata) (storage.SeriesRef, error) {
+	return 0, nil
+}
+
+func (c *capturingAppender) AppendCTZeroSample(_ storage.SeriesRef, _ labels.Labels, _, _ int64) (storage.SeriesRef, error) {
 	return 0, nil
 }

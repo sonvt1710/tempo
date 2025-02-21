@@ -2,7 +2,9 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -10,14 +12,16 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/grpcclient"
+	"github.com/grafana/dskit/httpgrpc"
 	"github.com/grafana/dskit/services"
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/weaveworks/common/httpgrpc"
+	"go.opentelemetry.io/otel"
 	"google.golang.org/grpc"
 
 	"github.com/grafana/tempo/pkg/util"
 )
+
+var tracer = otel.Tracer("modules/querier/worker")
 
 type Config struct {
 	FrontendAddress string        `yaml:"frontend_address"`
@@ -44,11 +48,11 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("querier.frontend-client", f)
 }
 
-func (cfg *Config) Validate(log log.Logger) error {
+func (cfg *Config) Validate() error {
 	if cfg.FrontendAddress != "" {
 		return errors.New("starting querier worker without frontend address is not supported")
 	}
-	return cfg.GRPCClientConfig.Validate(log)
+	return cfg.GRPCClientConfig.Validate()
 }
 
 // Handler for HTTP requests wrapped in protobuf messages.
@@ -87,11 +91,11 @@ type querierWorker struct {
 	managers map[string]*processorManager
 }
 
-func NewQuerierWorker(cfg Config, handler RequestHandler, log log.Logger, reg prometheus.Registerer) (services.Service, error) {
+func NewQuerierWorker(cfg Config, handler RequestHandler, log log.Logger, _ prometheus.Registerer) (services.Service, error) {
 	if cfg.QuerierID == "" {
 		hostname, err := os.Hostname()
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to get hostname for configuring querier ID")
+			return nil, fmt.Errorf("failed to get hostname for configuring querier ID: %w", err)
 		}
 		cfg.QuerierID = hostname
 	}
@@ -129,7 +133,7 @@ func newQuerierWorkerWithProcessor(cfg Config, log log.Logger, processor process
 	if len(servs) > 0 {
 		subservices, err := services.NewManager(servs...)
 		if err != nil {
-			return nil, errors.Wrap(err, "querier worker subservices")
+			return nil, fmt.Errorf("querier worker subservices: %w", err)
 		}
 
 		f.subservices = subservices
@@ -241,6 +245,8 @@ func (w *querierWorker) resetConcurrency() {
 	if totalConcurrency > w.cfg.MaxConcurrentRequests {
 		level.Warn(w.log).Log("msg", "total worker concurrency is greater than promql max concurrency. Queries may be queued in the querier which reduces QOS")
 	}
+
+	level.Info(w.log).Log("msg", "total worker concurrency updated", "totalConcurrency", totalConcurrency)
 }
 
 func (w *querierWorker) connect(ctx context.Context, address string) (*grpc.ClientConn, error) {

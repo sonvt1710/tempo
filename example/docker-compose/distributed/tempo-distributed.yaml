@@ -2,19 +2,11 @@ server:
   http_listen_port: 3200
 
 distributor:
-  receivers:                           # this configuration will listen on all ports and protocols that tempo is capable of.
-    jaeger:                            # the receives all come from the OpenTelemetry collector.  more configuration information can
-      protocols:                       # be found there: https://github.com/open-telemetry/opentelemetry-collector/tree/main/receiver
-        thrift_http:                   #
-        grpc:                          # for a production deployment you should only enable the receivers you need!
-        thrift_binary:
-        thrift_compact:
-    zipkin:
+  receivers:
     otlp:
       protocols:
-        http:
         grpc:
-    opencensus:
+          endpoint: "0.0.0.0:4317"
 
 ingester:
   max_block_duration: 5m               # cut the headblock when this much time passes. this is being set for demo purposes and should probably be left alone normally
@@ -26,6 +18,8 @@ memberlist:
   - ingester-0:7946
   - ingester-1:7946
   - ingester-2:7946
+  - metrics-generator-0:7946
+  - metrics-generator-1:7946
 
 compactor:
   compaction:
@@ -41,10 +35,12 @@ metrics_generator:
       source: tempo
       cluster: docker-compose
   storage:
-    path: /tmp/tempo/generator/wal
+    path: /var/tempo/generator/wal
     remote_write:
       - url: http://prometheus:9090/api/v1/write
         send_exemplars: true
+  traces_storage:
+    path: /var/tempo/generator/traces
 
 storage:
   trace:
@@ -56,9 +52,12 @@ storage:
       secret_key: supersecret
       insecure: true
     wal:
-      path: /tmp/tempo/wal             # where to store the the wal locally
+      path: /var/tempo/wal             # where to store the wal locally
     local:
-      path: /tmp/tempo/blocks
+      path: /var/tempo/blocks
 
 overrides:
-  metrics_generator_processors: ['service-graphs', 'span-metrics']
+  defaults:
+    metrics_generator:
+      processors: ['service-graphs', 'span-metrics', 'local-blocks']
+      generate_native_histograms: both

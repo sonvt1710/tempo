@@ -12,14 +12,12 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/google/uuid"
 	"github.com/grafana/dskit/services"
-	ot "github.com/opentracing/opentracing-go"
-	"github.com/opentracing/opentracing-go/ext"
-	otlog "github.com/opentracing/opentracing-go/log"
-	"github.com/pkg/errors"
+	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/uber/jaeger-client-go"
-	"github.com/weaveworks/common/user"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/grafana/tempo/pkg/util/log"
 )
@@ -46,10 +44,13 @@ var (
 		Help:      "The total number of failed retries after a failed flush",
 	})
 	metricFlushDuration = promauto.NewHistogram(prometheus.HistogramOpts{
-		Namespace: "tempo",
-		Name:      "ingester_flush_duration_seconds",
-		Help:      "Records the amount of time to flush a complete block.",
-		Buckets:   prometheus.ExponentialBuckets(1, 2, 10),
+		Namespace:                       "tempo",
+		Name:                            "ingester_flush_duration_seconds",
+		Help:                            "Records the amount of time to flush a complete block.",
+		Buckets:                         prometheus.ExponentialBuckets(1, 2, 10),
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: 1 * time.Hour,
 	})
 	metricFlushSize = promauto.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "tempo",
@@ -71,20 +72,6 @@ const (
 	opKindFlush
 )
 
-// Flush triggers a flush of all in memory traces to disk.  This is called
-// by the lifecycler on shutdown and will put our traces in the WAL to be
-// replayed.
-func (i *Ingester) Flush() {
-	instances := i.getInstances()
-
-	for _, instance := range instances {
-		err := instance.CutCompleteTraces(0, true)
-		if err != nil {
-			level.Error(log.WithUserID(instance.instanceID, log.Logger)).Log("msg", "failed to cut complete traces on shutdown", "err", err)
-		}
-	}
-}
-
 // ShutdownHandler handles a graceful shutdown for an ingester. It does the following things in order
 // * Stop incoming writes by exiting from the ring
 // * Flush all blocks to backend
@@ -98,12 +85,8 @@ func (i *Ingester) ShutdownHandler(w http.ResponseWriter, _ *http.Request) {
 		// stop accepting new writes
 		i.markUnavailable()
 
-		// move all data into flushQueue
-		i.sweepAllInstances(true)
-
-		for !i.flushQueues.IsEmpty() {
-			time.Sleep(100 * time.Millisecond)
-		}
+		// flush any remaining traces
+		i.flushRemaining()
 
 		// stop ingester service
 		_ = services.StopAndAwaitTerminated(context.Background(), i)
@@ -127,9 +110,9 @@ func (i *Ingester) FlushHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		level.Info(log.Logger).Log("msg", "flushing instance", "instance", instance.instanceID)
-		i.sweepInstance(instance, true)
+		i.cutOneInstanceToWal(instance, true)
 	} else {
-		i.sweepAllInstances(true)
+		i.cutAllInstancesToWal()
 	}
 
 	w.WriteHeader(http.StatusNoContent)
@@ -154,16 +137,47 @@ func (o *flushOp) Priority() int64 {
 	return -o.at.Unix()
 }
 
-// sweepAllInstances periodically schedules series for flushing and garbage collects instances with no series
-func (i *Ingester) sweepAllInstances(immediate bool) {
+// cutToWalLoop kicks off a goroutine for the passed instance that will periodically cut traces to WAL.
+// it signals completion through cutToWalWg, waits for cutToWalStart and stops on cutToWalStop.
+func (i *Ingester) cutToWalLoop(instance *instance) {
+	i.cutToWalWg.Add(1)
+
+	go func() {
+		defer i.cutToWalWg.Done()
+
+		// wait for the signal to start. we need the wal to be completely replayed
+		// before we start cutting to WAL
+		select {
+		case <-i.cutToWalStart:
+		case <-i.cutToWalStop:
+			return
+		}
+
+		// ticker
+		ticker := time.NewTicker(i.cfg.FlushCheckPeriod)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				i.cutOneInstanceToWal(instance, false)
+			case <-i.cutToWalStop:
+				return
+			}
+		}
+	}()
+}
+
+// cutAllInstancesToWal periodically schedules series for flushing and garbage collects instances with no series
+func (i *Ingester) cutAllInstancesToWal() {
 	instances := i.getInstances()
 
 	for _, instance := range instances {
-		i.sweepInstance(instance, immediate)
+		i.cutOneInstanceToWal(instance, true)
 	}
 }
 
-func (i *Ingester) sweepInstance(instance *instance, immediate bool) {
+func (i *Ingester) cutOneInstanceToWal(instance *instance, immediate bool) {
 	// cut traces internally
 	err := instance.CutCompleteTraces(i.cfg.MaxTraceIdle, immediate)
 	if err != nil {
@@ -179,7 +193,7 @@ func (i *Ingester) sweepInstance(instance *instance, immediate bool) {
 	}
 
 	if blockID != uuid.Nil {
-		level.Info(log.Logger).Log("msg", "head block cut. enqueueing flush op", "userid", instance.instanceID, "block", blockID)
+		level.Info(log.Logger).Log("msg", "head block cut. enqueueing flush op", "tenant", instance.instanceID, "block", blockID)
 		// jitter to help when flushing many instances at the same time
 		// no jitter if immediate (initiated via /flush handler for example)
 		i.enqueue(&flushOp{
@@ -207,6 +221,7 @@ func (i *Ingester) flushLoop(j int) {
 		if o == nil {
 			return
 		}
+
 		op := o.(*flushOp)
 		op.attempts++
 
@@ -214,7 +229,7 @@ func (i *Ingester) flushLoop(j int) {
 		var err error
 
 		if op.kind == opKindComplete {
-			retry, err = i.handleComplete(op)
+			retry, err = i.handleComplete(context.Background(), op)
 		} else {
 			retry, err = i.handleFlush(context.Background(), op.userID, op.blockID)
 		}
@@ -246,7 +261,11 @@ func handleAbandonedOp(op *flushOp) {
 		"op", op.kind, "block", op.blockID.String(), "attempts", op.attempts)
 }
 
-func (i *Ingester) handleComplete(op *flushOp) (retry bool, err error) {
+func (i *Ingester) handleComplete(ctx context.Context, op *flushOp) (retry bool, err error) {
+	ctx, sp := tracer.Start(ctx, "ingester.Complete", trace.WithAttributes(attribute.String("tenant", op.userID), attribute.String("blockID", op.blockID.String())))
+	defer sp.End()
+	withSpan(level.Info(log.Logger), sp).Log("msg", "completing block", "tenant", op.userID, "block", op.blockID.String())
+
 	// No point in proceeding if shutdown has been initiated since
 	// we won't be able to queue up the next flush op
 	if i.flushQueues.IsStopped() {
@@ -255,20 +274,19 @@ func (i *Ingester) handleComplete(op *flushOp) (retry bool, err error) {
 	}
 
 	start := time.Now()
-	level.Info(log.Logger).Log("msg", "completing block", "userid", op.userID, "blockID", op.blockID)
 	instance, err := i.getOrCreateInstance(op.userID)
 	if err != nil {
 		return false, err
 	}
 
-	err = instance.CompleteBlock(op.blockID)
-	level.Info(log.Logger).Log("msg", "block completed", "userid", op.userID, "blockID", op.blockID, "duration", time.Since(start))
+	err = instance.CompleteBlock(ctx, op.blockID)
+	level.Info(log.Logger).Log("msg", "block completed", "tenant", op.userID, "blockID", op.blockID, "duration", time.Since(start))
 	if err != nil {
 		handleFailedOp(op, err)
 
 		if op.attempts >= maxCompleteAttempts {
 			level.Error(log.WithUserID(op.userID, log.Logger)).Log("msg", "Block exceeded max completion errors. Deleting. POSSIBLE DATA LOSS",
-				"userID", op.userID, "attempts", op.attempts, "block", op.blockID.String())
+				"tenant", op.userID, "attempts", op.attempts, "block", op.blockID.String())
 
 			// Delete WAL and move on
 			err = instance.ClearCompletingBlock(op.blockID)
@@ -280,7 +298,7 @@ func (i *Ingester) handleComplete(op *flushOp) (retry bool, err error) {
 
 	err = instance.ClearCompletingBlock(op.blockID)
 	if err != nil {
-		return false, errors.Wrap(err, "error clearing completing block")
+		return false, fmt.Errorf("error clearing completing block: %w", err)
 	}
 
 	// add a flushOp for the block we just completed
@@ -296,12 +314,12 @@ func (i *Ingester) handleComplete(op *flushOp) (retry bool, err error) {
 
 // withSpan adds traceID to a logger, if span is sampled
 // TODO: move into some central trace/log package
-func withSpan(logger gklog.Logger, sp ot.Span) gklog.Logger {
+func withSpan(logger gklog.Logger, sp trace.Span) gklog.Logger {
 	if sp == nil {
 		return logger
 	}
-	sctx, ok := sp.Context().(jaeger.SpanContext)
-	if !ok || !sctx.IsSampled() {
+	sctx := sp.SpanContext()
+	if !sctx.IsSampled() {
 		return logger
 	}
 
@@ -309,9 +327,9 @@ func withSpan(logger gklog.Logger, sp ot.Span) gklog.Logger {
 }
 
 func (i *Ingester) handleFlush(ctx context.Context, userID string, blockID uuid.UUID) (retry bool, err error) {
-	sp, ctx := ot.StartSpanFromContext(ctx, "flush", ot.Tag{Key: "organization", Value: userID}, ot.Tag{Key: "blockID", Value: blockID.String()})
-	defer sp.Finish()
-	withSpan(level.Info(log.Logger), sp).Log("msg", "flushing block", "userid", userID, "block", blockID.String())
+	ctx, sp := tracer.Start(ctx, "ingester.Flush", trace.WithAttributes(attribute.String("tenant", userID), attribute.String("blockID", blockID.String())))
+	defer sp.End()
+	withSpan(level.Info(log.Logger), sp).Log("msg", "flushing block", "tenant", userID, "block", blockID.String())
 
 	instance, err := i.getOrCreateInstance(userID)
 	if err != nil {
@@ -330,10 +348,10 @@ func (i *Ingester) handleFlush(ctx context.Context, userID string, blockID uuid.
 		start := time.Now()
 		err = i.store.WriteBlock(ctx, block)
 		metricFlushDuration.Observe(time.Since(start).Seconds())
-		metricFlushSize.Observe(float64(block.BlockMeta().Size))
+		metricFlushSize.Observe(float64(block.BlockMeta().Size_))
 		if err != nil {
-			ext.Error.Set(sp, true)
-			sp.LogFields(otlog.Error(err))
+			sp.SetStatus(codes.Error, "")
+			sp.RecordError(err)
 			return true, err
 		}
 
@@ -345,6 +363,19 @@ func (i *Ingester) handleFlush(ctx context.Context, userID string, blockID uuid.
 	return false, nil
 }
 
+func (i *Ingester) enqueueExec(op *flushOp) {
+	// Check if shutdown initiated
+	if i.flushQueues.IsStopped() {
+		handleAbandonedOp(op)
+		return
+	}
+
+	err := i.flushQueues.Enqueue(op)
+	if err != nil {
+		handleFailedOp(op, err)
+	}
+}
+
 func (i *Ingester) enqueue(op *flushOp, jitter bool) {
 	delay := time.Duration(0)
 
@@ -354,19 +385,15 @@ func (i *Ingester) enqueue(op *flushOp, jitter bool) {
 
 	op.at = time.Now().Add(delay)
 
+	if !jitter {
+		// Execute synchronously to make sure we can flush during shutdown
+		i.enqueueExec(op)
+		return
+	}
+
 	go func() {
 		time.Sleep(delay)
-
-		// Check if shutdown initiated
-		if i.flushQueues.IsStopped() {
-			handleAbandonedOp(op)
-			return
-		}
-
-		err := i.flushQueues.Enqueue(op)
-		if err != nil {
-			handleFailedOp(op, err)
-		}
+		i.enqueueExec(op)
 	}()
 }
 

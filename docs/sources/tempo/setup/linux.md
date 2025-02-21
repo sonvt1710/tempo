@@ -17,7 +17,7 @@ These instructions focus on a [monolithic installation]({{< relref "./deployment
 
 To follow this guide, you need:
 
-- A running Grafana instance (see [installation instructions](https://grafana.com/docs/grafana/latest/setup-grafana/installation/))
+- A running Grafana instance (see [installation instructions](/docs/grafana/latest/setup-grafana/installation/))
 - An Amazon S3 compatible object store
 - Git, Docker, and docker-compose plugin installed to test Tempo
 
@@ -56,26 +56,25 @@ Consider adding a prefix for your organization to the bucket, for example, `myor
 For a linux-amd64 installation, run the following commands via the command line interface on your Linux machine.
 You need administrator privileges to do this by running as the `root` user or via `sudo` as a user with permissions to do so.
 
-1. Download the tempo binary, verify checksums, and add network capabilities to the binary. Be sure to [download the correct package installation](https://github.com/grafana/tempo/releases/tag/v1.5.0) for your OS and architecture:
+1. Download the Tempo binary, verify checksums (listed in `SHA256SUMS`), and add network capabilities to the binary. Be sure to [download the correct package installation](https://github.com/grafana/tempo/releases/) for your OS and architecture:
 
    ```bash
-   curl -Lo tempo_1.5.0_linux_amd64.deb https://github.com/grafana/tempo/releases/download/v1.5.0/tempo_1.5.0_linux_amd64.deb
-   echo 967b06434252766e424eef997162ef89257fdb232c032369ad2e644920337a8c \
-     tempo_1.5.0_linux_amd64.deb | sha256sum -c
-   dpkg -i tempo_1.5.0_linux_amd64.deb
+   curl -Lo tempo_2.2.0_linux_amd64.deb https://github.com/grafana/tempo/releases/download/v2.2.0/tempo_2.2.0_linux_amd64.deb
+   echo e81cb4ae47e1d8069efaad400df15547e809b849cbb18932e23ac3082995535b \
+     tempo_2.2.0_linux_amd64.deb | sha256sum -c
+   dpkg -i tempo_2.2.0_linux_amd64.deb
    ```
 
 ## Create a Tempo configuration file
 
 Copy the following YAML configuration to a file called `tempo.yaml`.
 
-Paste in your S3 credentials for admin_client and the storage backend. If you wish to give your cluster a unique name, add a cluster property with the appropriate name.
+Paste in your S3 credentials for `admin_client` and the storage backend. If you wish to give your cluster a unique name, add a cluster property with the appropriate name.
 
 Refer to the [Tempo configuration documentation]({{< relref "../configuration" >}}) for explanations of the available options.
 
 In the following configuration, Tempo options are altered to only listen to the OTLP gRPC and HTTP protocols.
 By default, Tempo listens for all compatible protocols.
-The [extended instructions for installing the TNS application]({{< relref "set-up-test-app" >}}) and Grafana Agent to verify that Tempo is receiving traces, relies on the default Jaeger port being available. If Tempo were also attempting to listen on the same port as the Grafana Agent for Jaeger, then Tempo would not start due a port conflict, hence we disable listening on that port in Tempo for a single Linux node.
 
 ```yaml
 server:
@@ -98,7 +97,7 @@ metrics_generator:
       source: tempo
       cluster: linux-microservices
   storage:
-    path: /tmp/tempo/generator/wal
+    path: /var/tempo/generator/wal
     remote_write:
     - url: http://localhost:9090/api/v1/write
       send_exemplars: true
@@ -110,16 +109,19 @@ storage:
       endpoint: s3.us-east-1.amazonaws.com
       bucket: grafana-traces-data
       forcepathstyle: true
-      #set to true if endpoint is https
+      enable_dual_stack: false
+      # set to false if endpoint is https
       insecure: true
       access_key: # TODO - Add S3 access key
       secret_key: # TODO - Add S3 secret key
     wal:
-      path: /tmp/tempo/wal         # where to store the the wal locally
+      path: /var/tempo/wal         # where to store the wal locally
     local:
-      path: /tmp/tempo/blocks
+      path: /var/tempo/blocks
 overrides:
-  metrics_generator_processors: [service-graphs, span-metrics]
+  defaults:
+    metrics_generator:
+      processors: [service-graphs, span-metrics]
 ```
 >**Note:** In the above configuration, metrics generator is enabled to generate Prometheus metrics data from incoming trace spans. This is sent to a Prometheus remote write compatible metrics store at `http://prometheus:9090/api/v1/write` (in the `metrics_generator` configuration block). Ensure you change the relevant `url` parameter to your own Prometheus compatible storage instance, or disable the metrics generator by removing the `metrics_generators_processors` if you do not wish to generate span metrics.
 
@@ -236,13 +238,13 @@ Docker compose uses an internal networking bridge to connect all of the defined 
 1. As part of the docker compose manifest, Grafana is now running on your Linux machine, reachable on port 3000. Point your web browser to the Linux machine on port 3000. You might need to port forward the local port if you’re doing this remotely, for example, via SSH forwarding.
 
 1. Once logged in, navigate to the **Explore** page, select the Tempo data source and select the **Search** tab. Select **Run query** to list the recent traces stored in Tempo. Select one to view the trace diagram:
-    <p align="center"><img src="../assets/setup-linux-run-query.png" alt="Query example"></p>
+   {{< figure align="center" src="/media/docs/grafana/data-sources/tempo/query-editor/tempo-ds-builder-span-details-v11.png" alt="Use the query builder to explore tracing data in Grafana" >}}
 
 
 1. Alter the Tempo configuration to point to the instance of Prometheus running in docker compose. To do so, edit the configuration at `/etc/tempo/config.yaml` and change the `storage` block under the `metrics_generator` section so that the remote write url is `http://localhost:9090`. The configuration section should look like this:
    ```
     storage:
-        path: /tmp/tempo/generator/wal
+        path: /var/tempo/generator/wal
         remote_write:
            - url: http://localhost:9090/api/v1/write
            send_exemplars: true
@@ -257,4 +259,4 @@ Docker compose uses an internal networking bridge to connect all of the defined 
    ```
 
 1. A couple of minutes after Tempo has successfully restarted, select the **Service graph** tab for the Tempo data source in the **Explore** page. Select **Run query** to view a service graph, generated by Tempo’s metrics-generator.
-    <p align="center"><img src="../assets/setup-linux-node-graph.png" alt="Service graph sample"></p>
+    {{< figure align="center" src="/media/docs/grafana/data-sources/tempo/query-editor/tempo-ds-query-service-graph.png" alt="Service graph sample" >}}

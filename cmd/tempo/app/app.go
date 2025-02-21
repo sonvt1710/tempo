@@ -3,29 +3,33 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/go-kit/log/level"
 	"github.com/gorilla/mux"
 	"github.com/grafana/dskit/grpcutil"
 	"github.com/grafana/dskit/kv/memberlist"
+	"github.com/grafana/dskit/middleware"
 	"github.com/grafana/dskit/modules"
 	"github.com/grafana/dskit/ring"
+	"github.com/grafana/dskit/server"
 	"github.com/grafana/dskit/services"
+	"github.com/grafana/dskit/signals"
+	"github.com/grafana/tempo/modules/blockbuilder"
 	"github.com/jedib0t/go-pretty/v6/table"
-	"github.com/pkg/errors"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/version"
-	"github.com/weaveworks/common/middleware"
-	"github.com/weaveworks/common/server"
-	"github.com/weaveworks/common/signals"
+	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"gopkg.in/yaml.v3"
 
+	"github.com/grafana/tempo/cmd/tempo/build"
 	"github.com/grafana/tempo/modules/compactor"
 	"github.com/grafana/tempo/modules/distributor"
 	"github.com/grafana/tempo/modules/distributor/receiver"
@@ -35,45 +39,46 @@ import (
 	"github.com/grafana/tempo/modules/overrides"
 	"github.com/grafana/tempo/modules/querier"
 	"github.com/grafana/tempo/modules/storage"
+	"github.com/grafana/tempo/pkg/api"
+	"github.com/grafana/tempo/pkg/cache"
 	"github.com/grafana/tempo/pkg/usagestats"
 	"github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/pkg/util/log"
+	util_log "github.com/grafana/tempo/pkg/util/log"
 )
 
-const metricsNamespace = "tempo"
-const apiDocs = "https://grafana.com/docs/tempo/latest/api_docs/"
+const (
+	metricsNamespace = "tempo"
+	apiDocs          = "https://grafana.com/docs/tempo/latest/api_docs/"
+)
 
 var (
-	metricConfigFeatDesc = prometheus.NewDesc(
-		"tempo_feature_enabled",
-		"Boolean for configuration variables",
-		[]string{"feature"},
-		nil,
-	)
-
-	statFeatureEnabledAuth                  = usagestats.NewInt("feature_enabled_auth_stats")
-	statFeatureEnabledMultitenancy          = usagestats.NewInt("feature_enabled_multitenancy")
-	statFeatureAutocompleteFilteringEnabled = usagestats.NewInt("feature_enabled_autocomplete_filtering")
+	statFeatureEnabledAuth         = usagestats.NewInt("feature_enabled_auth_stats")
+	statFeatureEnabledMultitenancy = usagestats.NewInt("feature_enabled_multitenancy")
 )
 
 // App is the root datastructure.
 type App struct {
 	cfg Config
 
-	Server         *server.Server
+	Server         TempoServer
 	InternalServer *server.Server
-	ring           *ring.Ring
-	generatorRing  *ring.Ring
-	overrides      *overrides.Overrides
-	distributor    *distributor.Distributor
-	querier        *querier.Querier
-	frontend       *frontend_v1.Frontend
-	compactor      *compactor.Compactor
-	ingester       *ingester.Ingester
-	generator      *generator.Generator
-	store          storage.Store
-	usageReport    *usagestats.Reporter
-	MemberlistKV   *memberlist.KVInitService
+
+	readRings            map[string]*ring.Ring
+	partitionRing        *ring.PartitionInstanceRing
+	partitionRingWatcher *ring.PartitionRingWatcher
+	Overrides            overrides.Service
+	distributor          *distributor.Distributor
+	querier              *querier.Querier
+	frontend             *frontend_v1.Frontend
+	compactor            *compactor.Compactor
+	ingester             *ingester.Ingester
+	generator            *generator.Generator
+	blockBuilder         *blockbuilder.BlockBuilder
+	store                storage.Store
+	usageReport          *usagestats.Reporter
+	cacheProvider        cache.Provider
+	MemberlistKV         *memberlist.KVInitService
 
 	HTTPAuthMiddleware       middleware.Interface
 	TracesConsumerMiddleware receiver.Middleware
@@ -86,7 +91,9 @@ type App struct {
 // New makes a new app.
 func New(cfg Config) (*App, error) {
 	app := &App{
-		cfg: cfg,
+		cfg:       cfg,
+		readRings: map[string]*ring.Ring{},
+		Server:    newTempoServer(),
 	}
 
 	usagestats.Edition("oss")
@@ -101,15 +108,10 @@ func New(cfg Config) (*App, error) {
 		statFeatureEnabledMultitenancy.Set(1)
 	}
 
-	statFeatureAutocompleteFilteringEnabled.Set(0)
-	if cfg.AutocompleteFilteringEnabled {
-		statFeatureAutocompleteFilteringEnabled.Set(1)
-	}
-
 	app.setupAuthMiddleware()
 
 	if err := app.setupModuleManager(); err != nil {
-		return nil, fmt.Errorf("failed to setup module manager %w", err)
+		return nil, fmt.Errorf("failed to setup module manager: %w", err)
 	}
 
 	return app, nil
@@ -166,7 +168,7 @@ func (t *App) Run() error {
 
 	serviceMap, err := t.ModuleManager.InitModuleServices(t.cfg.Target)
 	if err != nil {
-		return fmt.Errorf("failed to init module services %w", err)
+		return fmt.Errorf("failed to init module services: %w", err)
 	}
 	t.serviceMap = serviceMap
 
@@ -177,18 +179,26 @@ func (t *App) Run() error {
 
 	sm, err := services.NewManager(servs...)
 	if err != nil {
-		return fmt.Errorf("failed to start service manager %w", err)
+		return fmt.Errorf("failed to start service manager: %w", err)
 	}
 
+	// Used to delay shutdown but return "not ready" during this delay.
+	shutdownRequested := atomic.NewBool(false)
 	// before starting servers, register /ready handler and gRPC health check service.
 	if t.cfg.InternalServer.Enable {
-		t.InternalServer.HTTP.Path("/ready").Methods("GET").Handler(t.readyHandler(sm))
+		t.InternalServer.HTTP.Path("/ready").Methods("GET").Handler(t.readyHandler(sm, shutdownRequested))
 	}
 
-	t.Server.HTTP.Path("/ready").Handler(t.readyHandler(sm))
-	t.Server.HTTP.Path("/status").Handler(t.statusHandler()).Methods("GET")
-	t.Server.HTTP.Path("/status/{endpoint}").Handler(t.statusHandler()).Methods("GET")
-	grpc_health_v1.RegisterHealthServer(t.Server.GRPC, grpcutil.NewHealthCheck(sm))
+	t.Server.HTTPRouter().Path(addHTTPAPIPrefix(&t.cfg, api.PathBuildInfo)).Handler(t.buildinfoHandler()).Methods("GET")
+
+	t.Server.HTTPRouter().Path("/ready").Handler(t.readyHandler(sm, shutdownRequested))
+	t.Server.HTTPRouter().Path("/status").Handler(t.statusHandler()).Methods("GET")
+	t.Server.HTTPRouter().Path("/status/{endpoint}").Handler(t.statusHandler()).Methods("GET")
+	grpc_health_v1.RegisterHealthServer(t.Server.GRPC(),
+		grpcutil.NewHealthCheckFrom(
+			grpcutil.WithShutdownRequested(shutdownRequested),
+			grpcutil.WithManager(sm),
+		))
 
 	// Let's listen for events from this manager, and log them.
 	healthy := func() { level.Info(log.Logger).Log("msg", "Tempo started") }
@@ -200,14 +210,14 @@ func (t *App) Run() error {
 		// let's find out which module failed
 		for m, s := range serviceMap {
 			if s == service {
-				switch service.FailureCase() {
-				case modules.ErrStopProcess:
-					level.Info(log.Logger).Log("msg", "received stop signal via return error", "module", m, "err", service.FailureCase())
-				case context.Canceled:
-				default:
-					level.Error(log.Logger).Log("msg", "module failed", "module", m, "err", service.FailureCase())
+				err = service.FailureCase()
+				if errors.Is(err, modules.ErrStopProcess) {
+					level.Info(log.Logger).Log("msg", "received stop signal via return error", "module", m, "err", err)
+				} else if errors.Is(err, context.Canceled) {
+					return
+				} else if err != nil {
+					level.Error(log.Logger).Log("msg", "module failed", "module", m, "err", err)
 				}
-
 				return
 			}
 		}
@@ -217,9 +227,17 @@ func (t *App) Run() error {
 	sm.AddListener(services.NewManagerListener(healthy, stopped, serviceFailed))
 
 	// Setup signal handler. If signal arrives, we stop the manager, which stops all the services.
-	handler := signals.NewHandler(t.Server.Log)
+	handler := signals.NewHandler(t.Server.Log())
 	go func() {
 		handler.Loop()
+
+		shutdownRequested.Store(true)
+		t.Server.SetKeepAlivesEnabled(false)
+
+		if t.cfg.ShutdownDelay > 0 {
+			time.Sleep(t.cfg.ShutdownDelay)
+		}
+
 		sm.StopAsync()
 	}()
 
@@ -227,7 +245,7 @@ func (t *App) Run() error {
 	// in other state than New, which should not be the case.
 	err = sm.StartAsync(context.Background())
 	if err != nil {
-		return fmt.Errorf("failed to start service manager %w", err)
+		return fmt.Errorf("failed to start service manager: %w", err)
 	}
 
 	return sm.AwaitStopped(context.Background())
@@ -248,7 +266,7 @@ func (t *App) writeStatusConfig(w io.Writer, r *http.Request) error {
 	mode := r.URL.Query().Get("mode")
 	switch mode {
 	case "diff":
-		defaultCfg := newDefaultConfig()
+		defaultCfg := NewDefaultConfig()
 
 		defaultCfgYaml, err := util.YAMLMarshalUnmarshal(defaultCfg)
 		if err != nil {
@@ -265,11 +283,11 @@ func (t *App) writeStatusConfig(w io.Writer, r *http.Request) error {
 			return err
 		}
 	case "defaults":
-		output = newDefaultConfig()
+		output = NewDefaultConfig()
 	case "":
 		output = t.cfg
 	default:
-		return errors.Errorf("unknown value for mode query parameter: %v", mode)
+		return fmt.Errorf("unknown value for mode query parameter: %v", mode)
 	}
 
 	out, err := yaml.Marshal(output)
@@ -290,8 +308,14 @@ func (t *App) writeStatusConfig(w io.Writer, r *http.Request) error {
 	return nil
 }
 
-func (t *App) readyHandler(sm *services.Manager) http.HandlerFunc {
+func (t *App) readyHandler(sm *services.Manager, shutdownRequested *atomic.Bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if shutdownRequested.Load() {
+			level.Debug(util_log.Logger).Log("msg", "application is stopping")
+			http.Error(w, "Application is stopping", http.StatusServiceUnavailable)
+			return
+		}
+
 		if !sm.IsHealthy() {
 			msg := bytes.Buffer{}
 			msg.WriteString("Some services are not Running:\n")
@@ -338,11 +362,11 @@ func (t *App) readyHandler(sm *services.Manager) http.HandlerFunc {
 
 func (t *App) writeRuntimeConfig(w io.Writer, r *http.Request) error {
 	// Querier and query-frontend services do not run the overrides module
-	if t.overrides == nil {
+	if t.Overrides == nil {
 		_, err := w.Write([]byte(fmt.Sprintf("overrides module not loaded in %s\n", t.cfg.Target)))
 		return err
 	}
-	return t.overrides.WriteStatusRuntimeConfig(w, r)
+	return t.Overrides.WriteStatusRuntimeConfig(w, r)
 }
 
 func (t *App) statusHandler() http.HandlerFunc {
@@ -403,7 +427,7 @@ func (t *App) statusHandler() http.HandlerFunc {
 					if err == nil {
 						err = e
 					} else {
-						err = errors.Wrap(err, e.Error())
+						err = fmt.Errorf("%s: %w", e.Error(), err)
 					}
 				}
 			}
@@ -463,7 +487,7 @@ func (t *App) writeStatusEndpoints(w io.Writer) error {
 
 	endpoints := []endpoint{}
 
-	err := t.Server.HTTP.Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {
+	err := t.Server.HTTPRouter().Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {
 		e := endpoint{}
 
 		pathTemplate, err := route.GetPathTemplate()
@@ -481,7 +505,7 @@ func (t *App) writeStatusEndpoints(w io.Writer) error {
 		return nil
 	})
 	if err != nil {
-		return errors.Wrap(err, "error walking routes")
+		return fmt.Errorf("error walking routes: %w", err)
 	}
 
 	sort.Slice(endpoints[:], func(i, j int) bool {
@@ -503,8 +527,22 @@ func (t *App) writeStatusEndpoints(w io.Writer) error {
 
 	_, err = w.Write([]byte(fmt.Sprintf("\nAPI documentation: %s\n\n", apiDocs)))
 	if err != nil {
-		return errors.Wrap(err, "error writing status endpoints")
+		return fmt.Errorf("error writing status endpoints: %w", err)
 	}
 
 	return nil
+}
+
+func (t *App) buildinfoHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		err := json.NewEncoder(w).Encode(build.GetVersion())
+
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			level.Error(log.Logger).Log("msg", "error writing response", "err", err)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+	}
 }

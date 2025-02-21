@@ -3,19 +3,21 @@ package gcs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"cloud.google.com/go/storage"
 	"github.com/google/uuid"
 	"github.com/googleapis/gax-go/v2"
-	"github.com/grafana/tempo/tempodb/backend"
 	"google.golang.org/api/iterator"
+
+	"github.com/grafana/tempo/tempodb/backend"
 )
 
 func (rw *readerWriter) MarkBlockCompacted(blockID uuid.UUID, tenantID string) error {
 	// move meta file to a new location
-	metaFilename := backend.MetaFileName(blockID, tenantID)
-	compactedMetaFilename := backend.CompactedMetaFileName(blockID, tenantID)
+	metaFilename := backend.MetaFileName(blockID, tenantID, rw.cfg.Prefix)
+	compactedMetaFilename := backend.CompactedMetaFileName(blockID, tenantID, rw.cfg.Prefix)
 
 	src := rw.bucket.Object(metaFilename)
 	dst := rw.bucket.Object(compactedMetaFilename).Retryer(
@@ -43,13 +45,13 @@ func (rw *readerWriter) ClearBlock(blockID uuid.UUID, tenantID string) error {
 
 	ctx := context.TODO()
 	iter := rw.bucket.Objects(ctx, &storage.Query{
-		Prefix:   backend.RootPath(blockID, tenantID),
+		Prefix:   backend.RootPath(blockID, tenantID, rw.cfg.Prefix),
 		Versions: false,
 	})
 
 	for {
 		attrs, err := iter.Next()
-		if err == iterator.Done {
+		if errors.Is(err, iterator.Done) {
 			break
 		}
 		if err != nil {
@@ -67,9 +69,9 @@ func (rw *readerWriter) ClearBlock(blockID uuid.UUID, tenantID string) error {
 }
 
 func (rw *readerWriter) CompactedBlockMeta(blockID uuid.UUID, tenantID string) (*backend.CompactedBlockMeta, error) {
-	name := backend.CompactedMetaFileName(blockID, tenantID)
+	name := backend.CompactedMetaFileName(blockID, tenantID, rw.cfg.Prefix)
 
-	bytes, modTime, err := rw.readAllWithModTime(context.Background(), name)
+	bytes, attrs, err := rw.readAll(context.Background(), name)
 	if err != nil {
 		return nil, readError(err)
 	}
@@ -79,7 +81,7 @@ func (rw *readerWriter) CompactedBlockMeta(blockID uuid.UUID, tenantID string) (
 	if err != nil {
 		return nil, err
 	}
-	out.CompactedTime = modTime
+	out.CompactedTime = attrs.LastModified
 
 	return out, nil
 }

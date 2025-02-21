@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 
+	"github.com/grafana/tempo/pkg/collector"
 	"github.com/grafana/tempo/pkg/tempopb"
 	v1 "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	"github.com/grafana/tempo/pkg/util"
@@ -21,10 +23,11 @@ import (
 
 func TestEngine_Execute(t *testing.T) {
 	now := time.Now()
-	e := Engine{}
+	e := NewEngine()
 
 	req := &tempopb.SearchRequest{
-		Query: `{ .foo = .bar }`,
+		Query:           `{ .foo = .bar }`,
+		SpansPerSpanSet: 2,
 	}
 	spanSetFetcher := MockSpanSetFetcher{
 		iterator: &MockSpanSetIterator{
@@ -33,6 +36,12 @@ func TestEngine_Execute(t *testing.T) {
 					TraceID:         []byte{1},
 					RootSpanName:    "HTTP GET",
 					RootServiceName: "my-service",
+					ServiceStats: map[string]ServiceStats{
+						"my-service": {
+							SpanCount:  6,
+							ErrorCount: 0,
+						},
+					},
 					Spans: []Span{
 						&mockSpan{
 							id: []byte{1},
@@ -42,6 +51,33 @@ func TestEngine_Execute(t *testing.T) {
 						},
 						&mockSpan{
 							id:                 []byte{2},
+							startTimeUnixNanos: uint64(now.UnixNano()),
+							durationNanos:      uint64((100 * time.Millisecond).Nanoseconds()),
+							attributes: map[Attribute]Static{
+								NewAttribute("foo"): NewStaticString("value"),
+								NewAttribute("bar"): NewStaticString("value"),
+							},
+						},
+						&mockSpan{
+							id:                 []byte{3},
+							startTimeUnixNanos: uint64(now.UnixNano()),
+							durationNanos:      uint64((200 * time.Millisecond).Nanoseconds()),
+							attributes: map[Attribute]Static{
+								NewAttribute("foo"): NewStaticString("value"),
+								NewAttribute("bar"): NewStaticString("value"),
+							},
+						},
+						&mockSpan{
+							id:                 []byte{4},
+							startTimeUnixNanos: uint64(now.UnixNano()),
+							durationNanos:      uint64((100 * time.Millisecond).Nanoseconds()),
+							attributes: map[Attribute]Static{
+								NewAttribute("foo"): NewStaticString("value"),
+								NewAttribute("bar"): NewStaticString("diff"),
+							},
+						},
+						&mockSpan{
+							id:                 []byte{5},
 							startTimeUnixNanos: uint64(now.UnixNano()),
 							durationNanos:      uint64((100 * time.Millisecond).Nanoseconds()),
 							attributes: map[Attribute]Static{
@@ -76,44 +112,76 @@ func TestEngine_Execute(t *testing.T) {
 			newCondition(NewAttribute("foo"), OpNone),
 			newCondition(NewAttribute("bar"), OpNone),
 		},
-		AllConditions: true,
+		AllConditions:        true,
+		SecondPassConditions: SearchMetaConditions(),
 	}
-	spanSetFetcher.capturedRequest.Filter = nil // have to set this to nil b/c assert.Equal does not handle function pointers
+	spanSetFetcher.capturedRequest.SecondPass = nil // have to set this to nil b/c assert.Equal does not handle function pointers
 	assert.Equal(t, expectedFetchSpansRequest, spanSetFetcher.capturedRequest)
 
+	expectedSpanset := &tempopb.SpanSet{
+		Spans: []*tempopb.Span{
+			{
+				SpanID:            "0000000000000002",
+				StartTimeUnixNano: uint64(now.UnixNano()),
+				DurationNanos:     100_000_000,
+				Attributes: []*v1.KeyValue{
+					{
+						Key: "foo",
+						Value: &v1.AnyValue{
+							Value: &v1.AnyValue_StringValue{
+								StringValue: "value",
+							},
+						},
+					},
+					{
+						Key: "bar",
+						Value: &v1.AnyValue{
+							Value: &v1.AnyValue_StringValue{
+								StringValue: "value",
+							},
+						},
+					},
+				},
+			},
+			{
+				SpanID:            "0000000000000003",
+				StartTimeUnixNano: uint64(now.UnixNano()),
+				DurationNanos:     200_000_000,
+				Attributes: []*v1.KeyValue{
+					{
+						Key: "foo",
+						Value: &v1.AnyValue{
+							Value: &v1.AnyValue_StringValue{
+								StringValue: "value",
+							},
+						},
+					},
+					{
+						Key: "bar",
+						Value: &v1.AnyValue{
+							Value: &v1.AnyValue_StringValue{
+								StringValue: "value",
+							},
+						},
+					},
+				},
+			},
+		},
+		Matched: 0,
+	}
 	expectedTraceSearchMetadata := []*tempopb.TraceSearchMetadata{
 		{
 			TraceID:         "1",
 			RootServiceName: "my-service",
 			RootTraceName:   "HTTP GET",
-			SpanSet: &tempopb.SpanSet{
-				Spans: []*tempopb.Span{
-					{
-						SpanID:            "0000000000000002",
-						StartTimeUnixNano: uint64(now.UnixNano()),
-						DurationNanos:     100_000_000,
-						Attributes: []*v1.KeyValue{
-							{
-								Key: "foo",
-								Value: &v1.AnyValue{
-									Value: &v1.AnyValue_StringValue{
-										StringValue: "value",
-									},
-								},
-							},
-							{
-								Key: "bar",
-								Value: &v1.AnyValue{
-									Value: &v1.AnyValue_StringValue{
-										StringValue: "value",
-									},
-								},
-							},
-						},
-					},
+			ServiceStats: map[string]*tempopb.ServiceStats{
+				"my-service": {
+					SpanCount:  6,
+					ErrorCount: 0,
 				},
-				Matched: 1,
 			},
+			SpanSet:  expectedSpanset,
+			SpanSets: []*tempopb.SpanSet{expectedSpanset},
 		},
 	}
 
@@ -150,6 +218,12 @@ func TestEngine_asTraceSearchMetadata(t *testing.T) {
 		RootSpanName:       "HTTP GET",
 		StartTimeUnixNanos: 1000,
 		DurationNanos:      uint64(time.Second.Nanoseconds()),
+		ServiceStats: map[string]ServiceStats{
+			"service1": {
+				SpanCount:  2,
+				ErrorCount: 1,
+			},
+		},
 		Spans: []Span{
 			&mockSpan{
 				id:                 spanID1,
@@ -173,85 +247,105 @@ func TestEngine_asTraceSearchMetadata(t *testing.T) {
 				attributes:         map[Attribute]Static{},
 			},
 		},
+		Attributes: []*SpansetAttribute{
+			{Name: attributeMatched, Val: NewStaticInt(2)},
+			{Name: "avg(duration)", Val: NewStaticFloat(15.0)},
+		},
 	}
 
-	e := NewEngine()
+	traceSearchMetadata := asTraceSearchMetadata(spanSet)
 
-	traceSearchMetadata := e.asTraceSearchMetadata(spanSet)
-
+	expectedSpanset := &tempopb.SpanSet{
+		Matched: 2,
+		Spans: []*tempopb.Span{
+			{
+				SpanID:            util.SpanIDToHexString(spanID1),
+				Name:              "HTTP GET",
+				StartTimeUnixNano: uint64(now.UnixNano()),
+				DurationNanos:     10_000_000_000,
+				Attributes: []*v1.KeyValue{
+					{
+						Key: "cluster",
+						Value: &v1.AnyValue{
+							Value: &v1.AnyValue_StringValue{
+								StringValue: "prod",
+							},
+						},
+					},
+					{
+						Key: "count",
+						Value: &v1.AnyValue{
+							Value: &v1.AnyValue_IntValue{
+								IntValue: 5,
+							},
+						},
+					},
+					{
+						Key: "count_but_float",
+						Value: &v1.AnyValue{
+							Value: &v1.AnyValue_DoubleValue{
+								DoubleValue: 5.0,
+							},
+						},
+					},
+					{
+						Key: "is_ok",
+						Value: &v1.AnyValue{
+							Value: &v1.AnyValue_BoolValue{
+								BoolValue: true,
+							},
+						},
+					},
+					{
+						Key: "kind",
+						Value: &v1.AnyValue{
+							Value: &v1.AnyValue_StringValue{
+								StringValue: KindClient.String(),
+							},
+						},
+					},
+					{
+						Key: "status",
+						Value: &v1.AnyValue{
+							Value: &v1.AnyValue_StringValue{
+								StringValue: StatusOk.String(),
+							},
+						},
+					},
+				},
+			},
+			{
+				SpanID:            util.SpanIDToHexString(spanID2),
+				StartTimeUnixNano: uint64(now.Add(2 * time.Second).UnixNano()),
+				DurationNanos:     20_000_000_000,
+				Attributes:        nil,
+			},
+		},
+		Attributes: []*v1.KeyValue{
+			{
+				Key: "avg(duration)",
+				Value: &v1.AnyValue{
+					Value: &v1.AnyValue_DoubleValue{
+						DoubleValue: 15.0,
+					},
+				},
+			},
+		},
+	}
 	expectedTraceSearchMetadata := &tempopb.TraceSearchMetadata{
 		TraceID:           util.TraceIDToHexString(traceID),
 		RootServiceName:   "my-service",
 		RootTraceName:     "HTTP GET",
 		StartTimeUnixNano: 1000,
 		DurationMs:        uint32(time.Second.Milliseconds()),
-		SpanSet: &tempopb.SpanSet{
-			Matched: 2,
-			Spans: []*tempopb.Span{
-				{
-					SpanID:            util.SpanIDToHexString(spanID1),
-					Name:              "HTTP GET",
-					StartTimeUnixNano: uint64(now.UnixNano()),
-					DurationNanos:     10_000_000_000,
-					Attributes: []*v1.KeyValue{
-						{
-							Key: "cluster",
-							Value: &v1.AnyValue{
-								Value: &v1.AnyValue_StringValue{
-									StringValue: "prod",
-								},
-							},
-						},
-						{
-							Key: "count",
-							Value: &v1.AnyValue{
-								Value: &v1.AnyValue_IntValue{
-									IntValue: 5,
-								},
-							},
-						},
-						{
-							Key: "count_but_float",
-							Value: &v1.AnyValue{
-								Value: &v1.AnyValue_DoubleValue{
-									DoubleValue: 5.0,
-								},
-							},
-						},
-						{
-							Key: "is_ok",
-							Value: &v1.AnyValue{
-								Value: &v1.AnyValue_BoolValue{
-									BoolValue: true,
-								},
-							},
-						},
-						{
-							Key: "kind",
-							Value: &v1.AnyValue{
-								Value: &v1.AnyValue_StringValue{
-									StringValue: KindClient.String(),
-								},
-							},
-						},
-						{
-							Key: "status",
-							Value: &v1.AnyValue{
-								Value: &v1.AnyValue_StringValue{
-									StringValue: StatusOk.String(),
-								},
-							},
-						},
-					},
-				},
-				{
-					SpanID:            util.SpanIDToHexString(spanID2),
-					StartTimeUnixNano: uint64(now.Add(2 * time.Second).UnixNano()),
-					DurationNanos:     20_000_000_000,
-					Attributes:        nil,
-				},
+		ServiceStats: map[string]*tempopb.ServiceStats{
+			"service1": {
+				SpanCount:  2,
+				ErrorCount: 1,
 			},
 		},
+		SpanSet:  expectedSpanset,
+		SpanSets: []*tempopb.SpanSet{expectedSpanset},
 	}
 
 	// Ensure attributes are sorted to avoid a flaky test
@@ -262,6 +356,53 @@ func TestEngine_asTraceSearchMetadata(t *testing.T) {
 	assert.Equal(t, expectedTraceSearchMetadata, traceSearchMetadata)
 }
 
+var _ TagValuesFetcher = (*MockAutocompleteFetcher)(nil)
+
+type MockAutocompleteFetcher struct {
+	query    string
+	iterator SpansetIterator
+}
+
+func (m *MockAutocompleteFetcher) Fetch(ctx context.Context, req FetchTagValuesRequest, cb FetchTagValuesCallback) error {
+	rootExpr, err := Parse(m.query)
+	if err != nil {
+		return err
+	}
+	if err := rootExpr.validate(); err != nil {
+		return err
+	}
+
+	for {
+		spanset, err := m.iterator.Next(ctx)
+		if err != nil && errors.Is(err, io.EOF) {
+			return err
+		}
+		if spanset == nil {
+			break
+		}
+		if len(spanset.Spans) == 0 {
+			continue
+		}
+
+		evalSS, _ := rootExpr.Pipeline.evaluate([]*Spanset{spanset})
+
+		for _, ss := range evalSS {
+			for _, s := range ss.Spans {
+				for attr, static := range s.AllAttributes() {
+					if attr.Name != req.TagName.Name {
+						continue
+					}
+					if cb(static) {
+						return nil
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 type MockSpanSetFetcher struct {
 	iterator        SpansetIterator
 	capturedRequest FetchSpansRequest
@@ -269,9 +410,9 @@ type MockSpanSetFetcher struct {
 
 var _ = (SpansetFetcher)(&MockSpanSetFetcher{})
 
-func (m *MockSpanSetFetcher) Fetch(ctx context.Context, request FetchSpansRequest) (FetchSpansResponse, error) {
+func (m *MockSpanSetFetcher) Fetch(_ context.Context, request FetchSpansRequest) (FetchSpansResponse, error) {
 	m.capturedRequest = request
-	m.iterator.(*MockSpanSetIterator).filter = request.Filter
+	m.iterator.(*MockSpanSetIterator).filter = request.SecondPass
 	return FetchSpansResponse{
 		Results: m.iterator,
 		Bytes: func() uint64 {
@@ -282,7 +423,7 @@ func (m *MockSpanSetFetcher) Fetch(ctx context.Context, request FetchSpansReques
 
 type MockSpanSetIterator struct {
 	results []*Spanset
-	filter  FilterSpans
+	filter  SecondPassFn
 }
 
 func (m *MockSpanSetIterator) Next(context.Context) (*Spanset, error) {
@@ -293,6 +434,10 @@ func (m *MockSpanSetIterator) Next(context.Context) (*Spanset, error) {
 		r := m.results[0]
 		m.results = m.results[1:]
 
+		if m.filter == nil {
+			return r, nil
+		}
+
 		ss, err := m.filter(r)
 		if err != nil {
 			return nil, err
@@ -301,7 +446,7 @@ func (m *MockSpanSetIterator) Next(context.Context) (*Spanset, error) {
 			continue
 		}
 
-		r.Spans = r.Spans[len(ss):]
+		r.Spans = ss[0].Spans
 		return r, nil
 	}
 }
@@ -335,10 +480,43 @@ func TestStatic_AsAnyValue(t *testing.T) {
 		{NewStaticStatus(StatusOk), &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "ok"}}},
 		{NewStaticKind(KindInternal), &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "internal"}}},
 		{NewStaticNil(), &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "nil"}}},
+		// Test for arrays
+		{
+			NewStaticIntArray([]int{1, 2}),
+			&v1.AnyValue{
+				Value: &v1.AnyValue_ArrayValue{
+					ArrayValue: &v1.ArrayValue{Values: []*v1.AnyValue{{Value: &v1.AnyValue_IntValue{IntValue: 1}}, {Value: &v1.AnyValue_IntValue{IntValue: 2}}}},
+				},
+			},
+		},
+		{
+			NewStaticFloatArray([]float64{1.1, 2.2}),
+			&v1.AnyValue{
+				Value: &v1.AnyValue_ArrayValue{
+					ArrayValue: &v1.ArrayValue{Values: []*v1.AnyValue{{Value: &v1.AnyValue_DoubleValue{DoubleValue: 1.1}}, {Value: &v1.AnyValue_DoubleValue{DoubleValue: 2.2}}}},
+				},
+			},
+		},
+		{
+			NewStaticStringArray([]string{"foo", "bar"}),
+			&v1.AnyValue{
+				Value: &v1.AnyValue_ArrayValue{
+					ArrayValue: &v1.ArrayValue{Values: []*v1.AnyValue{{Value: &v1.AnyValue_StringValue{StringValue: "foo"}}, {Value: &v1.AnyValue_StringValue{StringValue: "bar"}}}},
+				},
+			},
+		},
+		{
+			NewStaticBooleanArray([]bool{true, false}),
+			&v1.AnyValue{
+				Value: &v1.AnyValue_ArrayValue{
+					ArrayValue: &v1.ArrayValue{Values: []*v1.AnyValue{{Value: &v1.AnyValue_BoolValue{BoolValue: true}}, {Value: &v1.AnyValue_BoolValue{BoolValue: false}}}},
+				},
+			},
+		},
 	}
 	for _, tc := range tt {
 		t.Run(fmt.Sprintf("%v", tc.s), func(t *testing.T) {
-			assert.Equal(t, tc.expected, tc.s.asAnyValue())
+			assert.Equal(t, tc.expected, tc.s.AsAnyValue())
 		})
 	}
 }
@@ -351,53 +529,48 @@ func TestExamplesInEngine(t *testing.T) {
 	err = yaml.Unmarshal(b, queries)
 	require.NoError(t, err)
 
-	e := NewEngine()
-
 	for _, q := range queries.Valid {
 		t.Run("valid - "+q, func(t *testing.T) {
-			_, err := e.parseQuery(&tempopb.SearchRequest{
-				Query: q,
-			})
+			_, _, _, _, err := Compile(q)
 			require.NoError(t, err)
 		})
 	}
 
 	for _, q := range queries.ParseFails {
 		t.Run("parse fails - "+q, func(t *testing.T) {
-			_, err := e.parseQuery(&tempopb.SearchRequest{
-				Query: q,
-			})
+			_, _, _, _, err := Compile(q)
 			require.Error(t, err)
 		})
 	}
 
 	for _, q := range queries.ValidateFails {
 		t.Run("validate fails - "+q, func(t *testing.T) {
-			_, err := e.parseQuery(&tempopb.SearchRequest{
-				Query: q,
-			})
+			_, _, _, _, err := Compile(q)
 			require.Error(t, err)
-			require.False(t, errors.As(err, &unsupportedError{}))
+			var unErr *unsupportedError
+			require.False(t, errors.As(err, &unErr))
 		})
 	}
 
 	for _, q := range queries.Unsupported {
 		t.Run("unsupported - "+q, func(t *testing.T) {
-			_, err := e.parseQuery(&tempopb.SearchRequest{
-				Query: q,
-			})
+			_, _, _, _, err := Compile(q)
 			require.Error(t, err)
-			require.True(t, errors.As(err, &unsupportedError{}))
+			var unErr *unsupportedError
+			require.True(t, errors.As(err, &unErr))
 		})
 	}
 }
 
 func TestExecuteTagValues(t *testing.T) {
+	// TODO: This test is stupid, it's using the traceql engine to execute the query
+	//  and doesn't actually test the ExecuteTagValues function
 	now := time.Now()
 	e := Engine{}
 
-	mockSpansetFetcher := func() SpansetFetcher {
-		return &MockSpanSetFetcher{
+	mockSpansetFetcher := func(query string) TagValuesFetcher {
+		return &MockAutocompleteFetcher{
+			query: query,
 			iterator: &MockSpanSetIterator{
 				results: []*Spanset{
 					{
@@ -457,39 +630,59 @@ func TestExecuteTagValues(t *testing.T) {
 			name:           "scoped param, no query",
 			attribute:      "resource.service.name",
 			query:          "{}",
-			expectedValues: []tempopb.TagValue{{Type: "String", Value: "my-service"}},
+			expectedValues: []tempopb.TagValue{{Type: "string", Value: "my-service"}},
 		},
 		{
 			name:      "intrinsic param, no query",
 			attribute: "name",
 			query:     "{}",
 			expectedValues: []tempopb.TagValue{
-				{Type: "String", Value: "HTTP GET /status"},
-				{Type: "String", Value: "HTTP POST /api/v1/users"},
-				{Type: "String", Value: "redis call"},
+				{Type: "string", Value: "HTTP GET /status"},
+				{Type: "string", Value: "HTTP POST /api/v1/users"},
+				{Type: "string", Value: "redis call"},
 			},
 		},
 		{
 			name:           "scoped param, with query",
 			attribute:      "span.http.method",
 			query:          `{ span.http.target = "/api/v1/users" }`,
-			expectedValues: []tempopb.TagValue{{Type: "String", Value: "POST"}},
+			expectedValues: []tempopb.TagValue{{Type: "string", Value: "POST"}},
 		},
 		{
 			name:           "intrinsic param, with query",
 			attribute:      "name",
 			query:          `{ span.http.target = "/api/v1/users" }`,
-			expectedValues: []tempopb.TagValue{{Type: "String", Value: "HTTP POST /api/v1/users"}},
+			expectedValues: []tempopb.TagValue{{Type: "string", Value: "HTTP POST /api/v1/users"}},
+		},
+		{
+			name:      "bad TraceQL",
+			attribute: "name",
+			query:     `{ span.http.target = foo }`,
+			expectedValues: []tempopb.TagValue{
+				{Type: "string", Value: "HTTP GET /status"},
+				{Type: "string", Value: "HTTP POST /api/v1/users"},
+				{Type: "string", Value: "redis call"},
+			},
+		},
+		{
+			name:           "noop", // autocompleting an attribute already filtered by the query
+			attribute:      "name",
+			query:          `{ name = "foo" }`,
+			expectedValues: []tempopb.TagValue{{Type: "string", Value: "foo"}},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			distinctValues := collector.NewDistinctValue[tempopb.TagValue](100_000, 0, 0, func(v tempopb.TagValue) int { return len(v.Type) + len(v.Value) })
 
-			distinctValues := util.NewDistinctValueCollector[tempopb.TagValue](100_000, func(v tempopb.TagValue) int { return len(v.Type) + len(v.Value) })
-			cb := func(v Static) bool { return distinctValues.Collect(tempopb.TagValue{Type: "String", Value: v.S}) }
+			// Ugly hack to make the mock fetcher work with a bad query
+			fetcherQuery := tc.query
+			if _, err := Parse(tc.query); err != nil {
+				fetcherQuery = "{}"
+			}
 
 			tag, err := ParseIdentifier(tc.attribute)
 			assert.NoError(t, err)
-			assert.NoError(t, e.ExecuteTagValues(context.Background(), tag, tc.query, cb, mockSpansetFetcher()))
+			assert.NoError(t, e.ExecuteTagValues(context.Background(), tag, tc.query, MakeCollectTagValueFunc(distinctValues.Collect), mockSpansetFetcher(fetcherQuery)))
 			values := distinctValues.Values()
 			sort.Slice(values, func(i, j int) bool {
 				return values[i].Value < values[j].Value
@@ -497,5 +690,4 @@ func TestExecuteTagValues(t *testing.T) {
 			assert.Equal(t, tc.expectedValues, values)
 		})
 	}
-
 }

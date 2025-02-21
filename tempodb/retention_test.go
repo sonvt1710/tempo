@@ -23,7 +23,7 @@ func TestRetention(t *testing.T) {
 	tempDir := t.TempDir()
 
 	r, w, c, err := New(&Config{
-		Backend: "local",
+		Backend: backend.Local,
 		Local: &local.Config{
 			Path: path.Join(tempDir, "traces"),
 		},
@@ -39,26 +39,27 @@ func TestRetention(t *testing.T) {
 			Filepath: path.Join(tempDir, "wal"),
 		},
 		BlocklistPoll: 0,
-	}, log.NewNopLogger())
+	}, nil, log.NewNopLogger())
 	assert.NoError(t, err)
 
 	ctx := context.Background()
 	err = c.EnableCompaction(ctx, &CompactorConfig{
 		ChunkSizeBytes:          10,
 		MaxCompactionRange:      time.Hour,
-		BlockRetention:          0,
-		CompactedBlockRetention: 0,
+		BlockRetention:          time.Hour,
+		CompactedBlockRetention: time.Hour,
 	}, &mockSharder{}, &mockOverrides{})
 	require.NoError(t, err)
 
-	r.EnablePolling(&mockJobSharder{})
+	r.EnablePolling(ctx, &mockJobSharder{})
 
-	blockID := uuid.New()
+	blockID := backend.NewUUID()
 
 	wal := w.WAL()
 	assert.NoError(t, err)
 
-	head, err := wal.NewBlock(blockID, testTenantID, model.CurrentEncoding)
+	meta := &backend.BlockMeta{BlockID: blockID, TenantID: testTenantID}
+	head, err := wal.NewBlock(meta, model.CurrentEncoding)
 	assert.NoError(t, err)
 
 	complete, err := w.CompleteBlock(context.Background(), head)
@@ -67,15 +68,17 @@ func TestRetention(t *testing.T) {
 
 	rw := r.(*readerWriter)
 	// poll
-	checkBlocklists(t, blockID, 1, 0, rw)
+	checkBlocklists(t, (uuid.UUID)(blockID), 1, 0, rw)
 
 	// retention should mark it compacted
+	rw.compactorCfg.BlockRetention = 0
 	r.(*readerWriter).doRetention(ctx)
-	checkBlocklists(t, blockID, 0, 1, rw)
+	checkBlocklists(t, (uuid.UUID)(blockID), 0, 1, rw)
 
 	// retention again should clear it
+	rw.compactorCfg.CompactedBlockRetention = 0
 	r.(*readerWriter).doRetention(ctx)
-	checkBlocklists(t, blockID, 0, 0, rw)
+	checkBlocklists(t, (uuid.UUID)(blockID), 0, 0, rw)
 }
 
 func TestRetentionUpdatesBlocklistImmediately(t *testing.T) {
@@ -86,7 +89,7 @@ func TestRetentionUpdatesBlocklistImmediately(t *testing.T) {
 	tempDir := t.TempDir()
 
 	r, w, c, err := New(&Config{
-		Backend: "local",
+		Backend: backend.Local,
 		Local: &local.Config{
 			Path: path.Join(tempDir, "traces"),
 		},
@@ -102,10 +105,11 @@ func TestRetentionUpdatesBlocklistImmediately(t *testing.T) {
 			Filepath: path.Join(tempDir, "wal"),
 		},
 		BlocklistPoll: 0,
-	}, log.NewNopLogger())
+	}, nil, log.NewNopLogger())
 	assert.NoError(t, err)
 
-	r.EnablePolling(&mockJobSharder{})
+	ctx := context.Background()
+	r.EnablePolling(ctx, &mockJobSharder{})
 
 	err = c.EnableCompaction(context.Background(), &CompactorConfig{
 		ChunkSizeBytes:          10,
@@ -118,12 +122,12 @@ func TestRetentionUpdatesBlocklistImmediately(t *testing.T) {
 	wal := w.WAL()
 	assert.NoError(t, err)
 
-	blockID := uuid.New()
+	blockID := backend.NewUUID()
 
-	head, err := wal.NewBlock(blockID, testTenantID, model.CurrentEncoding)
+	meta := &backend.BlockMeta{BlockID: blockID, TenantID: testTenantID}
+	head, err := wal.NewBlock(meta, model.CurrentEncoding)
 	assert.NoError(t, err)
 
-	ctx := context.Background()
 	complete, err := w.CompleteBlock(ctx, head)
 	assert.NoError(t, err)
 	blockID = complete.BlockMeta().BlockID
@@ -155,7 +159,7 @@ func TestBlockRetentionOverride(t *testing.T) {
 	tempDir := t.TempDir()
 
 	r, w, c, err := New(&Config{
-		Backend: "local",
+		Backend: backend.Local,
 		Local: &local.Config{
 			Path: path.Join(tempDir, "traces"),
 		},
@@ -171,7 +175,7 @@ func TestBlockRetentionOverride(t *testing.T) {
 			Filepath: path.Join(tempDir, "wal"),
 		},
 		BlocklistPoll: 0,
-	}, log.NewNopLogger())
+	}, nil, log.NewNopLogger())
 	require.NoError(t, err)
 
 	overrides := &mockOverrides{}
@@ -185,7 +189,7 @@ func TestBlockRetentionOverride(t *testing.T) {
 	}, &mockSharder{}, overrides)
 	require.NoError(t, err)
 
-	r.EnablePolling(&mockJobSharder{})
+	r.EnablePolling(ctx, &mockJobSharder{})
 
 	cutTestBlocks(t, w, testTenantID, 10, 10)
 

@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"strings"
@@ -134,7 +135,7 @@ func (c *RedisClient) MGet(ctx context.Context, keys []string) ([][]byte, error)
 		for i, key := range keys {
 			cmd := c.rdb.Get(ctx, key)
 			err := cmd.Err()
-			if err == redis.Nil {
+			if errors.Is(err, redis.Nil) {
 				// if key not found, response nil
 				continue
 			} else if err != nil {
@@ -158,16 +159,26 @@ func (c *RedisClient) MGet(ctx context.Context, keys []string) ([][]byte, error)
 	return ret, nil
 }
 
+func (c *RedisClient) Get(ctx context.Context, key string) ([]byte, error) {
+	var cancel context.CancelFunc
+	if c.timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+	cmd := c.rdb.Get(ctx, key)
+	err := cmd.Err()
+	if err != nil {
+		return nil, err
+	}
+
+	return StringToBytes(cmd.Val()), nil
+}
+
 func (c *RedisClient) Close() error {
 	return c.rdb.Close()
 }
 
-// StringToBytes converts string to byte slice. (copied from vendor/github.com/go-redis/redis/v8/internal/util/unsafe.go)
+// StringToBytes reads the string header and returns a byte slice without copying.
 func StringToBytes(s string) []byte {
-	return *(*[]byte)(unsafe.Pointer(
-		&struct {
-			string
-			Cap int
-		}{s, len(s)},
-	))
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }

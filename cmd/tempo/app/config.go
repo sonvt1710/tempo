@@ -7,6 +7,9 @@ import (
 
 	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/kv/memberlist"
+	"github.com/grafana/dskit/server"
+	"github.com/grafana/tempo/modules/blockbuilder"
+	"github.com/grafana/tempo/modules/cache"
 	"github.com/grafana/tempo/modules/compactor"
 	"github.com/grafana/tempo/modules/distributor"
 	"github.com/grafana/tempo/modules/frontend"
@@ -17,24 +20,24 @@ import (
 	"github.com/grafana/tempo/modules/overrides"
 	"github.com/grafana/tempo/modules/querier"
 	"github.com/grafana/tempo/modules/storage"
+	"github.com/grafana/tempo/pkg/ingest"
 	internalserver "github.com/grafana/tempo/pkg/server"
 	"github.com/grafana/tempo/pkg/usagestats"
 	"github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/tempodb"
+	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/weaveworks/common/server"
 )
 
 // Config is the root config for App.
 type Config struct {
-	Target                       string `yaml:"target,omitempty"`
-	AuthEnabled                  bool   `yaml:"auth_enabled,omitempty"`
-	MultitenancyEnabled          bool   `yaml:"multitenancy_enabled,omitempty"`
-	HTTPAPIPrefix                string `yaml:"http_api_prefix"`
-	UseOTelTracer                bool   `yaml:"use_otel_tracer,omitempty"`
-	EnableGoRuntimeMetrics       bool   `yaml:"enable_go_runtime_metrics,omitempty"`
-	AutocompleteFilteringEnabled bool   `yaml:"autocomplete_filtering_enabled,omitempty"`
+	Target                 string        `yaml:"target,omitempty"`
+	AuthEnabled            bool          `yaml:"auth_enabled,omitempty"`
+	MultitenancyEnabled    bool          `yaml:"multitenancy_enabled,omitempty"`
+	ShutdownDelay          time.Duration `yaml:"shutdown_delay,omitempty"`
+	StreamOverHTTPEnabled  bool          `yaml:"stream_over_http_enabled,omitempty"`
+	HTTPAPIPrefix          string        `yaml:"http_api_prefix"`
+	EnableGoRuntimeMetrics bool          `yaml:"enable_go_runtime_metrics,omitempty"`
 
 	Server          server.Config           `yaml:"server,omitempty"`
 	InternalServer  internalserver.Config   `yaml:"internal_server,omitempty"`
@@ -46,13 +49,16 @@ type Config struct {
 	Compactor       compactor.Config        `yaml:"compactor,omitempty"`
 	Ingester        ingester.Config         `yaml:"ingester,omitempty"`
 	Generator       generator.Config        `yaml:"metrics_generator,omitempty"`
+	Ingest          ingest.Config           `yaml:"ingest,omitempty"`
+	BlockBuilder    blockbuilder.Config     `yaml:"block_builder,omitempty"`
 	StorageConfig   storage.Config          `yaml:"storage,omitempty"`
-	LimitsConfig    overrides.Limits        `yaml:"overrides,omitempty"`
+	Overrides       overrides.Config        `yaml:"overrides,omitempty"`
 	MemberlistKV    memberlist.KVConfig     `yaml:"memberlist,omitempty"`
 	UsageReport     usagestats.Config       `yaml:"usage_report,omitempty"`
+	CacheProvider   cache.Config            `yaml:"cache,omitempty"`
 }
 
-func newDefaultConfig() *Config {
+func NewDefaultConfig() *Config {
 	defaultConfig := &Config{}
 	defaultFS := flag.NewFlagSet("", flag.PanicOnError)
 	defaultConfig.RegisterFlagsAndApplyDefaults("", defaultFS)
@@ -62,14 +68,14 @@ func newDefaultConfig() *Config {
 // RegisterFlagsAndApplyDefaults registers flag.
 func (c *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
 	c.Target = SingleBinary
+	c.StreamOverHTTPEnabled = false
 	// global settings
 	f.StringVar(&c.Target, "target", SingleBinary, "target module")
 	f.BoolVar(&c.AuthEnabled, "auth.enabled", false, "Set to true to enable auth (deprecated: use multitenancy.enabled)")
 	f.BoolVar(&c.MultitenancyEnabled, "multitenancy.enabled", false, "Set to true to enable multitenancy.")
 	f.StringVar(&c.HTTPAPIPrefix, "http-api-prefix", "", "String prefix for all http api endpoints.")
-	f.BoolVar(&c.UseOTelTracer, "use-otel-tracer", false, "Set to true to replace the OpenTracing tracer with the OpenTelemetry tracer")
 	f.BoolVar(&c.EnableGoRuntimeMetrics, "enable-go-runtime-metrics", false, "Set to true to enable all Go runtime metrics")
-	f.BoolVar(&c.AutocompleteFilteringEnabled, "autocomplete-filtering.enabled", false, "Set to true to enable autocomplete filtering")
+	f.DurationVar(&c.ShutdownDelay, "shutdown-delay", 0, "How long to wait between SIGTERM and shutdown. After receiving SIGTERM, Tempo will report not-ready status via /ready endpoint.")
 
 	// Server settings
 	flagext.DefaultValues(&c.Server)
@@ -78,8 +84,12 @@ func (c *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
 	// Internal server settings
 	flagext.DefaultValues(&c.InternalServer)
 
+	// Set log level for internal server as the same as server
+	c.InternalServer.LogLevel = c.Server.LogLevel
+	c.InternalServer.LogFormat = c.Server.LogFormat
+
 	// Increase max message size to 16MB
-	c.Server.GPRCServerMaxRecvMsgSize = 16 * 1024 * 1024
+	c.Server.GRPCServerMaxRecvMsgSize = 16 * 1024 * 1024
 	c.Server.GRPCServerMaxSendMsgSize = 16 * 1024 * 1024
 
 	// The following GRPC server settings are added to address this issue - https://github.com/grafana/tempo/issues/493
@@ -92,7 +102,7 @@ func (c *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
 	f.IntVar(&c.Server.GRPCListenPort, "server.grpc-listen-port", 9095, "gRPC server listen port.")
 
 	// Memberlist settings
-	fs := flag.NewFlagSet("", flag.PanicOnError) // create a new flag set b/c we don't want all of the memberlist settings in our flags. we're just doing this to get defaults
+	fs := flag.NewFlagSet("", flag.PanicOnError) // create a new flag set b/c we don't want all the memberlist settings in our flags. we're just doing this to get defaults
 	c.MemberlistKV.RegisterFlags(fs)
 	_ = fs.Parse([]string{})
 	// these defaults were chosen to balance resource usage vs. ring propagation speed. they are a "toned down" version of
@@ -104,22 +114,26 @@ func (c *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
 
 	f.Var(&c.MemberlistKV.JoinMembers, "memberlist.host-port", "Host port to connect to memberlist cluster.")
 	f.IntVar(&c.MemberlistKV.TCPTransport.BindPort, "memberlist.bind-port", 7946, "Port for memberlist to communicate on")
+	f.IntVar(&c.MemberlistKV.MessageHistoryBufferBytes, "memberlist.message-history-buffer-bytes", 0, "")
 
 	// Everything else
 	flagext.DefaultValues(&c.IngesterClient)
 	c.IngesterClient.GRPCClientConfig.GRPCCompression = "snappy"
 	flagext.DefaultValues(&c.GeneratorClient)
 	c.GeneratorClient.GRPCClientConfig.GRPCCompression = "snappy"
-	flagext.DefaultValues(&c.LimitsConfig)
+	c.Overrides.RegisterFlagsAndApplyDefaults(f)
 
 	c.Distributor.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "distributor"), f)
 	c.Ingester.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "ingester"), f)
 	c.Generator.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "generator"), f)
+	c.Ingest.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "ingest"), f)
+	c.BlockBuilder.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "block-builder"), f)
 	c.Querier.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "querier"), f)
 	c.Frontend.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "frontend"), f)
 	c.Compactor.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "compactor"), f)
 	c.StorageConfig.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "storage"), f)
 	c.UsageReport.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "reporting"), f)
+	c.CacheProvider.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "cache"), f)
 }
 
 // MultitenancyIsEnabled checks if multitenancy is enabled
@@ -142,7 +156,7 @@ func (c *Config) CheckConfig() []ConfigWarning {
 		warnings = append(warnings, warnRetentionConcurrency)
 	}
 
-	if c.StorageConfig.Trace.Backend == "s3" && c.Compactor.Compactor.FlushSizeBytes < 5242880 {
+	if c.StorageConfig.Trace.Backend == backend.S3 && c.Compactor.Compactor.FlushSizeBytes < 5242880 {
 		warnings = append(warnings, warnStorageTraceBackendS3)
 	}
 
@@ -150,12 +164,26 @@ func (c *Config) CheckConfig() []ConfigWarning {
 		warnings = append(warnings, warnBlocklistPollConcurrency)
 	}
 
-	if c.Distributor.LogReceivedTraces {
+	if c.Distributor.LogReceivedSpans.Enabled {
 		warnings = append(warnings, warnLogReceivedTraces)
 	}
 
-	if c.StorageConfig.Trace.Backend == "local" && c.Target != SingleBinary {
+	if c.Distributor.LogDiscardedSpans.Enabled {
+		warnings = append(warnings, warnLogDiscardedTraces)
+	}
+
+	if c.StorageConfig.Trace.Backend == backend.Local && c.Target != SingleBinary {
 		warnings = append(warnings, warnStorageTraceBackendLocal)
+	}
+
+	for _, dc := range c.StorageConfig.Trace.Block.DedicatedColumns {
+		err := dc.Validate()
+		if err != nil {
+			warnings = append(warnings, ConfigWarning{
+				Message: err.Error(),
+				Explain: "Tempo will not start with an invalid dedicated attribute column configuration",
+			})
+		}
 	}
 
 	// check v2 specific settings
@@ -179,26 +207,31 @@ func (c *Config) CheckConfig() []ConfigWarning {
 		warnings = append(warnings, newV2Warning("v2_prefetch_traces_count"))
 	}
 
+	if c.tracesAndOverridesStorageConflict() {
+		warnings = append(warnings, warnTracesAndUserConfigurableOverridesStorageConflict)
+	}
+
+	if c.Overrides.ConfigType == overrides.ConfigTypeLegacy {
+		warnings = append(warnings, warnLegacyOverridesConfig)
+	}
+
+	if c.StorageConfig.Trace.Backend == backend.S3 && c.StorageConfig.Trace.S3.NativeAWSAuthEnabled {
+		warnings = append(warnings, warnNativeAWSAuthEnabled)
+	}
+
+	if c.StorageConfig.Trace.Cache != "" {
+		warnings = append(warnings, warnConfiguredLegacyCache)
+	}
+
+	if c.Frontend.TraceByID.ConcurrentShards > c.Frontend.TraceByID.QueryShards {
+		warnings = append(warnings, warnTraceByIDConcurrentShards)
+	}
+
+	if c.BlockBuilder.BlockConfig.BlockCfg.Version != c.BlockBuilder.WAL.Version {
+		warnings = append(warnings, warnBlockAndWALVersionMismatch)
+	}
+
 	return warnings
-}
-
-func (c *Config) Describe(ch chan<- *prometheus.Desc) {
-	ch <- metricConfigFeatDesc
-}
-
-func (c *Config) Collect(ch chan<- prometheus.Metric) {
-
-	features := map[string]int{
-		"search_external_endpoints": 0,
-	}
-
-	if len(c.Querier.Search.ExternalEndpoints) > 0 {
-		features["search_external_endpoints"] = 1
-	}
-
-	for label, value := range features {
-		ch <- prometheus.MustNewConstMetric(metricConfigFeatDesc, prometheus.GaugeValue, float64(value), label)
-	}
 }
 
 // ConfigWarning bundles message and explanation strings in one structure.
@@ -229,10 +262,40 @@ var (
 		Explain: fmt.Sprintf("default=%d", tempodb.DefaultBlocklistPollConcurrency),
 	}
 	warnLogReceivedTraces = ConfigWarning{
-		Message: "c.Distributor.LogReceivedTraces is deprecated. The new flag is c.Distributor.log_received_spans.enabled",
+		Message: "Span logging is enabled. This is for debugging only and not recommended for production deployments.",
+	}
+	warnLogDiscardedTraces = ConfigWarning{
+		Message: "Span logging for discarded traces is enabled. This is for debugging only and not recommended for production deployments.",
 	}
 	warnStorageTraceBackendLocal = ConfigWarning{
 		Message: "Local backend will not correctly retrieve traces with a distributed deployment unless all components have access to the same disk. You should probably be using object storage as a backend.",
+	}
+	warnLegacyOverridesConfig = ConfigWarning{
+		Message: "Inline, unscoped overrides are deprecated. Please use the new overrides config format.",
+	}
+
+	warnTracesAndUserConfigurableOverridesStorageConflict = ConfigWarning{
+		Message: "Trace storage conflicts with user-configurable overrides storage",
+	}
+
+	warnNativeAWSAuthEnabled = ConfigWarning{
+		Message: "c.StorageConfig.Trace.S3.NativeAWSAuthEnabled is deprecated and will be removed in a future release.",
+		Explain: "This setting is no longer necessary and will be ignored.",
+	}
+
+	warnConfiguredLegacyCache = ConfigWarning{
+		Message: "c.StorageConfig.Trace.Cache is deprecated and will be removed in a future release.",
+		Explain: "Please migrate to the top level cache settings config.",
+	}
+
+	warnTraceByIDConcurrentShards = ConfigWarning{
+		Message: "c.Frontend.TraceByID.ConcurrentShards greater than query_shards is invalid. concurrent_shards will be set to query_shards",
+		Explain: "Please remove ConcurrentShards or set it to a value less than or equal to QueryShards",
+	}
+
+	warnBlockAndWALVersionMismatch = ConfigWarning{
+		Message: "c.BlockConfig.BlockCfg.Version != c.WAL.Version",
+		Explain: "Block version and WAL version must match. WAL version will be set to block version",
 	}
 )
 
@@ -241,4 +304,26 @@ func newV2Warning(setting string) ConfigWarning {
 		Message: "c.StorageConfig.Trace.Block.Version != \"v2\" but " + setting + " is set",
 		Explain: "This setting is only used in v2 blocks",
 	}
+}
+
+func (c *Config) tracesAndOverridesStorageConflict() bool {
+	traceStorage := c.StorageConfig.Trace
+	overridesStorage := c.Overrides.UserConfigurableOverridesConfig.Client
+
+	if traceStorage.Backend != overridesStorage.Backend {
+		return false
+	}
+
+	switch traceStorage.Backend {
+	case backend.Local:
+		return traceStorage.Local.PathMatches(overridesStorage.Local)
+	case backend.GCS:
+		return traceStorage.GCS.PathMatches(overridesStorage.GCS)
+	case backend.S3:
+		return traceStorage.S3.PathMatches(overridesStorage.S3)
+	case backend.Azure:
+		return traceStorage.Azure.PathMatches(overridesStorage.Azure)
+	}
+
+	return false
 }

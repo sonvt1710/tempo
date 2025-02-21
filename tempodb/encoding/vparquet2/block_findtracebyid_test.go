@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -75,7 +75,7 @@ func TestBackendBlockFindTraceByID(t *testing.T) {
 	})
 
 	meta := backend.NewBlockMeta("fake", uuid.New(), VersionString, backend.EncNone, "")
-	meta.TotalObjects = len(traces)
+	meta.TotalObjects = int64(len(traces))
 	s := newStreamingBlock(ctx, cfg, meta, r, w, tempo_io.NewBufferedWriter)
 
 	// Write test data, occasionally flushing (cutting new row group)
@@ -95,7 +95,7 @@ func TestBackendBlockFindTraceByID(t *testing.T) {
 
 	// Now find and verify all test traces
 	for _, tr := range traces {
-		wantProto := parquetTraceToTempopbTrace(tr)
+		wantProto := ParquetTraceToTempopbTrace(tr)
 
 		gotProto, err := b.FindTraceByID(ctx, tr.TraceID, common.DefaultSearchOptions())
 		require.NoError(t, err)
@@ -112,7 +112,7 @@ func TestBackendBlockFindTraceByID_TestData(t *testing.T) {
 	r := backend.NewReader(rawR)
 	ctx := context.Background()
 
-	blocks, err := r.Blocks(ctx, "single-tenant")
+	blocks, _, err := r.Blocks(ctx, "single-tenant")
 	require.NoError(t, err)
 	assert.Len(t, blocks, 1)
 
@@ -121,7 +121,7 @@ func TestBackendBlockFindTraceByID_TestData(t *testing.T) {
 
 	b := newBackendBlock(meta, r)
 
-	iter, err := b.RawIterator(context.Background(), newRowPool(10))
+	iter, err := b.rawIter(context.Background(), newRowPool(10))
 	require.NoError(t, err)
 
 	sch := parquet.SchemaOf(new(Trace))
@@ -143,11 +143,35 @@ func TestBackendBlockFindTraceByID_TestData(t *testing.T) {
 	}
 }
 
+/*func genIndex(b *testing.B, block *backendBlock) *index {
+	pf, _, err := block.openForSearch(context.TODO(), common.DefaultSearchOptions())
+	require.NoError(b, err)
+
+	i := &index{}
+
+	for j := range pf.RowGroups() {
+		iter := parquetquery.NewSyncIterator(context.TODO(), pf.RowGroups()[j:j+1], 0, "", 1000, nil, "TraceID")
+		defer iter.Close()
+
+		for {
+			v, err := iter.Next()
+			require.NoError(b, err)
+			if v == nil {
+				break
+			}
+
+			i.Add(v.Entries[0].Value.ByteArray())
+		}
+		i.Flush()
+	}
+
+	return i
+}*/
+
 func BenchmarkFindTraceByID(b *testing.B) {
 	ctx := context.TODO()
 	tenantID := "1"
-	blockID := uuid.MustParse("3685ee3d-cbbf-4f36-bf28-93447a19dea6")
-	// blockID := uuid.MustParse("1a2d50d7-f10e-41f0-850d-158b19ead23d")
+	blockID := uuid.MustParse("1f38c153-b798-4bba-b4f4-cc60633e5cab")
 
 	r, _, _, err := local.New(&local.Config{
 		Path: path.Join("/Users/marty/src/tmp/"),
@@ -155,15 +179,16 @@ func BenchmarkFindTraceByID(b *testing.B) {
 	require.NoError(b, err)
 
 	rr := backend.NewReader(r)
+	// ww := backend.NewWriter(w)
 
 	meta, err := rr.BlockMeta(ctx, blockID, tenantID)
 	require.NoError(b, err)
 
-	traceID := meta.MinID
-	// traceID, err := util.HexStringToTraceID("1a029f7ace79c7f2")
-	// require.NoError(b, err)
-
+	traceID := []byte{}
 	block := newBackendBlock(meta, rr)
+
+	// idx := genIndex(b, block)
+	// writeBlockMeta(ctx, ww, block.meta, &common.ShardedBloomFilter{}, idx)
 
 	b.ResetTimer()
 

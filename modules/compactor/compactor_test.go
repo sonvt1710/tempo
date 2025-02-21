@@ -4,20 +4,27 @@ import (
 	"math"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/grafana/tempo/modules/overrides"
 	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/model/trace"
 	"github.com/grafana/tempo/pkg/tempopb"
 	v1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	"github.com/grafana/tempo/pkg/util/test"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"github.com/grafana/tempo/tempodb/backend"
 )
 
 func TestCombineLimitsNotHit(t *testing.T) {
-	o, err := overrides.NewOverrides(overrides.Limits{
-		MaxBytesPerTrace: math.MaxInt,
-	})
+	o, err := overrides.NewOverrides(overrides.Config{
+		Defaults: overrides.Overrides{
+			Global: overrides.GlobalOverrides{
+				MaxBytesPerTrace: math.MaxInt,
+			},
+		},
+	}, nil, prometheus.DefaultRegisterer)
 	require.NoError(t, err)
 
 	c := &Compactor{
@@ -26,13 +33,13 @@ func TestCombineLimitsNotHit(t *testing.T) {
 
 	trace := test.MakeTraceWithSpanCount(2, 10, nil)
 	t1 := &tempopb.Trace{
-		Batches: []*v1.ResourceSpans{
-			trace.Batches[0],
+		ResourceSpans: []*v1.ResourceSpans{
+			trace.ResourceSpans[0],
 		},
 	}
 	t2 := &tempopb.Trace{
-		Batches: []*v1.ResourceSpans{
-			trace.Batches[1],
+		ResourceSpans: []*v1.ResourceSpans{
+			trace.ResourceSpans[1],
 		},
 	}
 	obj1 := encode(t, t1)
@@ -45,9 +52,13 @@ func TestCombineLimitsNotHit(t *testing.T) {
 }
 
 func TestCombineLimitsHit(t *testing.T) {
-	o, err := overrides.NewOverrides(overrides.Limits{
-		MaxBytesPerTrace: 1,
-	})
+	o, err := overrides.NewOverrides(overrides.Config{
+		Defaults: overrides.Overrides{
+			Global: overrides.GlobalOverrides{
+				MaxBytesPerTrace: 1,
+			},
+		},
+	}, nil, prometheus.DefaultRegisterer)
 	require.NoError(t, err)
 
 	c := &Compactor{
@@ -56,13 +67,13 @@ func TestCombineLimitsHit(t *testing.T) {
 
 	trace := test.MakeTraceWithSpanCount(2, 10, nil)
 	t1 := &tempopb.Trace{
-		Batches: []*v1.ResourceSpans{
-			trace.Batches[0],
+		ResourceSpans: []*v1.ResourceSpans{
+			trace.ResourceSpans[0],
 		},
 	}
 	t2 := &tempopb.Trace{
-		Batches: []*v1.ResourceSpans{
-			trace.Batches[1],
+		ResourceSpans: []*v1.ResourceSpans{
+			trace.ResourceSpans[1],
 		},
 	}
 	obj1 := encode(t, t1)
@@ -75,9 +86,13 @@ func TestCombineLimitsHit(t *testing.T) {
 }
 
 func TestCombineDoesntEnforceZero(t *testing.T) {
-	o, err := overrides.NewOverrides(overrides.Limits{
-		MaxBytesPerTrace: 0,
-	})
+	o, err := overrides.NewOverrides(overrides.Config{
+		Defaults: overrides.Overrides{
+			Global: overrides.GlobalOverrides{
+				MaxBytesPerTrace: math.MaxInt,
+			},
+		},
+	}, nil, prometheus.DefaultRegisterer)
 	require.NoError(t, err)
 
 	c := &Compactor{
@@ -86,13 +101,13 @@ func TestCombineDoesntEnforceZero(t *testing.T) {
 
 	trace := test.MakeTraceWithSpanCount(2, 10, nil)
 	t1 := &tempopb.Trace{
-		Batches: []*v1.ResourceSpans{
-			trace.Batches[0],
+		ResourceSpans: []*v1.ResourceSpans{
+			trace.ResourceSpans[0],
 		},
 	}
 	t2 := &tempopb.Trace{
-		Batches: []*v1.ResourceSpans{
-			trace.Batches[1],
+		ResourceSpans: []*v1.ResourceSpans{
+			trace.ResourceSpans[1],
 		},
 	}
 	obj1 := encode(t, t1)
@@ -120,6 +135,41 @@ func TestCountSpans(t *testing.T) {
 	assert.Equal(t, t1ExpectedSpans, b1Total)
 	assert.Equal(t, t2ExpectedSpans, b2Total)
 	assert.Equal(t, t1ExpectedSpans+t2ExpectedSpans, total)
+}
+
+func TestDedicatedColumns(t *testing.T) {
+	o, err := overrides.NewOverrides(overrides.Config{
+		Defaults: overrides.Overrides{
+			Storage: overrides.StorageOverrides{
+				DedicatedColumns: backend.DedicatedColumns{
+					{Scope: "resource", Name: "dedicated.resource.1", Type: "string"},
+					{Scope: "span", Name: "dedicated.span.1", Type: "string"},
+				},
+			},
+		},
+	}, nil, prometheus.DefaultRegisterer)
+	require.NoError(t, err)
+
+	c := &Compactor{overrides: o}
+
+	tr := test.AddDedicatedAttributes(test.MakeTraceWithSpanCount(2, 10, nil))
+	t1 := &tempopb.Trace{
+		ResourceSpans: []*v1.ResourceSpans{
+			tr.ResourceSpans[0],
+		},
+	}
+	t2 := &tempopb.Trace{
+		ResourceSpans: []*v1.ResourceSpans{
+			tr.ResourceSpans[1],
+		},
+	}
+	obj1 := encode(t, t1)
+	obj2 := encode(t, t2)
+
+	actual, wasCombined, err := c.Combine(model.CurrentEncoding, "test", obj1, obj2)
+	assert.NoError(t, err)
+	assert.Equal(t, true, wasCombined)
+	assert.Equal(t, encode(t, tr), actual) // entire trace should be returned
 }
 
 func encode(t *testing.T, tr *tempopb.Trace) []byte {

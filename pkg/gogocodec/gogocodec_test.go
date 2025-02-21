@@ -5,9 +5,9 @@ package gogocodec
 import (
 	"testing"
 
-	"github.com/golang/protobuf/proto" //nolint:all,deprecated SA1019 deprecated package
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/grafana/tempo/pkg/tempopb"
@@ -15,7 +15,7 @@ import (
 
 func TestCodecMarshallAndUnmarshall_tempo_type(t *testing.T) {
 	// marshal a tempo object using the custom codec
-	c := newCodec()
+	c := NewCodec()
 	req1 := &tempopb.TraceByIDRequest{
 		TraceID: []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
 	}
@@ -31,7 +31,7 @@ func TestCodecMarshallAndUnmarshall_tempo_type(t *testing.T) {
 
 func TestCodecMarshallAndUnmarshall_foreign_type(t *testing.T) {
 	// marshal a foreign object (anything other than Tempo/Cortex/Jaeger) using the custom codec
-	c := newCodec()
+	c := NewCodec()
 	goprotoMessage1 := &emptypb.Empty{}
 	data, err := c.Marshal(goprotoMessage1)
 	require.NoError(t, err)
@@ -40,12 +40,12 @@ func TestCodecMarshallAndUnmarshall_foreign_type(t *testing.T) {
 	goprotoMessage2 := &emptypb.Empty{}
 	err = c.Unmarshal(data, goprotoMessage2)
 	require.NoError(t, err)
-	assert.Equal(t, goprotoMessage1, goprotoMessage2)
+	assert.True(t, proto.Equal(goprotoMessage1, goprotoMessage2))
 }
 
 func TestWireCompatibility(t *testing.T) {
 	// marshal a tempo object using the custom codec
-	c := newCodec()
+	c := NewCodec()
 	req1 := &tempopb.TraceByIDRequest{
 		TraceID: []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
 	}

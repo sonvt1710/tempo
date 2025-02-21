@@ -11,8 +11,7 @@ import (
 
 const Encoding = "v1"
 
-type ObjectDecoder struct {
-}
+type ObjectDecoder struct{}
 
 var staticDecoder = &ObjectDecoder{}
 
@@ -35,20 +34,23 @@ func (d *ObjectDecoder) PrepareForRead(obj []byte) (*tempopb.Trace, error) {
 			return nil, err
 		}
 
-		trace.Batches = append(trace.Batches, innerTrace.Batches...)
+		trace.ResourceSpans = append(trace.ResourceSpans, innerTrace.ResourceSpans...)
 	}
 	return trace, err
 }
 
 func (d *ObjectDecoder) Combine(objs ...[]byte) ([]byte, error) {
-	c := trace.NewCombiner()
+	c := trace.NewCombiner(0, false)
 	for i, obj := range objs {
 		t, err := staticDecoder.PrepareForRead(obj)
 		if err != nil {
 			return nil, fmt.Errorf("error unmarshaling trace: %w", err)
 		}
 
-		c.ConsumeWithFinal(t, i == len(obj)-1)
+		_, err = c.ConsumeWithFinal(t, i == len(obj)-1)
+		if err != nil {
+			return nil, fmt.Errorf("error combining trace: %w", err)
+		}
 	}
 	combinedTrace, _ := c.Result()
 

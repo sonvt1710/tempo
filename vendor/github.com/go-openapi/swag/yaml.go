@@ -18,6 +18,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strconv"
 
 	"github.com/mailru/easyjson/jlexer"
@@ -118,6 +120,8 @@ const ( // See https://yaml.org/type/
 	yamlIntScalar    = "tag:yaml.org,2002:int"
 	yamlBoolScalar   = "tag:yaml.org,2002:bool"
 	yamlFloatScalar  = "tag:yaml.org,2002:float"
+	yamlTimestamp    = "tag:yaml.org,2002:timestamp"
+	yamlNull         = "tag:yaml.org,2002:null"
 )
 
 func yamlScalar(node *yaml.Node) (interface{}, error) {
@@ -142,8 +146,10 @@ func yamlScalar(node *yaml.Node) (interface{}, error) {
 			return nil, fmt.Errorf("unable to process scalar node. Got %q. Expecting float content: %w", node.Value, err)
 		}
 		return f, nil
-	case "tag:yaml.org,2002:null":
-		return nil, nil
+	case yamlTimestamp:
+		return node.Value, nil
+	case yamlNull:
+		return nil, nil //nolint:nilnil
 	default:
 		return nil, fmt.Errorf("YAML tag %q is not supported", node.LongTag())
 	}
@@ -241,7 +247,27 @@ func (s JSONMapSlice) MarshalYAML() (interface{}, error) {
 	return yaml.Marshal(&n)
 }
 
+func isNil(input interface{}) bool {
+	if input == nil {
+		return true
+	}
+	kind := reflect.TypeOf(input).Kind()
+	switch kind { //nolint:exhaustive
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Chan:
+		return reflect.ValueOf(input).IsNil()
+	default:
+		return false
+	}
+}
+
 func json2yaml(item interface{}) (*yaml.Node, error) {
+	if isNil(item) {
+		return &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Value: "null",
+		}, nil
+	}
+
 	switch val := item.(type) {
 	case JSONMapSlice:
 		var n yaml.Node
@@ -261,7 +287,14 @@ func json2yaml(item interface{}) (*yaml.Node, error) {
 	case map[string]interface{}:
 		var n yaml.Node
 		n.Kind = yaml.MappingNode
-		for k, v := range val {
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		for _, k := range keys {
+			v := val[k]
 			childNode, err := json2yaml(v)
 			if err != nil {
 				return nil, err
@@ -314,8 +347,9 @@ func json2yaml(item interface{}) (*yaml.Node, error) {
 			Tag:   yamlBoolScalar,
 			Value: strconv.FormatBool(val),
 		}, nil
+	default:
+		return nil, fmt.Errorf("unhandled type: %T", val)
 	}
-	return nil, nil
 }
 
 // JSONMapItem represents the value of a key in a JSON object held by JSONMapSlice

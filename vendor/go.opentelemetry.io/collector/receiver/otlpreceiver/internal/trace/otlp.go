@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package trace // import "go.opentelemetry.io/collector/receiver/otlpreceiver/internal/trace"
 
@@ -18,8 +7,9 @@ import (
 	"context"
 
 	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/obsreport"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
+	"go.opentelemetry.io/collector/receiver/otlpreceiver/internal/errors"
+	"go.opentelemetry.io/collector/receiver/receiverhelper"
 )
 
 const dataFormatProtobuf = "protobuf"
@@ -28,14 +18,14 @@ const dataFormatProtobuf = "protobuf"
 type Receiver struct {
 	ptraceotlp.UnimplementedGRPCServer
 	nextConsumer consumer.Traces
-	obsrecv      *obsreport.Receiver
+	obsreport    *receiverhelper.ObsReport
 }
 
 // New creates a new Receiver reference.
-func New(nextConsumer consumer.Traces, obsrecv *obsreport.Receiver) *Receiver {
+func New(nextConsumer consumer.Traces, obsreport *receiverhelper.ObsReport) *Receiver {
 	return &Receiver{
 		nextConsumer: nextConsumer,
-		obsrecv:      obsrecv,
+		obsreport:    obsreport,
 	}
 }
 
@@ -48,9 +38,19 @@ func (r *Receiver) Export(ctx context.Context, req ptraceotlp.ExportRequest) (pt
 		return ptraceotlp.NewExportResponse(), nil
 	}
 
-	ctx = r.obsrecv.StartTracesOp(ctx)
+	ctx = r.obsreport.StartTracesOp(ctx)
 	err := r.nextConsumer.ConsumeTraces(ctx, td)
-	r.obsrecv.EndTracesOp(ctx, dataFormatProtobuf, numSpans, err)
+	r.obsreport.EndTracesOp(ctx, dataFormatProtobuf, numSpans, err)
 
-	return ptraceotlp.NewExportResponse(), err
+	// Use appropriate status codes for permanent/non-permanent errors
+	// If we return the error straightaway, then the grpc implementation will set status code to Unknown
+	// Refer: https://github.com/grpc/grpc-go/blob/v1.59.0/server.go#L1345
+	// So, convert the error to appropriate grpc status and return the error
+	// NonPermanent errors will be converted to codes.Unavailable (equivalent to HTTP 503)
+	// Permanent errors will be converted to codes.InvalidArgument (equivalent to HTTP 400)
+	if err != nil {
+		return ptraceotlp.NewExportResponse(), errors.GetStatusFromError(err)
+	}
+
+	return ptraceotlp.NewExportResponse(), nil
 }

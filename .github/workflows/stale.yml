@@ -10,9 +10,9 @@ jobs:
   stale:
     # only run in grafana/tempo.
     if: github.repository == 'grafana/tempo'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/stale@v6.0.1
+      - uses: actions/stale@v9.1.0
         with:
           close-issue-reason: not_planned
           operations-per-run: 100

@@ -28,15 +28,19 @@ func NewStreamingBlock(cfg *common.BlockConfig, id uuid.UUID, tenantID string, m
 		return nil, fmt.Errorf("empty block meta list")
 	}
 
-	dataEncoding := metas[0].DataEncoding
+	dataEncoding, dedicatedColumns := metas[0].DataEncoding, metas[0].DedicatedColumns
+	dedicatedColumnsHash := metas[0].DedicatedColumnsHash()
 	for _, meta := range metas {
 		if meta.DataEncoding != dataEncoding {
 			return nil, fmt.Errorf("two blocks of different data encodings can not be streamed together: %s: %s", dataEncoding, meta.DataEncoding)
 		}
+		if dedicatedColumnsHash != meta.DedicatedColumnsHash() {
+			return nil, fmt.Errorf("two blocks of different dedicated columns can not be streamed together: %s: %s", dedicatedColumns, meta.DedicatedColumns)
+		}
 	}
 
 	// Start with times from input metas.
-	newMeta := backend.NewBlockMeta(tenantID, id, VersionString, cfg.Encoding, dataEncoding)
+	newMeta := backend.NewBlockMetaWithDedicatedColumns(tenantID, id, VersionString, cfg.Encoding, dataEncoding, dedicatedColumns)
 	newMeta.StartTime = metas[0].StartTime
 	newMeta.EndTime = metas[0].EndTime
 	for _, m := range metas[1:] {
@@ -74,7 +78,7 @@ func (c *StreamingBlock) AddObject(id common.ID, object []byte) error {
 		return err
 	}
 	c.bufferedObjects++
-	c.meta.ObjectAdded(id, 0, 0) // streaming block handles start/end time by combining BlockMetas. See .BlockMeta()
+	c.meta.ObjectAdded(0, 0) // streaming block handles start/end time by combining BlockMetas. See .BlockMeta()
 	c.bloom.Add(id)
 	return nil
 }
@@ -140,13 +144,13 @@ func (c *StreamingBlock) Complete(ctx context.Context, tracker backend.AppendTra
 
 	meta.TotalRecords = uint32(len(records)) // casting
 	meta.IndexPageSize = uint32(c.cfg.IndexPageSizeBytes)
-	meta.BloomShardCount = uint16(c.bloom.GetShardCount())
+	meta.BloomShardCount = uint32(c.bloom.GetShardCount())
 
 	return bytesFlushed, writeBlockMeta(ctx, w, meta, indexBytes, c.bloom)
 }
 
 func (c *StreamingBlock) BlockMeta() *backend.BlockMeta {
 	meta := c.meta
-	meta.Size = c.appender.DataLength()
+	meta.Size_ = c.appender.DataLength()
 	return meta
 }

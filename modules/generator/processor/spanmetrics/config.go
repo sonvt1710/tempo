@@ -2,9 +2,11 @@ package spanmetrics
 
 import (
 	"flag"
+	"fmt"
 
+	"github.com/grafana/tempo/modules/generator/registry"
+	"github.com/grafana/tempo/pkg/sharedconfig"
 	filterconfig "github.com/grafana/tempo/pkg/spanfilter/config"
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -16,18 +18,33 @@ const (
 	dimSpanKind      = "span_kind"
 	dimStatusCode    = "status_code"
 	dimStatusMessage = "status_message"
+	dimJob           = "job"
+	dimInstance      = "instance"
 )
+
+var intrinsicLabels = []string{dimService, dimSpanName, dimSpanKind, dimStatusCode, dimStatusMessage}
 
 type Config struct {
 	// Buckets for latency histogram in seconds.
 	HistogramBuckets []float64 `yaml:"histogram_buckets"`
+
+	// The histogram mode to select.
+	HistogramOverride registry.HistogramMode `yaml:"-"`
+
 	// Intrinsic dimensions (labels) added to the metric, that are generated from fixed span
-	// data. The dimensions service, span_name, span_kind, and status_code are enabled by
+	// data. The dimensions service, span_name, span_kind, status_code, job and instance are enabled by
 	// default, whereas the dimension status_message must be enabled explicitly.
 	IntrinsicDimensions IntrinsicDimensions `yaml:"intrinsic_dimensions"`
+
 	// Additional dimensions (labels) to be added to the metric. The dimensions are generated
 	// from span attributes and are created along with the intrinsic dimensions.
 	Dimensions []string `yaml:"dimensions"`
+
+	// Dimension label mapping to allow the user to rename attributes in their metrics
+	DimensionMappings []sharedconfig.DimensionMappings `yaml:"dimension_mappings"`
+
+	// Enable target_info as a metrics
+	EnableTargetInfo bool `yaml:"enable_target_info"`
 
 	// If enabled attribute value will be used for metric calculation
 	SpanMultiplierKey string `yaml:"span_multiplier_key"`
@@ -38,10 +55,14 @@ type Config struct {
 
 	// FilterPolicies is a list of policies that will be applied to spans for inclusion or exlusion.
 	FilterPolicies []filterconfig.FilterPolicy `yaml:"filter_policies"`
+
+	// Allow user to specify labels they want to drop from target_info
+	TargetInfoExcludedDimensions []string `yaml:"target_info_excluded_dimensions"`
 }
 
-func (cfg *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
+func (cfg *Config) RegisterFlagsAndApplyDefaults(string, *flag.FlagSet) {
 	cfg.HistogramBuckets = prometheus.ExponentialBuckets(0.002, 2, 14)
+	cfg.HistogramOverride = registry.HistogramModeClassic
 	cfg.IntrinsicDimensions.Service = true
 	cfg.IntrinsicDimensions.SpanName = true
 	cfg.IntrinsicDimensions.SpanKind = true
@@ -74,7 +95,7 @@ func (ic *IntrinsicDimensions) ApplyFromMap(dimensions map[string]bool) error {
 		case dimStatusMessage:
 			ic.StatusMessage = active
 		default:
-			return errors.Errorf("%s is not a valid intrinsic dimension", label)
+			return fmt.Errorf("%s is not a valid intrinsic dimension", label)
 		}
 	}
 	return nil

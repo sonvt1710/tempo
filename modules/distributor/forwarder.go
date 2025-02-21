@@ -54,12 +54,12 @@ type generatorForwarder struct {
 
 	forwardFunc forwardFunc
 
-	o                 *overrides.Overrides
+	o                 overrides.Interface
 	overridesInterval time.Duration
 	shutdown          chan interface{}
 }
 
-func newGeneratorForwarder(logger log.Logger, fn forwardFunc, o *overrides.Overrides) *generatorForwarder {
+func newGeneratorForwarder(logger log.Logger, fn forwardFunc, o overrides.Interface) *generatorForwarder {
 	rf := &generatorForwarder{
 		logger:            logger,
 		queues:            make(map[string]*queue.Queue[*request]),
@@ -198,7 +198,6 @@ func (f *generatorForwarder) start(_ context.Context) error {
 	go f.watchOverrides()
 
 	return nil
-
 }
 
 func (f *generatorForwarder) stop(_ error) error {

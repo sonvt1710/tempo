@@ -1,6 +1,7 @@
 package vparquet2
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -8,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/dustin/go-humanize"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -17,6 +18,7 @@ import (
 	v1_resource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
 	v1_trace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	"github.com/grafana/tempo/pkg/util/test"
+	"github.com/grafana/tempo/tempodb/encoding/common"
 )
 
 func TestProtoParquetRoundTrip(t *testing.T) {
@@ -24,10 +26,10 @@ func TestProtoParquetRoundTrip(t *testing.T) {
 	// Proto -> Parquet -> Proto
 
 	traceIDA := []byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F}
-	expectedTrace := parquetTraceToTempopbTrace(fullyPopulatedTestTrace(traceIDA))
+	expectedTrace := ParquetTraceToTempopbTrace(fullyPopulatedTestTrace(traceIDA))
 
 	parquetTrace := traceToParquet(traceIDA, expectedTrace, nil)
-	actualTrace := parquetTraceToTempopbTrace(parquetTrace)
+	actualTrace := ParquetTraceToTempopbTrace(parquetTrace)
 	assert.Equal(t, expectedTrace, actualTrace)
 }
 
@@ -49,16 +51,16 @@ func TestProtoParquetRando(t *testing.T) {
 		expectedTrace := test.MakeTrace(batches, id)
 
 		parqTr := traceToParquet(id, expectedTrace, trp)
-		actualTrace := parquetTraceToTempopbTrace(parqTr)
+		actualTrace := ParquetTraceToTempopbTrace(parqTr)
 		require.Equal(t, expectedTrace, actualTrace)
 	}
 }
 
 func TestFieldsAreCleared(t *testing.T) {
 	traceID := []byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F}
-	complexTrace := parquetTraceToTempopbTrace(fullyPopulatedTestTrace(traceID))
+	complexTrace := ParquetTraceToTempopbTrace(fullyPopulatedTestTrace(traceID))
 	simpleTrace := &tempopb.Trace{
-		Batches: []*v1_trace.ResourceSpans{
+		ResourceSpans: []*v1_trace.ResourceSpans{
 			{
 				Resource: &v1_resource.Resource{
 					Attributes: []*v1.KeyValue{
@@ -102,8 +104,192 @@ func TestFieldsAreCleared(t *testing.T) {
 	tr := &Trace{}
 	_ = traceToParquet(traceID, complexTrace, tr)
 	parqTr := traceToParquet(traceID, simpleTrace, tr)
-	actualTrace := parquetTraceToTempopbTrace(parqTr)
+	actualTrace := ParquetTraceToTempopbTrace(parqTr)
 	require.Equal(t, simpleTrace, actualTrace)
+}
+
+func TestTraceToParquet(t *testing.T) {
+	strPtr := func(s string) *string { return &s }
+	intPtr := func(i int64) *int64 { return &i }
+
+	traceID := common.ID{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F}
+
+	tsc := []struct {
+		name     string
+		id       common.ID
+		trace    tempopb.Trace
+		expected Trace
+	}{
+		{
+			name: "span and resource attributes",
+			id:   traceID,
+			trace: tempopb.Trace{
+				ResourceSpans: []*v1_trace.ResourceSpans{{
+					Resource: &v1_resource.Resource{
+						Attributes: []*v1.KeyValue{
+							{Key: "res.attr", Value: &v1.AnyValue{Value: &v1.AnyValue_IntValue{IntValue: 123}}},
+							{Key: "service.name", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "service-a"}}},
+							{Key: "cluster", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "cluster-a"}}},
+							{Key: "namespace", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "namespace-a"}}},
+							{Key: "pod", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "pod-a"}}},
+							{Key: "container", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "container-a"}}},
+							{Key: "k8s.cluster.name", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "k8s-cluster-a"}}},
+							{Key: "k8s.namespace.name", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "k8s-namespace-a"}}},
+							{Key: "k8s.pod.name", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "k8s-pod-a"}}},
+							{Key: "k8s.container.name", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "k8s-container-a"}}},
+						},
+					},
+					ScopeSpans: []*v1_trace.ScopeSpans{{
+						Scope: &v1.InstrumentationScope{},
+						Spans: []*v1_trace.Span{{
+							Name:   "span-a",
+							SpanId: common.ID{0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+							Attributes: []*v1.KeyValue{
+								{Key: "span.attr", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "aaa"}}},
+								{Key: "http.method", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "POST"}}},
+								{Key: "http.url", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "https://example.com"}}},
+								{Key: "http.status_code", Value: &v1.AnyValue{Value: &v1.AnyValue_IntValue{IntValue: 201}}},
+							},
+						}},
+					}},
+				}},
+			},
+			expected: Trace{
+				TraceID:         traceID,
+				TraceIDText:     "102030405060708090a0b0c0d0e0f",
+				RootSpanName:    "span-a",
+				RootServiceName: "service-a",
+				ResourceSpans: []ResourceSpans{{
+					Resource: Resource{
+						ServiceName:      "service-a",
+						Cluster:          strPtr("cluster-a"),
+						Namespace:        strPtr("namespace-a"),
+						Pod:              strPtr("pod-a"),
+						Container:        strPtr("container-a"),
+						K8sClusterName:   strPtr("k8s-cluster-a"),
+						K8sNamespaceName: strPtr("k8s-namespace-a"),
+						K8sPodName:       strPtr("k8s-pod-a"),
+						K8sContainerName: strPtr("k8s-container-a"),
+						Attrs: []Attribute{
+							{Key: "res.attr", ValueInt: intPtr(int64(123))},
+						},
+					},
+					ScopeSpans: []ScopeSpans{{
+						Spans: []Span{{
+							Name:           "span-a",
+							SpanID:         []byte{0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+							NestedSetLeft:  1,
+							NestedSetRight: 2,
+							ParentID:       -1,
+							HttpMethod:     strPtr("POST"),
+							HttpUrl:        strPtr("https://example.com"),
+							HttpStatusCode: intPtr(201),
+							Attrs: []Attribute{
+								{Key: "span.attr", Value: strPtr("aaa")},
+							},
+						}},
+					}},
+				}},
+			},
+		},
+		{
+			name: "nested set model bounds",
+			id:   traceID,
+			trace: tempopb.Trace{
+				ResourceSpans: []*v1_trace.ResourceSpans{{
+					Resource: &v1_resource.Resource{
+						Attributes: []*v1.KeyValue{
+							{Key: "service.name", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "service-a"}}},
+						},
+					},
+					ScopeSpans: []*v1_trace.ScopeSpans{{
+						Scope: &v1.InstrumentationScope{},
+						Spans: []*v1_trace.Span{
+							{
+								Name:   "span-a",
+								SpanId: common.ID{0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+								Attributes: []*v1.KeyValue{
+									{Key: "span.attr", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "aaa"}}},
+								},
+							},
+							{
+								Name:         "span-b",
+								SpanId:       common.ID{0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02},
+								ParentSpanId: common.ID{0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+								Attributes: []*v1.KeyValue{
+									{Key: "span.attr", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "bbb"}}},
+								},
+							},
+							{
+								Name:         "span-c",
+								SpanId:       common.ID{0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03},
+								ParentSpanId: common.ID{0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+								Attributes: []*v1.KeyValue{
+									{Key: "span.attr", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "ccc"}}},
+								},
+							},
+						},
+					}},
+				}},
+			},
+			expected: Trace{
+				TraceID:         traceID,
+				TraceIDText:     "102030405060708090a0b0c0d0e0f",
+				RootSpanName:    "span-a",
+				RootServiceName: "service-a",
+				ResourceSpans: []ResourceSpans{{
+					Resource: Resource{
+						ServiceName: "service-a",
+						Attrs:       []Attribute{},
+					},
+					ScopeSpans: []ScopeSpans{{
+						Spans: []Span{
+							{
+								Name:           "span-a",
+								SpanID:         []byte{0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+								NestedSetLeft:  1,
+								NestedSetRight: 6,
+								ParentID:       -1,
+								Attrs: []Attribute{
+									{Key: "span.attr", Value: strPtr("aaa")},
+								},
+							},
+							{
+								Name:           "span-b",
+								SpanID:         []byte{0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02},
+								ParentSpanID:   []byte{0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+								ParentID:       1,
+								NestedSetLeft:  2,
+								NestedSetRight: 3,
+								Attrs: []Attribute{
+									{Key: "span.attr", Value: strPtr("bbb")},
+								},
+							},
+							{
+								Name:           "span-c",
+								SpanID:         []byte{0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03},
+								ParentSpanID:   []byte{0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+								ParentID:       1,
+								NestedSetLeft:  4,
+								NestedSetRight: 5,
+								Attrs: []Attribute{
+									{Key: "span.attr", Value: strPtr("ccc")},
+								},
+							},
+						},
+					}},
+				}},
+			},
+		},
+	}
+
+	for _, tt := range tsc {
+		t.Run(tt.name, func(t *testing.T) {
+			var actual Trace
+			traceToParquet(tt.id, &tt.trace, &actual)
+			assert.Equal(t, tt.expected, actual)
+		})
+	}
 }
 
 func BenchmarkProtoToParquet(b *testing.B) {
@@ -115,7 +301,6 @@ func BenchmarkProtoToParquet(b *testing.B) {
 
 	for _, spanCount := range spanCounts {
 		b.Run("SpanCount:"+humanize.SI(float64(batchCount*spanCount), ""), func(b *testing.B) {
-
 			id := test.ValidTraceID(nil)
 			tr := test.MakeTraceWithSpanCount(batchCount, spanCount, id)
 
@@ -166,7 +351,6 @@ func BenchmarkEventToParquet(b *testing.B) {
 }
 
 func BenchmarkDeconstruct(b *testing.B) {
-
 	batchCount := 100
 	spanCounts := []int{
 		100, 1000,
@@ -183,7 +367,6 @@ func BenchmarkDeconstruct(b *testing.B) {
 			ss := humanize.SI(float64(batchCount*spanCount), "")
 			ps := humanize.SI(float64(poolSize), "")
 			b.Run(fmt.Sprintf("SpanCount%v/Pool%v", ss, ps), func(b *testing.B) {
-
 				id := test.ValidTraceID(nil)
 				tr := traceToParquet(id, test.MakeTraceWithSpanCount(batchCount, spanCount, id), nil)
 				sch := parquet.SchemaOf(tr)
@@ -211,7 +394,7 @@ func TestParquetRowSizeEstimate(t *testing.T) {
 }
 
 func estimateRowSize(t *testing.T, name string) {
-	f, err := os.OpenFile(name, os.O_RDONLY, 0644)
+	f, err := os.OpenFile(name, os.O_RDONLY, 0o600)
 	require.NoError(t, err)
 
 	fi, err := f.Stat()
@@ -228,7 +411,7 @@ func estimateRowSize(t *testing.T, name string) {
 	for {
 		_, err := r.Read(row)
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			require.NoError(t, err)

@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/grafana/dskit/user"
 	"github.com/stretchr/testify/require"
-	"github.com/weaveworks/common/user"
 	"go.opentelemetry.io/collector/client"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -32,7 +32,7 @@ func newAssertingConsumer(t *testing.T, assertFunc assertFunc) consumer.Traces {
 	}
 }
 
-func (tc *testConsumer) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
+func (tc *testConsumer) ConsumeTraces(ctx context.Context, _ ptrace.Traces) error {
 	tc.assertFunc(tc.t, ctx)
 	return nil
 }

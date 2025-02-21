@@ -4,7 +4,7 @@ import (
 	"hash"
 	"sync"
 
-	"github.com/cespare/xxhash"
+	"github.com/cespare/xxhash/v2"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 )
 
@@ -60,7 +60,7 @@ func (a *appender) Append(id common.ID, b []byte) error {
 }
 
 func (a *appender) addRecord(hash uint64, id common.ID, bytesWritten int) {
-	new := Record{
+	newRecord := Record{
 		ID:     id,
 		Start:  a.currentOffset,
 		Length: uint32(bytesWritten),
@@ -70,7 +70,7 @@ func (a *appender) addRecord(hash uint64, id common.ID, bytesWritten int) {
 	defer a.recordsMtx.Unlock()
 
 	records := a.records[hash]
-	records = append(records, new)
+	records = append(records, newRecord)
 	a.records[hash] = records
 }
 

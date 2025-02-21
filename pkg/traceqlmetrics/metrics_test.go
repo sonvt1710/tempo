@@ -2,6 +2,7 @@ package traceqlmetrics
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/grafana/tempo/pkg/traceql"
@@ -9,17 +10,16 @@ import (
 )
 
 func TestPercentile(t *testing.T) {
-
 	testCases := []struct {
 		name      string
 		durations []uint64
-		quartile  float32
+		p         float64
 		value     uint64
 	}{
 		{
 			name:      "easy mode",
 			durations: []uint64{2, 4, 6, 8},
-			quartile:  0.5,
+			p:         0.5,
 			value:     uint64(4),
 		},
 		{
@@ -31,25 +31,48 @@ func TestPercentile(t *testing.T) {
 			// = 2048 * 2^0.6 = 3104.1875...
 			name:      "interpolate between buckets",
 			durations: []uint64{2000, 2000, 2000, 2000, 2000, 4000, 4000, 4000, 4000, 4000},
-			quartile:  0.75,
+			p:         0.75,
 			value:     uint64(3104),
+		},
+		{
+			name:      "edge case bucket 0",
+			durations: []uint64{1},
+			p:         1.0,
+			value:     uint64(1),
+		},
+		{
+			name:      "edge case max bucket",
+			durations: []uint64{math.MaxUint64},
+			p:         1.0,
+			value:     uint64(1 << (maxBuckets - 1)),
+		},
+		{
+			name:      "edge case empty",
+			durations: []uint64{},
+			p:         1.0,
+			value:     uint64(0),
 		},
 	}
 
 	for _, tc := range testCases {
-		m := &latencyHistogram{}
+		m := &LatencyHistogram{}
 		for _, d := range tc.durations {
 			m.Record(d)
 		}
-		got := m.Percentile(tc.quartile)
+		got := m.Percentile(tc.p)
 		require.Equal(t, tc.value, got, tc.name)
 	}
 }
 
 func TestMetricsResultsCombine(t *testing.T) {
-	a := traceql.NewStaticString("1")
-	b := traceql.NewStaticString("2")
-	c := traceql.NewStaticString("3")
+	a := MetricSeries{KeyValue{Key: "x", Value: traceql.NewStaticString("1")}}
+	ak := a.MetricKeys()
+
+	b := MetricSeries{KeyValue{Key: "x", Value: traceql.NewStaticString("2")}}
+	bk := b.MetricKeys()
+
+	c := MetricSeries{KeyValue{Key: "x", Value: traceql.NewStaticString("3")}}
+	ck := c.MetricKeys()
 
 	m := NewMetricsResults()
 	m.Record(a, 1, true)
@@ -68,56 +91,98 @@ func TestMetricsResultsCombine(t *testing.T) {
 	require.Equal(t, 3, len(m.Series))
 	require.Equal(t, 3, len(m.Errors))
 
-	require.Equal(t, 1, m.Series[a].Count())
-	require.Equal(t, 4, m.Series[b].Count())
-	require.Equal(t, 3, m.Series[c].Count())
+	require.Equal(t, 1, m.Series[ak].Histogram.Count())
+	require.Equal(t, 4, m.Series[bk].Histogram.Count())
+	require.Equal(t, 3, m.Series[ck].Histogram.Count())
 
-	require.Equal(t, 1, m.Errors[a])
-	require.Equal(t, 2, m.Errors[b])
-	require.Equal(t, 1, m.Errors[c])
+	require.Equal(t, 1, m.Errors[ak])
+	require.Equal(t, 2, m.Errors[bk])
+	require.Equal(t, 1, m.Errors[ck])
 }
 
 func TestGetMetrics(t *testing.T) {
-
-	ctx := context.TODO()
-	query := "{}"
-	groupBy := "span.foo"
+	var (
+		ctx     = context.TODO()
+		query   = "{}"
+		groupBy = "span.foo"
+		start   = uint64(0)
+		end     = uint64(0)
+	)
 
 	m := &mockFetcher{
 		Spansets: []*traceql.Spanset{
 			{
 				Spans: []traceql.Span{
-					newMockSpan(128, "span.foo", "1"),
-					newMockSpan(128, "span.foo", "1"), // p50 for foo=1
-					newMockSpan(256, "span.foo", "1"),
-					newMockSpan(256, "span.foo", "1"),
-					newMockSpan(256, "span.foo", "2"),
-					newMockSpan(256, "span.foo", "2"), // p50 for foo=2
-					newMockSpan(512, "span.foo", "2"),
-					newMockSpan(512, "span.foo", "2").WithErr(),
+					newMockSpan().WithDuration(128).WithAttributes("span.foo", "1"),
+					newMockSpan().WithDuration(128).WithAttributes("span.foo", "1"), // p50 for foo=1
+					newMockSpan().WithDuration(256).WithAttributes("span.foo", "1"),
+					newMockSpan().WithDuration(256).WithAttributes("span.foo", "1"),
+					newMockSpan().WithDuration(256).WithAttributes("span.foo", "2"),
+					newMockSpan().WithDuration(256).WithAttributes("span.foo", "2"), // p50 for foo=2
+					newMockSpan().WithDuration(512).WithAttributes("span.foo", "2"),
+					newMockSpan().WithDuration(512).WithAttributes("span.foo", "2").WithErr(),
 				},
 			},
 		},
 	}
 
-	res, err := GetMetrics(ctx, query, groupBy, 1000, m)
+	res, err := GetMetrics(ctx, query, groupBy, 1000, start, end, m)
 	require.NoError(t, err)
 	require.NotNil(t, res)
 
-	one := traceql.NewStaticString("1")
-	two := traceql.NewStaticString("2")
+	one := MetricSeries{KeyValue{Key: "span.foo", Value: traceql.NewStaticString("1")}}
+	oneK := one.MetricKeys()
 
-	require.Equal(t, 0, res.Errors[one])
-	require.Equal(t, 1, res.Errors[two])
+	two := MetricSeries{KeyValue{Key: "span.foo", Value: traceql.NewStaticString("2")}}
+	twoK := two.MetricKeys()
 
-	require.NotNil(t, res.Series[one])
-	require.NotNil(t, res.Series[two])
+	require.Equal(t, 0, res.Errors[oneK])
+	require.Equal(t, 1, res.Errors[twoK])
 
-	require.Equal(t, uint64(128), res.Series[one].Percentile(0.5))  // p50
-	require.Equal(t, uint64(181), res.Series[one].Percentile(0.75)) // p75, 128 * 2^0.5 = 181
-	require.Equal(t, uint64(256), res.Series[one].Percentile(1.0))  // p100
+	require.NotNil(t, res.Series[oneK])
+	require.NotNil(t, res.Series[twoK])
 
-	require.Equal(t, uint64(256), res.Series[two].Percentile(0.5))  // p50
-	require.Equal(t, uint64(362), res.Series[two].Percentile(0.75)) // p75, 256 * 2^0.5 = 362
-	require.Equal(t, uint64(512), res.Series[two].Percentile(1.0))  // p100
+	require.Equal(t, uint64(128), res.Series[oneK].Histogram.Percentile(0.5))  // p50
+	require.Equal(t, uint64(181), res.Series[oneK].Histogram.Percentile(0.75)) // p75, 128 * 2^0.5 = 181
+	require.Equal(t, uint64(256), res.Series[oneK].Histogram.Percentile(1.0))  // p100
+
+	require.Equal(t, uint64(256), res.Series[twoK].Histogram.Percentile(0.5))  // p50
+	require.Equal(t, uint64(362), res.Series[twoK].Histogram.Percentile(0.75)) // p75, 256 * 2^0.5 = 362
+	require.Equal(t, uint64(512), res.Series[twoK].Histogram.Percentile(1.0))  // p100
+}
+
+func TestGetMetricsTimeRange(t *testing.T) {
+	var (
+		ctx     = context.TODO()
+		query   = "{}"
+		groupBy = "span.foo"
+		start   = uint64(100)
+		end     = uint64(200)
+	)
+
+	m := &mockFetcher{
+		Spansets: []*traceql.Spanset{
+			{
+				Spans: []traceql.Span{
+					newMockSpan().WithStart(100).WithDuration(128).WithAttributes("span.foo", "1"),  // Included
+					newMockSpan().WithStart(200).WithDuration(256).WithAttributes("span.foo", "1"),  // not included
+					newMockSpan().WithStart(100).WithDuration(512).WithAttributes("span.foo", "2"),  // Included
+					newMockSpan().WithStart(200).WithDuration(1024).WithAttributes("span.foo", "2"), // not included
+				},
+			},
+		},
+	}
+
+	res, err := GetMetrics(ctx, query, groupBy, 1000, start, end, m)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+
+	one := MetricSeries{KeyValue{Key: "span.foo", Value: traceql.NewStaticString("1")}}
+	oneK := one.MetricKeys()
+
+	two := MetricSeries{KeyValue{Key: "span.foo", Value: traceql.NewStaticString("2")}}
+	twoK := two.MetricKeys()
+
+	require.Equal(t, uint64(128), res.Series[oneK].Histogram.Percentile(1.0)) // Highest span
+	require.Equal(t, uint64(512), res.Series[twoK].Histogram.Percentile(1.0)) // Highest span
 }

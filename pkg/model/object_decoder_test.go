@@ -1,16 +1,18 @@
 package model
 
 import (
+	"errors"
 	"math/rand"
 	"testing"
 
 	"github.com/gogo/protobuf/proto"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/grafana/tempo/pkg/model/decoder"
 	"github.com/grafana/tempo/pkg/model/trace"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/util/test"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestObjectDecoderMarshalUnmarshal(t *testing.T) {
@@ -53,14 +55,14 @@ func TestCombines(t *testing.T) {
 	t2a := &tempopb.Trace{}
 	t2b := &tempopb.Trace{}
 	t2c := &tempopb.Trace{}
-	for _, b := range t2.Batches {
+	for _, b := range t2.ResourceSpans {
 		switch rand.Int() % 3 {
 		case 0:
-			t2a.Batches = append(t2a.Batches, b)
+			t2a.ResourceSpans = append(t2a.ResourceSpans, b)
 		case 1:
-			t2b.Batches = append(t2b.Batches, b)
+			t2b.ResourceSpans = append(t2b.ResourceSpans, b)
 		case 2:
-			t2c.Batches = append(t2c.Batches, b)
+			t2c.ResourceSpans = append(t2c.ResourceSpans, b)
 		}
 	}
 
@@ -158,7 +160,7 @@ func TestCombines(t *testing.T) {
 					assert.Equal(t, tt.expected, actual)
 
 					start, end, err := d.FastRange(actualBytes)
-					if err == decoder.ErrUnsupported {
+					if errors.Is(err, decoder.ErrUnsupported) {
 						return
 					}
 					require.NoError(t, err)

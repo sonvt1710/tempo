@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -12,6 +13,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/storage"
 	"go.uber.org/atomic"
+
+	tempo_log "github.com/grafana/tempo/pkg/util/log"
 )
 
 var (
@@ -67,6 +70,7 @@ type ManagedRegistry struct {
 	appendable storage.Appendable
 
 	logger                   log.Logger
+	limitLogger              *tempo_log.RateLimitedLogger
 	metricActiveSeries       prometheus.Gauge
 	metricMaxActiveSeries    prometheus.Gauge
 	metricTotalSeriesAdded   prometheus.Counter
@@ -79,9 +83,11 @@ type ManagedRegistry struct {
 // metric is the interface for a metric that is managed by ManagedRegistry.
 type metric interface {
 	name() string
-	collectMetrics(appender storage.Appender, timeMs int64, externalLabels map[string]string) (activeSeries int, err error)
+	collectMetrics(appender storage.Appender, timeMs int64) (activeSeries int, err error)
 	removeStaleSeries(staleTimeMs int64)
 }
+
+const highestAggregationInterval = 1 * time.Minute
 
 var _ Registry = (*ManagedRegistry)(nil)
 
@@ -97,6 +103,10 @@ func New(cfg *Config, overrides Overrides, tenant string, appendable storage.App
 	hostname, _ := os.Hostname()
 	externalLabels["__metrics_gen_instance"] = hostname
 
+	if cfg.InjectTenantIDAs != "" {
+		externalLabels[cfg.InjectTenantIDAs] = tenant
+	}
+
 	r := &ManagedRegistry{
 		onShutdown: cancel,
 
@@ -110,6 +120,7 @@ func New(cfg *Config, overrides Overrides, tenant string, appendable storage.App
 		appendable: appendable,
 
 		logger:                   logger,
+		limitLogger:              tempo_log.NewRateLimitedLogger(1, level.Warn(logger)),
 		metricActiveSeries:       metricActiveSeries.WithLabelValues(tenant),
 		metricMaxActiveSeries:    metricMaxActiveSeries.WithLabelValues(tenant),
 		metricTotalSeriesAdded:   metricTotalSeriesAdded.WithLabelValues(tenant),
@@ -119,30 +130,45 @@ func New(cfg *Config, overrides Overrides, tenant string, appendable storage.App
 		metricFailedCollections:  metricFailedCollections.WithLabelValues(tenant),
 	}
 
-	go job(instanceCtx, r.collectMetrics, r.collectionInterval)
+	go job(instanceCtx, r.CollectMetrics, r.collectionInterval)
 	go job(instanceCtx, r.removeStaleSeries, constantInterval(5*time.Minute))
 
 	return r
 }
 
-func (r *ManagedRegistry) NewLabelValues(values []string) *LabelValues {
-	return newLabelValuesWithMax(values, r.cfg.MaxLabelValueLength)
+func (r *ManagedRegistry) NewLabelValueCombo(labels []string, values []string) *LabelValueCombo {
+	if len(labels) != len(values) {
+		panic(fmt.Sprintf("length of given label values does not match with labels, labels: %v, label values: %v", labels, values))
+	}
+	return newLabelValueComboWithMax(labels, values, r.cfg.MaxLabelNameLength, r.cfg.MaxLabelValueLength)
 }
 
-func (r *ManagedRegistry) NewCounter(name string, labels []string) Counter {
-	truncateLength(labels, r.cfg.MaxLabelNameLength)
-
-	c := newCounter(name, labels, r.onAddMetricSeries, r.onRemoveMetricSeries)
+func (r *ManagedRegistry) NewCounter(name string) Counter {
+	c := newCounter(name, r.onAddMetricSeries, r.onRemoveMetricSeries, r.externalLabels)
 	r.registerMetric(c)
 	return c
 }
 
-func (r *ManagedRegistry) NewHistogram(name string, labels []string, buckets []float64) Histogram {
-	truncateLength(labels, r.cfg.MaxLabelNameLength)
+func (r *ManagedRegistry) NewHistogram(name string, buckets []float64, histogramOverride HistogramMode) (h Histogram) {
+	traceIDLabelName := r.overrides.MetricsGenerationTraceIDLabelName(r.tenant)
 
-	h := newHistogram(name, labels, buckets, r.onAddMetricSeries, r.onRemoveMetricSeries)
+	// TODO: Temporary switch: use the old implementation when native histograms
+	// are disabled, eventually the new implementation can handle all cases
+
+	if hasNativeHistograms(histogramOverride) {
+		h = newNativeHistogram(name, buckets, r.onAddMetricSeries, r.onRemoveMetricSeries, traceIDLabelName, histogramOverride, r.externalLabels)
+	} else {
+		h = newHistogram(name, buckets, r.onAddMetricSeries, r.onRemoveMetricSeries, traceIDLabelName, r.externalLabels)
+	}
+
 	r.registerMetric(h)
 	return h
+}
+
+func (r *ManagedRegistry) NewGauge(name string) Gauge {
+	g := newGauge(name, r.onAddMetricSeries, r.onRemoveMetricSeries, r.externalLabels)
+	r.registerMetric(g)
+	return g
 }
 
 func (r *ManagedRegistry) registerMetric(m metric) {
@@ -159,7 +185,7 @@ func (r *ManagedRegistry) onAddMetricSeries(count uint32) bool {
 	maxActiveSeries := r.overrides.MetricsGeneratorMaxActiveSeries(r.tenant)
 	if maxActiveSeries != 0 && r.activeSeries.Load()+count > maxActiveSeries {
 		r.metricTotalSeriesLimited.Inc()
-		level.Warn(r.logger).Log("msg", "reached max active series", "active_series", r.activeSeries.Load(), "max_active_series", maxActiveSeries)
+		r.limitLogger.Log("msg", "reached max active series", "active_series", r.activeSeries.Load(), "max_active_series", maxActiveSeries)
 		return false
 	}
 
@@ -177,7 +203,7 @@ func (r *ManagedRegistry) onRemoveMetricSeries(count uint32) {
 	r.metricActiveSeries.Sub(float64(count))
 }
 
-func (r *ManagedRegistry) collectMetrics(ctx context.Context) {
+func (r *ManagedRegistry) CollectMetrics(ctx context.Context) {
 	if r.overrides.MetricsGeneratorDisableCollection(r.tenant) {
 		return
 	}
@@ -200,7 +226,7 @@ func (r *ManagedRegistry) collectMetrics(ctx context.Context) {
 	collectionTimeMs := time.Now().UnixMilli()
 
 	for _, m := range r.metrics {
-		active, err := m.collectMetrics(appender, collectionTimeMs, r.externalLabels)
+		active, err := m.collectMetrics(appender, collectionTimeMs)
 		if err != nil {
 			return
 		}
@@ -214,6 +240,13 @@ func (r *ManagedRegistry) collectMetrics(ctx context.Context) {
 	maxActiveSeries := r.overrides.MetricsGeneratorMaxActiveSeries(r.tenant)
 	r.metricMaxActiveSeries.Set(float64(maxActiveSeries))
 
+	// Try to avoid committing after we have started the shutdown process.
+	if ctx.Err() != nil { // shutdown
+		return
+	}
+
+	// If the shutdown has started here, a "file already closed" error will be
+	// observed here.
 	err = appender.Commit()
 	if err != nil {
 		return
@@ -246,4 +279,16 @@ func (r *ManagedRegistry) removeStaleSeries(_ context.Context) {
 func (r *ManagedRegistry) Close() {
 	level.Info(r.logger).Log("msg", "closing registry")
 	r.onShutdown()
+}
+
+func hasNativeHistograms(s HistogramMode) bool {
+	return s == HistogramModeNative || s == HistogramModeBoth
+}
+
+func hasClassicHistograms(s HistogramMode) bool {
+	return s == HistogramModeClassic || s == HistogramModeBoth
+}
+
+func getEndOfLastMinuteMs(timeMs int64) int64 {
+	return time.UnixMilli(timeMs).Truncate(highestAggregationInterval).Add(-1 * time.Second).UnixMilli()
 }

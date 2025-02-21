@@ -9,6 +9,7 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/google/uuid"
+	"github.com/grafana/tempo/pkg/collector"
 	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/model/trace"
 	"github.com/grafana/tempo/pkg/tempopb"
@@ -64,7 +65,8 @@ func TestPartialReplay(t *testing.T) {
 	blockID := uuid.New()
 	basePath := t.TempDir()
 
-	w, err := createWALBlock(blockID, "fake", basePath, backend.EncNone, model.CurrentEncoding, 0)
+	meta := backend.NewBlockMeta("fake", blockID, VersionString, backend.EncNone, "")
+	w, err := createWALBlock(meta, basePath, model.CurrentEncoding, 0)
 	require.NoError(t, err)
 
 	// Flush a set of traces across 2 pages
@@ -82,7 +84,7 @@ func TestPartialReplay(t *testing.T) {
 		b2, err := decoder.ToObject([][]byte{b1})
 		require.NoError(t, err)
 
-		err = w.Append(ids[i], b2, 0, 0)
+		err = w.Append(ids[i], b2, 0, 0, true)
 		require.NoError(t, err)
 
 		if i+1 == count/2 {
@@ -228,7 +230,6 @@ func TestWalBlockFindTraceByID(t *testing.T) {
 
 func TestWalBlockIterator(t *testing.T) {
 	testWalBlock(t, func(w *walBlock, ids []common.ID, trs []*tempopb.Trace) {
-
 		iter, err := w.Iterator()
 		require.NoError(t, err)
 
@@ -292,7 +293,8 @@ func TestRowIterator(t *testing.T) {
 }
 
 func testWalBlock(t *testing.T, f func(w *walBlock, ids []common.ID, trs []*tempopb.Trace)) {
-	w, err := createWALBlock(uuid.New(), "fake", t.TempDir(), backend.EncNone, model.CurrentEncoding, 0)
+	meta := backend.NewBlockMeta("fake", uuid.New(), VersionString, backend.EncNone, "")
+	w, err := createWALBlock(meta, t.TempDir(), model.CurrentEncoding, 0)
 	require.NoError(t, err)
 
 	decoder := model.MustNewSegmentDecoder(model.CurrentEncoding)
@@ -311,7 +313,7 @@ func testWalBlock(t *testing.T, f func(w *walBlock, ids []common.ID, trs []*temp
 		b2, err := decoder.ToObject([][]byte{b1})
 		require.NoError(t, err)
 
-		err = w.Append(ids[i], b2, 0, 0)
+		err = w.Append(ids[i], b2, 0, 0, true)
 		require.NoError(t, err)
 
 		if i%10 == 0 {
@@ -325,7 +327,6 @@ func testWalBlock(t *testing.T, f func(w *walBlock, ids []common.ID, trs []*temp
 }
 
 func BenchmarkWalTraceQL(b *testing.B) {
-
 	reqs := []string{
 		"{ .foo = `bar` }",
 		"{ span.foo = `bar` }",
@@ -337,7 +338,7 @@ func BenchmarkWalTraceQL(b *testing.B) {
 	require.NoError(b, warn)
 
 	for _, q := range reqs {
-		req := traceql.MustExtractFetchSpansRequest(q)
+		req := traceql.MustExtractFetchSpansRequestWithMetadata(q)
 		b.Run(q, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				resp, err := w.Fetch(context.TODO(), req, common.DefaultSearchOptions())
@@ -356,7 +357,6 @@ func BenchmarkWalTraceQL(b *testing.B) {
 }
 
 func BenchmarkWalSearchTagValues(b *testing.B) {
-
 	tags := []string{
 		"service.name",
 		"name",
@@ -370,13 +370,15 @@ func BenchmarkWalSearchTagValues(b *testing.B) {
 	require.NoError(b, err)
 	require.NoError(b, warn)
 
-	cb := func(v string) {
+	cb := func(_ string) bool {
+		return true
 	}
+	mc := collector.NewMetricsCollector()
 
 	for _, t := range tags {
 		b.Run(t, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				err := w.SearchTagValues(context.TODO(), t, cb, common.DefaultSearchOptions())
+				err := w.SearchTagValues(context.TODO(), t, cb, mc.Add, common.DefaultSearchOptions())
 				require.NoError(b, err)
 			}
 		})

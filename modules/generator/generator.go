@@ -7,18 +7,25 @@ import (
 	"os"
 	"path"
 	"sync"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/backoff"
 	"github.com/grafana/dskit/kv"
 	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/services"
-	"github.com/opentracing/opentracing-go"
+	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/weaveworks/common/user"
+	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/atomic"
 
 	"github.com/grafana/tempo/modules/generator/storage"
+	objStorage "github.com/grafana/tempo/modules/storage"
+	"github.com/grafana/tempo/pkg/ingest"
 	"github.com/grafana/tempo/pkg/tempopb"
 	tempodb_wal "github.com/grafana/tempo/tempodb/wal"
 )
@@ -32,6 +39,8 @@ const (
 	// in order to simplify the config.
 	ringNumTokens = 256
 )
+
+var tracer = otel.Tracer("modules/generator")
 
 var (
 	ErrUnconfigured = errors.New("no metrics_generator.storage.path configured, metrics generator will be disabled")
@@ -52,21 +61,36 @@ type Generator struct {
 	subservices        *services.Manager
 	subservicesWatcher *services.FailureWatcher
 
+	store objStorage.Store
+
 	// When set to true, the generator will refuse incoming pushes
 	// and will flush any remaining metrics.
 	readOnly atomic.Bool
 
 	reg    prometheus.Registerer
 	logger log.Logger
+
+	kafkaCh            chan *kgo.Record
+	kafkaWG            sync.WaitGroup
+	kafkaStop          func()
+	kafkaClient        *ingest.Client
+	kafkaAdm           *kadm.Client
+	partitionRing      ring.PartitionRingReader
+	partitionMtx       sync.RWMutex
+	assignedPartitions []int32
 }
 
 // New makes a new Generator.
-func New(cfg *Config, overrides metricsGeneratorOverrides, reg prometheus.Registerer, logger log.Logger) (*Generator, error) {
+func New(cfg *Config, overrides metricsGeneratorOverrides, reg prometheus.Registerer, partitionRing ring.PartitionRingReader, store objStorage.Store, logger log.Logger) (*Generator, error) {
 	if cfg.Storage.Path == "" {
 		return nil, ErrUnconfigured
 	}
 
-	err := os.MkdirAll(cfg.Storage.Path, os.ModePerm)
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
+	err := os.MkdirAll(cfg.Storage.Path, 0o700)
 	if err != nil {
 		return nil, fmt.Errorf("failed to mkdir on %s: %w", cfg.Storage.Path, err)
 	}
@@ -77,8 +101,10 @@ func New(cfg *Config, overrides metricsGeneratorOverrides, reg prometheus.Regist
 
 		instances: map[string]*instance{},
 
-		reg:    reg,
-		logger: logger,
+		store:         store,
+		partitionRing: partitionRing,
+		reg:           reg,
+		logger:        logger,
 	}
 
 	// Lifecycler and ring
@@ -103,7 +129,7 @@ func New(cfg *Config, overrides metricsGeneratorOverrides, reg prometheus.Regist
 	delegate = ring.NewLeaveOnStoppingDelegate(delegate, g.logger)
 	delegate = ring.NewAutoForgetDelegate(ringAutoForgetUnhealthyPeriods*cfg.Ring.HeartbeatTimeout, delegate, g.logger)
 
-	g.ringLifecycler, err = ring.NewBasicLifecycler(lifecyclerCfg, ringNameForServer, RingKey, ringStore, delegate, g.logger, prometheus.WrapRegistererWithPrefix("tempo_", reg))
+	g.ringLifecycler, err = ring.NewBasicLifecycler(lifecyclerCfg, ringNameForServer, cfg.OverrideRingKey, ringStore, delegate, g.logger, prometheus.WrapRegistererWithPrefix("tempo_", reg))
 	if err != nil {
 		return nil, fmt.Errorf("create ring lifecycler: %w", err)
 	}
@@ -135,33 +161,83 @@ func (g *Generator) starting(ctx context.Context) (err error) {
 
 	err = services.StartManagerAndAwaitHealthy(ctx, g.subservices)
 	if err != nil {
-		return fmt.Errorf("unable to start mertics-generator dependencies: %w", err)
+		return fmt.Errorf("unable to start metrics-generator dependencies: %w", err)
+	}
+
+	if g.cfg.Ingest.Enabled {
+		g.kafkaClient, err = ingest.NewGroupReaderClient(
+			g.cfg.Ingest.Kafka,
+			g.partitionRing,
+			ingest.NewReaderClientMetrics("generator", prometheus.DefaultRegisterer),
+			g.logger,
+			kgo.InstanceID(g.cfg.InstanceID),
+			kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, m map[string][]int32) {
+				g.handlePartitionsAssigned(m)
+			}),
+			kgo.OnPartitionsRevoked(func(_ context.Context, _ *kgo.Client, m map[string][]int32) {
+				g.handlePartitionsRevoked(m)
+			}),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create kafka reader client: %w", err)
+		}
+
+		boff := backoff.New(ctx, backoff.Config{
+			MinBackoff: 100 * time.Millisecond,
+			MaxBackoff: time.Minute, // If there is a network hiccup, we prefer to wait longer retrying, than fail the service.
+			MaxRetries: 10,
+		})
+
+		for boff.Ongoing() {
+			err := g.kafkaClient.Ping(ctx)
+			if err == nil {
+				break
+			}
+			level.Warn(g.logger).Log("msg", "ping kafka; will retry", "err", err)
+			boff.Wait()
+		}
+		if err := boff.ErrCause(); err != nil {
+			return fmt.Errorf("failed to ping kafka: %w", err)
+		}
+
+		g.kafkaAdm = kadm.NewClient(g.kafkaClient.Client)
 	}
 
 	return nil
 }
 
 func (g *Generator) running(ctx context.Context) error {
+	if g.cfg.Ingest.Enabled {
+		g.startKafka()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 
 		case err := <-g.subservicesWatcher.Chan():
-			return fmt.Errorf("metrics-generator subservice failed %w", err)
+			return fmt.Errorf("metrics-generator subservice failed: %w", err)
 		}
 	}
 }
 
 func (g *Generator) stopping(_ error) error {
-	// Mark as read-only
-	g.stopIncomingRequests()
-
 	if g.subservices != nil {
 		err := services.StopManagerAndAwaitStopped(context.Background(), g.subservices)
 		if err != nil {
 			level.Error(g.logger).Log("msg", "failed to stop metrics-generator dependencies", "err", err)
 		}
+	}
+
+	time.Sleep(5 * time.Second) // let the ring propagate the shutdown
+
+	// Mark as read-only after we have removed ourselves from the ring
+	g.stopIncomingRequests()
+
+	// Stop reading from queue and wait for outstanding data to be processed and committed
+	if g.cfg.Ingest.Enabled {
+		g.stopKafka()
 	}
 
 	var wg sync.WaitGroup
@@ -189,14 +265,14 @@ func (g *Generator) PushSpans(ctx context.Context, req *tempopb.PushSpansRequest
 		return nil, ErrReadOnly
 	}
 
-	span, ctx := opentracing.StartSpanFromContext(ctx, "generator.PushSpans")
-	defer span.Finish()
+	ctx, span := tracer.Start(ctx, "generator.PushSpans")
+	defer span.End()
 
 	instanceID, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return nil, err
 	}
-	span.SetTag("instanceID", instanceID)
+	span.SetAttributes(attribute.String("instanceID", instanceID))
 
 	instance, err := g.getOrCreateInstance(instanceID)
 	if err != nil {
@@ -248,36 +324,45 @@ func (g *Generator) createInstance(id string) (*instance, error) {
 	// main registry only if successful.
 	reg := prometheus.NewRegistry()
 
-	wal, err := storage.New(&g.cfg.Storage, id, reg, g.logger)
+	wal, err := storage.New(&g.cfg.Storage, g.overrides, id, reg, g.logger)
 	if err != nil {
 		return nil, err
 	}
 
 	// Create traces wal if configured
-	var tracesWAL *tempodb_wal.WAL
+	var tracesWAL, tracesQueryWAL *tempodb_wal.WAL
 
 	if g.cfg.TracesWAL.Filepath != "" {
 		// Create separate wals per tenant by prefixing path with tenant ID
-
-		tracesWALCfg := g.cfg.TracesWAL
-		tracesWALCfg.Filepath = path.Join(tracesWALCfg.Filepath, id)
-
-		tracesWAL, err = tempodb_wal.New(&tracesWALCfg)
+		cfg := g.cfg.TracesWAL
+		cfg.Filepath = path.Join(cfg.Filepath, id)
+		tracesWAL, err = tempodb_wal.New(&cfg)
 		if err != nil {
-			wal.Close()
+			_ = wal.Close()
 			return nil, err
 		}
 	}
 
-	inst, err := newInstance(g.cfg, id, g.overrides, wal, reg, g.logger, tracesWAL)
+	if g.cfg.TracesQueryWAL.Filepath != "" {
+		// Create separate wals per tenant by prefixing path with tenant ID
+		cfg := g.cfg.TracesQueryWAL
+		cfg.Filepath = path.Join(cfg.Filepath, id)
+		tracesQueryWAL, err = tempodb_wal.New(&cfg)
+		if err != nil {
+			_ = wal.Close()
+			return nil, err
+		}
+	}
+
+	inst, err := newInstance(g.cfg, id, g.overrides, wal, reg, g.logger, tracesWAL, tracesQueryWAL, g.store)
 	if err != nil {
-		wal.Close()
+		_ = wal.Close()
 		return nil, err
 	}
 
 	err = g.reg.Register(reg)
 	if err != nil {
-		wal.Close()
+		inst.shutdown()
 		return nil, err
 	}
 
@@ -293,7 +378,7 @@ func (g *Generator) CheckReady(_ context.Context) error {
 }
 
 // OnRingInstanceRegister implements ring.BasicLifecyclerDelegate
-func (g *Generator) OnRingInstanceRegister(lifecycler *ring.BasicLifecycler, ringDesc ring.Desc, instanceExists bool, instanceID string, instanceDesc ring.InstanceDesc) (ring.InstanceState, ring.Tokens) {
+func (g *Generator) OnRingInstanceRegister(_ *ring.BasicLifecycler, ringDesc ring.Desc, instanceExists bool, _ string, instanceDesc ring.InstanceDesc) (ring.InstanceState, ring.Tokens) {
 	// When we initialize the metrics-generator instance in the ring we want to start from
 	// a clean situation, so whatever is the state we set it ACTIVE, while we keep existing
 	// tokens (if any) or the ones loaded from file.
@@ -303,7 +388,8 @@ func (g *Generator) OnRingInstanceRegister(lifecycler *ring.BasicLifecycler, rin
 	}
 
 	takenTokens := ringDesc.GetTokens()
-	newTokens := ring.GenerateTokens(ringNumTokens-len(tokens), takenTokens)
+	gen := ring.NewRandomTokenGenerator()
+	newTokens := gen.GenerateTokens(ringNumTokens-len(tokens), takenTokens)
 
 	// Tokens sorting will be enforced by the parent caller.
 	tokens = append(tokens, newTokens...)
@@ -312,13 +398,43 @@ func (g *Generator) OnRingInstanceRegister(lifecycler *ring.BasicLifecycler, rin
 }
 
 // OnRingInstanceTokens implements ring.BasicLifecyclerDelegate
-func (g *Generator) OnRingInstanceTokens(lifecycler *ring.BasicLifecycler, tokens ring.Tokens) {
+func (g *Generator) OnRingInstanceTokens(*ring.BasicLifecycler, ring.Tokens) {
 }
 
 // OnRingInstanceStopping implements ring.BasicLifecyclerDelegate
-func (g *Generator) OnRingInstanceStopping(lifecycler *ring.BasicLifecycler) {
+func (g *Generator) OnRingInstanceStopping(*ring.BasicLifecycler) {
 }
 
 // OnRingInstanceHeartbeat implements ring.BasicLifecyclerDelegate
-func (g *Generator) OnRingInstanceHeartbeat(lifecycler *ring.BasicLifecycler, ringDesc *ring.Desc, instanceDesc *ring.InstanceDesc) {
+func (g *Generator) OnRingInstanceHeartbeat(*ring.BasicLifecycler, *ring.Desc, *ring.InstanceDesc) {
+}
+
+func (g *Generator) GetMetrics(ctx context.Context, req *tempopb.SpanMetricsRequest) (*tempopb.SpanMetricsResponse, error) {
+	instanceID, err := user.ExtractOrgID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// return empty if we don't have an instance
+	instance, ok := g.getInstanceByID(instanceID)
+	if !ok || instance == nil {
+		return &tempopb.SpanMetricsResponse{}, nil
+	}
+
+	return instance.GetMetrics(ctx, req)
+}
+
+func (g *Generator) QueryRange(ctx context.Context, req *tempopb.QueryRangeRequest) (*tempopb.QueryRangeResponse, error) {
+	instanceID, err := user.ExtractOrgID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// return empty if we don't have an instance
+	instance, ok := g.getInstanceByID(instanceID)
+	if !ok || instance == nil {
+		return &tempopb.QueryRangeResponse{}, nil
+	}
+
+	return instance.QueryRange(ctx, req)
 }

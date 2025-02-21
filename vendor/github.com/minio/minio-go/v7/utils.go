@@ -20,6 +20,8 @@ package minio
 import (
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
@@ -27,7 +29,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
@@ -40,7 +41,6 @@ import (
 
 	md5simd "github.com/minio/md5-simd"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
-	"github.com/minio/sha256-simd"
 )
 
 func trimEtag(etag string) string {
@@ -105,21 +105,6 @@ func sumMD5Base64(data []byte) string {
 
 // getEndpointURL - construct a new endpoint.
 func getEndpointURL(endpoint string, secure bool) (*url.URL, error) {
-	if strings.Contains(endpoint, ":") {
-		host, _, err := net.SplitHostPort(endpoint)
-		if err != nil {
-			return nil, err
-		}
-		if !s3utils.IsValidIP(host) && !s3utils.IsValidDomain(host) {
-			msg := "Endpoint: " + endpoint + " does not follow ip address or domain name standards."
-			return nil, errInvalidArgument(msg)
-		}
-	} else {
-		if !s3utils.IsValidIP(endpoint) && !s3utils.IsValidDomain(endpoint) {
-			msg := "Endpoint: " + endpoint + " does not follow ip address or domain name standards."
-			return nil, errInvalidArgument(msg)
-		}
-	}
 	// If secure is false, use 'http' scheme.
 	scheme := "https"
 	if !secure {
@@ -155,7 +140,7 @@ func closeResponse(resp *http.Response) {
 		// Without this closing connection would disallow re-using
 		// the same connection for future uses.
 		//  - http://stackoverflow.com/a/17961593/4465767
-		io.Copy(ioutil.Discard, resp.Body)
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
 }
@@ -176,12 +161,18 @@ func isValidEndpointURL(endpointURL url.URL) error {
 	if endpointURL.Path != "/" && endpointURL.Path != "" {
 		return errInvalidArgument("Endpoint url cannot have fully qualified paths.")
 	}
-	if strings.Contains(endpointURL.Host, ".s3.amazonaws.com") {
+	host := endpointURL.Hostname()
+	if !s3utils.IsValidIP(host) && !s3utils.IsValidDomain(host) {
+		msg := "Endpoint: " + endpointURL.Host + " does not follow ip address or domain name standards."
+		return errInvalidArgument(msg)
+	}
+
+	if strings.Contains(host, ".s3.amazonaws.com") {
 		if !s3utils.IsAmazonEndpoint(endpointURL) {
 			return errInvalidArgument("Amazon S3 endpoint should be 's3.amazonaws.com'.")
 		}
 	}
-	if strings.Contains(endpointURL.Host, ".googleapis.com") {
+	if strings.Contains(host, ".googleapis.com") {
 		if !s3utils.IsGoogleEndpoint(endpointURL) {
 			return errInvalidArgument("Google Cloud Storage endpoint should be 'storage.googleapis.com'.")
 		}
@@ -263,7 +254,7 @@ func parseRFC7231Time(lastModified string) (time.Time, error) {
 
 // ToObjectInfo converts http header values into ObjectInfo type,
 // extracts metadata and fills in all the necessary fields in ObjectInfo.
-func ToObjectInfo(bucketName string, objectName string, h http.Header) (ObjectInfo, error) {
+func ToObjectInfo(bucketName, objectName string, h http.Header) (ObjectInfo, error) {
 	var err error
 	// Trim off the odd double quotes from ETag in the beginning and end.
 	etag := trimEtag(h.Get("ETag"))
@@ -385,6 +376,13 @@ func ToObjectInfo(bucketName string, objectName string, h http.Header) (ObjectIn
 		UserTags:     userTags,
 		UserTagCount: tagCount,
 		Restore:      restore,
+
+		// Checksum values
+		ChecksumCRC32:     h.Get(ChecksumCRC32.Key()),
+		ChecksumCRC32C:    h.Get(ChecksumCRC32C.Key()),
+		ChecksumSHA1:      h.Get(ChecksumSHA1.Key()),
+		ChecksumSHA256:    h.Get(ChecksumSHA256.Key()),
+		ChecksumCRC64NVME: h.Get(ChecksumCRC64NVME.Key()),
 	}, nil
 }
 
@@ -510,18 +508,51 @@ func isSSEHeader(headerKey string) bool {
 func isAmzHeader(headerKey string) bool {
 	key := strings.ToLower(headerKey)
 
-	return strings.HasPrefix(key, "x-amz-meta-") || strings.HasPrefix(key, "x-amz-grant-") || key == "x-amz-acl" || isSSEHeader(headerKey)
+	return strings.HasPrefix(key, "x-amz-meta-") || strings.HasPrefix(key, "x-amz-grant-") || key == "x-amz-acl" || isSSEHeader(headerKey) || strings.HasPrefix(key, "x-amz-checksum-")
 }
 
-var md5Pool = sync.Pool{New: func() interface{} { return md5.New() }}
-var sha256Pool = sync.Pool{New: func() interface{} { return sha256.New() }}
+// isMinioHeader returns true if header is x-minio- header.
+func isMinioHeader(headerKey string) bool {
+	return strings.HasPrefix(strings.ToLower(headerKey), "x-minio-")
+}
+
+// supportedQueryValues is a list of query strings that can be passed in when using GetObject.
+var supportedQueryValues = map[string]bool{
+	"attributes":                   true,
+	"partNumber":                   true,
+	"versionId":                    true,
+	"response-cache-control":       true,
+	"response-content-disposition": true,
+	"response-content-encoding":    true,
+	"response-content-language":    true,
+	"response-content-type":        true,
+	"response-expires":             true,
+}
+
+// isStandardQueryValue will return true when the passed in query string parameter is supported rather than customized.
+func isStandardQueryValue(qsKey string) bool {
+	return supportedQueryValues[qsKey]
+}
+
+// Per documentation at https://docs.aws.amazon.com/AmazonS3/latest/userguide/LogFormat.html#LogFormatCustom, the
+// set of query params starting with "x-" are ignored by S3.
+const allowedCustomQueryPrefix = "x-"
+
+func isCustomQueryValue(qsKey string) bool {
+	return strings.HasPrefix(qsKey, allowedCustomQueryPrefix)
+}
+
+var (
+	md5Pool    = sync.Pool{New: func() interface{} { return md5.New() }}
+	sha256Pool = sync.Pool{New: func() interface{} { return sha256.New() }}
+)
 
 func newMd5Hasher() md5simd.Hasher {
-	return hashWrapper{Hash: md5Pool.Get().(hash.Hash), isMD5: true}
+	return &hashWrapper{Hash: md5Pool.Get().(hash.Hash), isMD5: true}
 }
 
 func newSHA256Hasher() md5simd.Hasher {
-	return hashWrapper{Hash: sha256Pool.Get().(hash.Hash), isSHA256: true}
+	return &hashWrapper{Hash: sha256Pool.Get().(hash.Hash), isSHA256: true}
 }
 
 // hashWrapper implements the md5simd.Hasher interface.
@@ -532,7 +563,7 @@ type hashWrapper struct {
 }
 
 // Close will put the hasher back into the pool.
-func (m hashWrapper) Close() {
+func (m *hashWrapper) Close() {
 	if m.isMD5 && m.Hash != nil {
 		m.Reset()
 		md5Pool.Put(m.Hash)
@@ -594,7 +625,7 @@ func IsNetworkOrHostDown(err error, expectTimeouts bool) bool {
 	urlErr := &url.Error{}
 	if errors.As(err, &urlErr) {
 		switch urlErr.Err.(type) {
-		case *net.DNSError, *net.OpError, net.UnknownNetworkError:
+		case *net.DNSError, *net.OpError, net.UnknownNetworkError, *tls.CertificateVerificationError:
 			return true
 		}
 	}
@@ -621,10 +652,193 @@ func IsNetworkOrHostDown(err error, expectTimeouts bool) bool {
 	case strings.Contains(err.Error(), "connection refused"):
 		// If err is connection refused
 		return true
-
+	case strings.Contains(err.Error(), "server gave HTTP response to HTTPS client"):
+		// If err is TLS client is used with HTTP server
+		return true
+	case strings.Contains(err.Error(), "Client sent an HTTP request to an HTTPS server"):
+		// If err is plain-text Client is used with a HTTPS server
+		return true
 	case strings.Contains(strings.ToLower(err.Error()), "503 service unavailable"):
 		// Denial errors
 		return true
 	}
 	return false
+}
+
+// newHashReaderWrapper will hash all reads done through r.
+// When r returns io.EOF the done function will be called with the sum.
+func newHashReaderWrapper(r io.Reader, h hash.Hash, done func(hash []byte)) *hashReaderWrapper {
+	return &hashReaderWrapper{
+		r:    r,
+		h:    h,
+		done: done,
+	}
+}
+
+type hashReaderWrapper struct {
+	r    io.Reader
+	h    hash.Hash
+	done func(hash []byte)
+}
+
+// Read implements the io.Reader interface.
+func (h *hashReaderWrapper) Read(p []byte) (n int, err error) {
+	n, err = h.r.Read(p)
+	if n > 0 {
+		n2, err := h.h.Write(p[:n])
+		if err != nil {
+			return 0, err
+		}
+		if n2 != n {
+			return 0, io.ErrShortWrite
+		}
+	}
+	if err == io.EOF {
+		// Call back
+		h.done(h.h.Sum(nil))
+	}
+	return n, err
+}
+
+// Following is ported from C to Go in 2016 by Justin Ruggles, with minimal alteration.
+// Used uint for unsigned long. Used uint32 for input arguments in order to match
+// the Go hash/crc32 package. zlib CRC32 combine (https://github.com/madler/zlib)
+// Modified for hash/crc64 by Klaus Post, 2024.
+func gf2MatrixTimes(mat []uint64, vec uint64) uint64 {
+	var sum uint64
+
+	for vec != 0 {
+		if vec&1 != 0 {
+			sum ^= mat[0]
+		}
+		vec >>= 1
+		mat = mat[1:]
+	}
+	return sum
+}
+
+func gf2MatrixSquare(square, mat []uint64) {
+	if len(square) != len(mat) {
+		panic("square matrix size mismatch")
+	}
+	for n := range mat {
+		square[n] = gf2MatrixTimes(mat, mat[n])
+	}
+}
+
+// crc32Combine returns the combined CRC-32 hash value of the two passed CRC-32
+// hash values crc1 and crc2. poly represents the generator polynomial
+// and len2 specifies the byte length that the crc2 hash covers.
+func crc32Combine(poly uint32, crc1, crc2 uint32, len2 int64) uint32 {
+	// degenerate case (also disallow negative lengths)
+	if len2 <= 0 {
+		return crc1
+	}
+
+	even := make([]uint64, 32) // even-power-of-two zeros operator
+	odd := make([]uint64, 32)  // odd-power-of-two zeros operator
+
+	// put operator for one zero bit in odd
+	odd[0] = uint64(poly) // CRC-32 polynomial
+	row := uint64(1)
+	for n := 1; n < 32; n++ {
+		odd[n] = row
+		row <<= 1
+	}
+
+	// put operator for two zero bits in even
+	gf2MatrixSquare(even, odd)
+
+	// put operator for four zero bits in odd
+	gf2MatrixSquare(odd, even)
+
+	// apply len2 zeros to crc1 (first square will put the operator for one
+	// zero byte, eight zero bits, in even)
+	crc1n := uint64(crc1)
+	for {
+		// apply zeros operator for this bit of len2
+		gf2MatrixSquare(even, odd)
+		if len2&1 != 0 {
+			crc1n = gf2MatrixTimes(even, crc1n)
+		}
+		len2 >>= 1
+
+		// if no more bits set, then done
+		if len2 == 0 {
+			break
+		}
+
+		// another iteration of the loop with odd and even swapped
+		gf2MatrixSquare(odd, even)
+		if len2&1 != 0 {
+			crc1n = gf2MatrixTimes(odd, crc1n)
+		}
+		len2 >>= 1
+
+		// if no more bits set, then done
+		if len2 == 0 {
+			break
+		}
+	}
+
+	// return combined crc
+	crc1n ^= uint64(crc2)
+	return uint32(crc1n)
+}
+
+func crc64Combine(poly uint64, crc1, crc2 uint64, len2 int64) uint64 {
+	// degenerate case (also disallow negative lengths)
+	if len2 <= 0 {
+		return crc1
+	}
+
+	even := make([]uint64, 64) // even-power-of-two zeros operator
+	odd := make([]uint64, 64)  // odd-power-of-two zeros operator
+
+	// put operator for one zero bit in odd
+	odd[0] = poly // CRC-64 polynomial
+	row := uint64(1)
+	for n := 1; n < 64; n++ {
+		odd[n] = row
+		row <<= 1
+	}
+
+	// put operator for two zero bits in even
+	gf2MatrixSquare(even, odd)
+
+	// put operator for four zero bits in odd
+	gf2MatrixSquare(odd, even)
+
+	// apply len2 zeros to crc1 (first square will put the operator for one
+	// zero byte, eight zero bits, in even)
+	crc1n := crc1
+	for {
+		// apply zeros operator for this bit of len2
+		gf2MatrixSquare(even, odd)
+		if len2&1 != 0 {
+			crc1n = gf2MatrixTimes(even, crc1n)
+		}
+		len2 >>= 1
+
+		// if no more bits set, then done
+		if len2 == 0 {
+			break
+		}
+
+		// another iteration of the loop with odd and even swapped
+		gf2MatrixSquare(odd, even)
+		if len2&1 != 0 {
+			crc1n = gf2MatrixTimes(odd, crc1n)
+		}
+		len2 >>= 1
+
+		// if no more bits set, then done
+		if len2 == 0 {
+			break
+		}
+	}
+
+	// return combined crc
+	crc1n ^= crc2
+	return crc1n
 }

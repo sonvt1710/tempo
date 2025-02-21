@@ -1,9 +1,6 @@
 package frontend
 
 import (
-	"bytes"
-	"io"
-	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -13,17 +10,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type mockNextTripperware struct{}
-
-func (s *mockNextTripperware) RoundTrip(_ *http.Request) (*http.Response, error) {
-	return &http.Response{
-		StatusCode: 200,
-		Body:       io.NopCloser(bytes.NewReader([]byte("next"))),
-	}, nil
+var testSLOcfg = SLOConfig{
+	ThroughputBytesSLO: 0,
+	DurationSLO:        0,
 }
 
-func TestFrontendRoundTripsSearch(t *testing.T) {
-	next := &mockNextTripperware{}
+func TestFrontendTagSearchRequiresOrgID(t *testing.T) {
+	next := &mockRoundTripper{}
 	f, err := New(Config{
 		TraceByID: TraceByIDConfig{
 			QueryShards: minQueryShards,
@@ -33,18 +26,39 @@ func TestFrontendRoundTripsSearch(t *testing.T) {
 			Sharder: SearchSharderConfig{
 				ConcurrentRequests:    defaultConcurrentRequests,
 				TargetBytesPerRequest: defaultTargetBytesPerRequest,
+				MostRecentShards:      defaultMostRecentShards,
 			},
 			SLO: testSLOcfg,
 		},
-	}, next, nil, nil, "", log.NewNopLogger(), nil)
+		Metrics: MetricsConfig{
+			Sharder: QueryRangeSharderConfig{
+				ConcurrentRequests:    defaultConcurrentRequests,
+				TargetBytesPerRequest: defaultTargetBytesPerRequest,
+				Interval:              time.Second,
+			},
+			SLO: testSLOcfg,
+		},
+	}, next, nil, nil, nil, "", log.NewNopLogger(), nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest("GET", "/", nil)
 
-	// search is a blind passthrough. easy!
-	res := httptest.NewRecorder()
-	f.SearchHandler.ServeHTTP(res, req)
-	assert.Equal(t, res.Body.String(), "next")
+	// search will fail with `no org id` error
+	resSearch := httptest.NewRecorder()
+	f.SearchTagsValuesHandler.ServeHTTP(resSearch, req)
+	assert.Equal(t, resSearch.Body.String(), "no org id")
+
+	resSearch1 := httptest.NewRecorder()
+	f.SearchTagsValuesV2Handler.ServeHTTP(resSearch1, req)
+	assert.Equal(t, resSearch1.Body.String(), "no org id")
+
+	resSearch2 := httptest.NewRecorder()
+	f.SearchTagsV2Handler.ServeHTTP(resSearch2, req)
+	assert.Equal(t, resSearch2.Body.String(), "no org id")
+
+	resSearch3 := httptest.NewRecorder()
+	f.SearchTagsHandler.ServeHTTP(resSearch3, req)
+	assert.Equal(t, resSearch3.Body.String(), "no org id")
 }
 
 func TestFrontendBadConfigFails(t *testing.T) {
@@ -56,12 +70,12 @@ func TestFrontendBadConfigFails(t *testing.T) {
 			Sharder: SearchSharderConfig{
 				ConcurrentRequests:    defaultConcurrentRequests,
 				TargetBytesPerRequest: defaultTargetBytesPerRequest,
+				MostRecentShards:      defaultMostRecentShards,
 			},
 			SLO: testSLOcfg,
 		},
-	}, nil, nil, nil, "", log.NewNopLogger(), nil)
+	}, nil, nil, nil, nil, "", log.NewNopLogger(), nil)
 	assert.EqualError(t, err, "frontend query shards should be between 2 and 100000 (both inclusive)")
-
 	assert.Nil(t, f)
 
 	f, err = New(Config{
@@ -73,10 +87,11 @@ func TestFrontendBadConfigFails(t *testing.T) {
 			Sharder: SearchSharderConfig{
 				ConcurrentRequests:    defaultConcurrentRequests,
 				TargetBytesPerRequest: defaultTargetBytesPerRequest,
+				MostRecentShards:      defaultMostRecentShards,
 			},
 			SLO: testSLOcfg,
 		},
-	}, nil, nil, nil, "", log.NewNopLogger(), nil)
+	}, nil, nil, nil, nil, "", log.NewNopLogger(), nil)
 	assert.EqualError(t, err, "frontend query shards should be between 2 and 100000 (both inclusive)")
 	assert.Nil(t, f)
 
@@ -89,10 +104,11 @@ func TestFrontendBadConfigFails(t *testing.T) {
 			Sharder: SearchSharderConfig{
 				ConcurrentRequests:    0,
 				TargetBytesPerRequest: defaultTargetBytesPerRequest,
+				MostRecentShards:      defaultMostRecentShards,
 			},
 			SLO: testSLOcfg,
 		},
-	}, nil, nil, nil, "", log.NewNopLogger(), nil)
+	}, nil, nil, nil, nil, "", log.NewNopLogger(), nil)
 	assert.EqualError(t, err, "frontend search concurrent requests should be greater than 0")
 	assert.Nil(t, f)
 
@@ -105,10 +121,11 @@ func TestFrontendBadConfigFails(t *testing.T) {
 			Sharder: SearchSharderConfig{
 				ConcurrentRequests:    defaultConcurrentRequests,
 				TargetBytesPerRequest: 0,
+				MostRecentShards:      defaultMostRecentShards,
 			},
 			SLO: testSLOcfg,
 		},
-	}, nil, nil, nil, "", log.NewNopLogger(), nil)
+	}, nil, nil, nil, nil, "", log.NewNopLogger(), nil)
 	assert.EqualError(t, err, "frontend search target bytes per request should be greater than 0")
 	assert.Nil(t, f)
 
@@ -121,12 +138,100 @@ func TestFrontendBadConfigFails(t *testing.T) {
 			Sharder: SearchSharderConfig{
 				ConcurrentRequests:    defaultConcurrentRequests,
 				TargetBytesPerRequest: defaultTargetBytesPerRequest,
+				MostRecentShards:      defaultMostRecentShards,
 				QueryIngestersUntil:   time.Minute,
 				QueryBackendAfter:     time.Hour,
 			},
 			SLO: testSLOcfg,
 		},
-	}, nil, nil, nil, "", log.NewNopLogger(), nil)
+	}, nil, nil, nil, nil, "", log.NewNopLogger(), nil)
 	assert.EqualError(t, err, "query backend after should be less than or equal to query ingester until")
+	assert.Nil(t, f)
+
+	f, err = New(Config{
+		TraceByID: TraceByIDConfig{
+			QueryShards: maxQueryShards,
+		},
+		Search: SearchConfig{
+			Sharder: SearchSharderConfig{
+				ConcurrentRequests:    defaultConcurrentRequests,
+				TargetBytesPerRequest: defaultTargetBytesPerRequest,
+				MostRecentShards:      defaultMostRecentShards,
+			},
+			SLO: testSLOcfg,
+		},
+	}, nil, nil, nil, nil, "", log.NewNopLogger(), nil)
+	assert.EqualError(t, err, "frontend metrics concurrent requests should be greater than 0")
+	assert.Nil(t, f)
+
+	f, err = New(Config{
+		TraceByID: TraceByIDConfig{
+			QueryShards: maxQueryShards,
+		},
+		Search: SearchConfig{
+			Sharder: SearchSharderConfig{
+				ConcurrentRequests:    defaultConcurrentRequests,
+				TargetBytesPerRequest: defaultTargetBytesPerRequest,
+				MostRecentShards:      defaultMostRecentShards,
+			},
+			SLO: testSLOcfg,
+		},
+		Metrics: MetricsConfig{
+			Sharder: QueryRangeSharderConfig{
+				ConcurrentRequests:    defaultConcurrentRequests,
+				TargetBytesPerRequest: 0,
+			},
+			SLO: testSLOcfg,
+		},
+	}, nil, nil, nil, nil, "", log.NewNopLogger(), nil)
+	assert.EqualError(t, err, "frontend metrics target bytes per request should be greater than 0")
+	assert.Nil(t, f)
+
+	f, err = New(Config{
+		TraceByID: TraceByIDConfig{
+			QueryShards: maxQueryShards,
+		},
+		Search: SearchConfig{
+			Sharder: SearchSharderConfig{
+				ConcurrentRequests:    defaultConcurrentRequests,
+				TargetBytesPerRequest: defaultTargetBytesPerRequest,
+				MostRecentShards:      defaultMostRecentShards,
+			},
+			SLO: testSLOcfg,
+		},
+		Metrics: MetricsConfig{
+			Sharder: QueryRangeSharderConfig{
+				ConcurrentRequests:    defaultConcurrentRequests,
+				TargetBytesPerRequest: defaultTargetBytesPerRequest,
+				Interval:              0,
+			},
+			SLO: testSLOcfg,
+		},
+	}, nil, nil, nil, nil, "", log.NewNopLogger(), nil)
+	assert.EqualError(t, err, "frontend metrics interval should be greater than 0")
+	assert.Nil(t, f)
+
+	f, err = New(Config{
+		TraceByID: TraceByIDConfig{
+			QueryShards: maxQueryShards,
+		},
+		Search: SearchConfig{
+			Sharder: SearchSharderConfig{
+				ConcurrentRequests:    defaultConcurrentRequests,
+				TargetBytesPerRequest: defaultTargetBytesPerRequest,
+				MostRecentShards:      0,
+			},
+			SLO: testSLOcfg,
+		},
+		Metrics: MetricsConfig{
+			Sharder: QueryRangeSharderConfig{
+				ConcurrentRequests:    defaultConcurrentRequests,
+				TargetBytesPerRequest: defaultTargetBytesPerRequest,
+				Interval:              5 * time.Minute,
+			},
+			SLO: testSLOcfg,
+		},
+	}, nil, nil, nil, nil, "", log.NewNopLogger(), nil)
+	assert.EqualError(t, err, "most recent shards must be greater than 0")
 	assert.Nil(t, f)
 }

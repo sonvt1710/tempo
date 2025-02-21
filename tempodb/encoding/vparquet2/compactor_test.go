@@ -5,14 +5,11 @@ import (
 	crand "crypto/rand"
 	"encoding/binary"
 	"math/rand"
-	"time"
-
 	"testing"
 
 	"github.com/go-kit/log"
-	"github.com/google/uuid"
 	tempoUtil "github.com/grafana/tempo/pkg/util"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 
 	tempo_io "github.com/grafana/tempo/pkg/io"
 	"github.com/grafana/tempo/pkg/util/test"
@@ -65,7 +62,7 @@ func benchmarkCompactor(b *testing.B, traceCount, batchCount, spanCount int) {
 			MaxBytesPerTrace: 50_000_000,
 		})
 
-		_, err = c.Compact(ctx, l, r, func(*backend.BlockMeta, time.Time) backend.Writer { return w }, inputs)
+		_, err = c.Compact(ctx, l, r, w, inputs)
 		require.NoError(b, err)
 	}
 }
@@ -100,10 +97,10 @@ func BenchmarkCompactorDupes(b *testing.B) {
 			FlushSizeBytes:   30_000_000,
 			MaxBytesPerTrace: 50_000_000,
 			ObjectsCombined:  func(compactionLevel, objects int) {},
-			SpansDiscarded:   func(traceID string, spans int) {},
+			SpansDiscarded:   func(traceID, rootSpanName string, rootServiceName string, spans int) {},
 		})
 
-		_, err = c.Compact(ctx, l, r, func(*backend.BlockMeta, time.Time) backend.Writer { return w }, inputs)
+		_, err = c.Compact(ctx, l, r, w, inputs)
 		require.NoError(b, err)
 	}
 }
@@ -115,8 +112,8 @@ func BenchmarkCompactorDupes(b *testing.B) {
 func createTestBlock(t testing.TB, ctx context.Context, cfg *common.BlockConfig, r backend.Reader, w backend.Writer, traceCount, batchCount, spanCount int) *backend.BlockMeta {
 	inMeta := &backend.BlockMeta{
 		TenantID:     tenantID,
-		BlockID:      uuid.New(),
-		TotalObjects: traceCount,
+		BlockID:      backend.NewUUID(),
+		TotalObjects: int64(traceCount),
 	}
 
 	sb := newStreamingBlock(ctx, cfg, inMeta, r, w, tempo_io.NewBufferedWriter)
@@ -142,13 +139,17 @@ func createTestBlock(t testing.TB, ctx context.Context, cfg *common.BlockConfig,
 	return sb.meta
 }
 
-func TestValueAlloc(t *testing.T) {
+func TestValueAlloc(_ *testing.T) {
 	_ = make([]parquet.Value, 1_000_000)
 }
 
 func TestCountSpans(t *testing.T) {
-	batchSize := rand.Intn(1000) + 1
-	spansEach := rand.Intn(1000) + 1
+	// It causes high mem usage when batchSize and spansEach are too big (> 500)
+	batchSize := 300 + rand.Intn(25)
+	spansEach := 250 + rand.Intn(25)
+
+	rootSpan := "foo"
+	rootService := "bar"
 
 	sch := parquet.SchemaOf(new(Trace))
 	traceID := make([]byte, 16)
@@ -158,10 +159,14 @@ func TestCountSpans(t *testing.T) {
 	// make Trace and convert to parquet.Row
 	tr := test.MakeTraceWithSpanCount(batchSize, spansEach, traceID)
 	trp := traceToParquet(traceID, tr, nil)
+	trp.RootServiceName = rootService
+	trp.RootSpanName = rootSpan
 	row := sch.Deconstruct(nil, trp)
 
 	// count spans for generated rows.
-	tID, spans := countSpans(sch, row)
+	tID, rootSpanName, rootServiceName, spans := countSpans(sch, row)
 	require.Equal(t, tID, tempoUtil.TraceIDToHexString(traceID))
 	require.Equal(t, spans, batchSize*spansEach)
+	require.Equal(t, rootSpan, rootSpanName)
+	require.Equal(t, rootService, rootServiceName)
 }

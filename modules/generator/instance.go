@@ -3,6 +3,7 @@ package generator
 import (
 	"context"
 	"fmt"
+	"maps"
 	"reflect"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/tempo/tempodb"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
@@ -21,11 +23,14 @@ import (
 	"github.com/grafana/tempo/modules/generator/storage"
 	"github.com/grafana/tempo/pkg/tempopb"
 	v1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
+	"github.com/grafana/tempo/pkg/traceql"
 	"github.com/grafana/tempo/tempodb/wal"
+
+	"go.uber.org/atomic"
 )
 
 var (
-	allSupportedProcessors = []string{servicegraphs.Name, spanmetrics.Name, localblocks.Name}
+	SupportedProcessors = []string{servicegraphs.Name, spanmetrics.Name, localblocks.Name}
 
 	metricActiveProcessors = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "tempo",
@@ -57,24 +62,29 @@ var (
 const (
 	reasonOutsideTimeRangeSlack = "outside_metrics_ingestion_slack"
 	reasonSpanMetricsFiltered   = "span_metrics_filtered"
+	reasonInvalidUTF8           = "invalid_utf8"
 )
 
 type instance struct {
 	cfg *Config
 
-	instanceID string
-	overrides  metricsGeneratorOverrides
+	instanceID             string
+	overrides              metricsGeneratorOverrides
+	ingestionSlackOverride atomic.Int64
 
 	registry *registry.ManagedRegistry
 	wal      storage.Storage
 
-	traceWAL *wal.WAL
+	traceWAL      *wal.WAL
+	traceQueryWAL *wal.WAL
+	writer        tempodb.Writer
 
 	// processorsMtx protects the processors map, not the processors itself
 	processorsMtx sync.RWMutex
 	// processors is a map of processor name -> processor, only one instance of a processor can be
 	// active at any time
-	processors map[string]processor.Processor
+	processors            map[string]processor.Processor
+	queuebasedLocalBlocks *localblocks.Processor
 
 	shutdownCh chan struct{}
 
@@ -82,7 +92,7 @@ type instance struct {
 	logger log.Logger
 }
 
-func newInstance(cfg *Config, instanceID string, overrides metricsGeneratorOverrides, wal storage.Storage, reg prometheus.Registerer, logger log.Logger, traceWAL *wal.WAL) (*instance, error) {
+func newInstance(cfg *Config, instanceID string, overrides metricsGeneratorOverrides, wal storage.Storage, reg prometheus.Registerer, logger log.Logger, traceWAL, rf1TraceWAL *wal.WAL, writer tempodb.Writer) (*instance, error) {
 	logger = log.With(logger, "tenant", instanceID)
 
 	i := &instance{
@@ -90,9 +100,11 @@ func newInstance(cfg *Config, instanceID string, overrides metricsGeneratorOverr
 		instanceID: instanceID,
 		overrides:  overrides,
 
-		registry: registry.New(&cfg.Registry, overrides, instanceID, wal, logger),
-		wal:      wal,
-		traceWAL: traceWAL,
+		registry:      registry.New(&cfg.Registry, overrides, instanceID, wal, logger),
+		wal:           wal,
+		traceWAL:      traceWAL,
+		traceQueryWAL: rf1TraceWAL,
+		writer:        writer,
 
 		processors: make(map[string]processor.Processor),
 
@@ -151,8 +163,12 @@ func (i *instance) updateSubprocessors(desiredProcessors map[string]struct{}, de
 	_, latencyOk := desiredProcessors[spanmetrics.Latency.String()]
 	_, sizeOk := desiredProcessors[spanmetrics.Size.String()]
 
+	// Copy the map before modifying it. This map can be shared by multiple instances and is not safe to write to.
+	newDesiredProcessors := map[string]struct{}{}
+	maps.Copy(newDesiredProcessors, desiredProcessors)
+
 	if !allOk {
-		desiredProcessors[spanmetrics.Name] = struct{}{}
+		newDesiredProcessors[spanmetrics.Name] = struct{}{}
 		desiredCfg.SpanMetrics.Subprocessors[spanmetrics.Count] = false
 		desiredCfg.SpanMetrics.Subprocessors[spanmetrics.Latency] = false
 		desiredCfg.SpanMetrics.Subprocessors[spanmetrics.Size] = false
@@ -170,11 +186,11 @@ func (i *instance) updateSubprocessors(desiredProcessors map[string]struct{}, de
 		}
 	}
 
-	delete(desiredProcessors, spanmetrics.Latency.String())
-	delete(desiredProcessors, spanmetrics.Count.String())
-	delete(desiredProcessors, spanmetrics.Size.String())
+	delete(newDesiredProcessors, spanmetrics.Latency.String())
+	delete(newDesiredProcessors, spanmetrics.Count.String())
+	delete(newDesiredProcessors, spanmetrics.Size.String())
 
-	return desiredProcessors, desiredCfg
+	return newDesiredProcessors, desiredCfg
 }
 
 func (i *instance) updateProcessors() error {
@@ -183,6 +199,13 @@ func (i *instance) updateProcessors() error {
 	if err != nil {
 		return err
 	}
+
+	ingestionSlackInt := i.overrides.MetricsGeneratorIngestionSlack(i.instanceID).Nanoseconds()
+	if ingestionSlackInt == 0 {
+		ingestionSlackInt = i.cfg.MetricsIngestionSlack.Nanoseconds()
+	}
+
+	i.ingestionSlackOverride.Store(ingestionSlackInt)
 
 	desiredProcessors, desiredCfg = i.updateSubprocessors(desiredProcessors, desiredCfg)
 
@@ -252,7 +275,7 @@ func (i *instance) diffProcessors(desiredProcessors map[string]struct{}, desired
 			}
 		default:
 			level.Error(i.logger).Log(
-				"msg", fmt.Sprintf("processor does not exist, supported processors: [%s]", strings.Join(allSupportedProcessors, ", ")),
+				"msg", fmt.Sprintf("processor does not exist, supported processors: [%s]", strings.Join(SupportedProcessors, ", ")),
 				"processorName", processorName,
 			)
 			err = fmt.Errorf("unknown processor %s", processorName)
@@ -272,21 +295,34 @@ func (i *instance) addProcessor(processorName string, cfg ProcessorConfig) error
 	switch processorName {
 	case spanmetrics.Name:
 		filteredSpansCounter := metricSpansDiscarded.WithLabelValues(i.instanceID, reasonSpanMetricsFiltered)
-		newProcessor, err = spanmetrics.New(cfg.SpanMetrics, i.registry, filteredSpansCounter)
+		invalidUTF8Counter := metricSpansDiscarded.WithLabelValues(i.instanceID, reasonInvalidUTF8)
+		newProcessor, err = spanmetrics.New(cfg.SpanMetrics, i.registry, filteredSpansCounter, invalidUTF8Counter)
 		if err != nil {
 			return err
 		}
 	case servicegraphs.Name:
 		newProcessor = servicegraphs.New(cfg.ServiceGraphs, i.instanceID, i.registry, i.logger)
 	case localblocks.Name:
-		p, err := localblocks.New(cfg.LocalBlocks, i.instanceID, i.traceWAL)
+		p, err := localblocks.New(cfg.LocalBlocks, i.instanceID, i.traceWAL, i.writer, i.overrides)
 		if err != nil {
 			return err
 		}
 		newProcessor = p
+
+		// Add the non-flushing alternate if configured
+		if i.traceQueryWAL != nil {
+			nonFlushingConfig := cfg.LocalBlocks
+			nonFlushingConfig.FlushToStorage = false
+			nonFlushingConfig.AssertMaxLiveTraces = true
+			nonFlushingConfig.AdjustTimeRangeForSlack = false
+			i.queuebasedLocalBlocks, err = localblocks.New(nonFlushingConfig, i.instanceID, i.traceQueryWAL, i.writer, i.overrides)
+			if err != nil {
+				return err
+			}
+		}
 	default:
 		level.Error(i.logger).Log(
-			"msg", fmt.Sprintf("processor does not exist, supported processors: [%s]", strings.Join(allSupportedProcessors, ", ")),
+			"msg", fmt.Sprintf("processor does not exist, supported processors: [%s]", strings.Join(SupportedProcessors, ", ")),
 			"processorName", processorName,
 		)
 		return fmt.Errorf("unknown processor %s", processorName)
@@ -315,11 +351,16 @@ func (i *instance) removeProcessor(processorName string) {
 	delete(i.processors, processorName)
 
 	deletedProcessor.Shutdown(context.Background())
+
+	if processorName == localblocks.Name && i.queuebasedLocalBlocks != nil {
+		i.queuebasedLocalBlocks.Shutdown(context.Background())
+		i.queuebasedLocalBlocks = nil
+	}
 }
 
 // updateProcessorMetrics updates the active processor metrics. Must be called under a read lock.
 func (i *instance) updateProcessorMetrics() {
-	for _, processorName := range allSupportedProcessors {
+	for _, processorName := range SupportedProcessors {
 		isPresent := 0.0
 		if _, ok := i.processors[processorName]; ok {
 			isPresent = 1.0
@@ -338,10 +379,33 @@ func (i *instance) pushSpans(ctx context.Context, req *tempopb.PushSpansRequest)
 	}
 }
 
+func (i *instance) pushSpansFromQueue(ctx context.Context, ts time.Time, req *tempopb.PushSpansRequest) {
+	i.preprocessSpans(req)
+	i.processorsMtx.RLock()
+	defer i.processorsMtx.RUnlock()
+
+	for _, processor := range i.processors {
+		// Same as normal push except we skip the local blocks processor
+		if processor.Name() == localblocks.Name {
+			continue
+		}
+		processor.PushSpans(ctx, req)
+	}
+
+	// Now we push to the non-flushing local blocks if present
+	if i.queuebasedLocalBlocks != nil {
+		i.queuebasedLocalBlocks.DeterministicPush(ts, req)
+	}
+}
+
 func (i *instance) preprocessSpans(req *tempopb.PushSpansRequest) {
+	// TODO - uniqify all strings?
+	// Doesn't help allocs, but should greatly reduce inuse space
 	size := 0
 	spanCount := 0
 	expiredSpanCount := 0
+	ingestionSlackNano := i.ingestionSlackOverride.Load()
+
 	for _, b := range req.Batches {
 		size += b.Size()
 		for _, ss := range b.ScopeSpans {
@@ -349,9 +413,12 @@ func (i *instance) preprocessSpans(req *tempopb.PushSpansRequest) {
 			// filter spans that have end time > max_age and end time more than 5 days in the future
 			newSpansArr := make([]*v1.Span, len(ss.Spans))
 			timeNow := time.Now()
+			maxTimePast := uint64(timeNow.UnixNano() - ingestionSlackNano)
+			maxTimeFuture := uint64(timeNow.UnixNano() + ingestionSlackNano)
+
 			index := 0
 			for _, span := range ss.Spans {
-				if span.EndTimeUnixNano >= uint64(timeNow.Add(-i.cfg.MetricsIngestionSlack).UnixNano()) && span.EndTimeUnixNano <= uint64(timeNow.Add(i.cfg.MetricsIngestionSlack).UnixNano()) {
+				if span.EndTimeUnixNano >= maxTimePast && span.EndTimeUnixNano <= maxTimeFuture {
 					newSpansArr[index] = span
 					index++
 				} else {
@@ -362,6 +429,89 @@ func (i *instance) preprocessSpans(req *tempopb.PushSpansRequest) {
 		}
 	}
 	i.updatePushMetrics(size, spanCount, expiredSpanCount)
+}
+
+func (i *instance) GetMetrics(ctx context.Context, req *tempopb.SpanMetricsRequest) (resp *tempopb.SpanMetricsResponse, err error) {
+	for _, processor := range i.processors {
+		switch p := processor.(type) {
+		case *localblocks.Processor:
+			return p.GetMetrics(ctx, req)
+		default:
+		}
+	}
+
+	return nil, fmt.Errorf("localblocks processor not found")
+}
+
+func (i *instance) QueryRange(ctx context.Context, req *tempopb.QueryRangeRequest) (resp *tempopb.QueryRangeResponse, err error) {
+	var processors []*localblocks.Processor
+
+	i.processorsMtx.RLock()
+	for _, processor := range i.processors {
+		switch p := processor.(type) {
+		case *localblocks.Processor:
+			processors = append(processors, p)
+		}
+	}
+
+	if i.queuebasedLocalBlocks != nil {
+		processors = append(processors, i.queuebasedLocalBlocks)
+	}
+
+	i.processorsMtx.RUnlock()
+
+	if len(processors) == 0 {
+		return resp, fmt.Errorf("localblocks processor not found")
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	expr, err := traceql.Parse(req.Query)
+	if err != nil {
+		return nil, fmt.Errorf("compiling query: %w", err)
+	}
+
+	unsafe := i.overrides.UnsafeQueryHints(i.instanceID)
+
+	timeOverlapCutoff := i.cfg.Processor.LocalBlocks.Metrics.TimeOverlapCutoff
+	if v, ok := expr.Hints.GetFloat(traceql.HintTimeOverlapCutoff, unsafe); ok && v >= 0 && v <= 1.0 {
+		timeOverlapCutoff = v
+	}
+
+	e := traceql.NewEngine()
+
+	// Compile the raw version of the query for head and wal blocks
+	// These aren't cached and we put them all into the same evaluator
+	// for efficiency.
+	rawEval, err := e.CompileMetricsQueryRange(req, int(req.Exemplars), timeOverlapCutoff, unsafe)
+	if err != nil {
+		return nil, err
+	}
+
+	// This is a summation version of the query for complete blocks
+	// which can be cached. They are timeseries, so they need the job-level evaluator.
+	jobEval, err := traceql.NewEngine().CompileMetricsQueryRangeNonRaw(req, traceql.AggregateModeSum)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, p := range processors {
+		err = p.QueryRange(ctx, req, rawEval, jobEval)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Combine the raw results into the job results
+	walResults := rawEval.Results().ToProto(req)
+	jobEval.ObserveSeries(walResults)
+
+	r := jobEval.Results()
+	rr := r.ToProto(req)
+	return &tempopb.QueryRangeResponse{
+		Series: rr,
+	}, nil
 }
 
 func (i *instance) updatePushMetrics(bytesIngested int, spanCount int, expiredSpanCount int) {

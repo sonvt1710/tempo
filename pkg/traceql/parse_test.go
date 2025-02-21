@@ -1,6 +1,7 @@
 package traceql
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -13,10 +14,11 @@ func TestPipelineErrors(t *testing.T) {
 		in  string
 		err error
 	}{
+		{in: "", err: newParseError("syntax error: unexpected $end", 0, 0)},
 		{in: "{ .a } | { .b", err: newParseError("syntax error: unexpected $end", 1, 14)},
 		{in: "{ .a | .b }", err: newParseError("syntax error: unexpected |", 1, 6)},
 		{in: "({ .a } | { .b }", err: newParseError("syntax error: unexpected $end, expecting ) or |", 1, 17)},
-		{in: "({ .a } | { .b }) + ({ .a } | { .b })", err: newParseError("syntax error: unexpected +", 1, 19)},
+		{in: "({ .a } | { .b }) + ({ .a } | { .b })", err: newParseError("syntax error: unexpected +, expecting with", 1, 19)},
 	}
 
 	for _, tc := range tests {
@@ -71,6 +73,25 @@ func TestPipelineOperatorPrecedence(t *testing.T) {
 				),
 			),
 		},
+		{
+			in: "({ .a } | { .b }) < (({ .a } | { .b }) && ({ .a } | { .b }))",
+			expected: newSpansetOperation(OpSpansetParent,
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+				newSpansetOperation(OpSpansetAnd,
+					newPipeline(
+						newSpansetFilter(NewAttribute("a")),
+						newSpansetFilter(NewAttribute("b")),
+					),
+					newPipeline(
+						newSpansetFilter(NewAttribute("a")),
+						newSpansetFilter(NewAttribute("b")),
+					),
+				),
+			),
+		},
 	}
 
 	for _, tc := range tests {
@@ -78,7 +99,7 @@ func TestPipelineOperatorPrecedence(t *testing.T) {
 			actual, err := Parse(tc.in)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(tc.expected)}, actual)
+			require.Equal(t, newRootExpr(newPipeline(tc.expected)), actual)
 		})
 	}
 }
@@ -91,6 +112,32 @@ func TestPipelineSpansetOperators(t *testing.T) {
 		{
 			in: "({ .a } | { .b }) > ({ .a } | { .b })",
 			expected: newSpansetOperation(OpSpansetChild,
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+			),
+		},
+		{
+			in: "({ .a } | { .b }) < ({ .a } | { .b })",
+			expected: newSpansetOperation(OpSpansetParent,
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+			),
+		},
+		{
+			in: "({ .a } | { .b }) ~ ({ .a } | { .b })",
+			expected: newSpansetOperation(OpSpansetSibling,
 				newPipeline(
 					newSpansetFilter(NewAttribute("a")),
 					newSpansetFilter(NewAttribute("b")),
@@ -127,6 +174,149 @@ func TestPipelineSpansetOperators(t *testing.T) {
 				),
 			),
 		},
+		{
+			in: "({ .a } | { .b }) << ({ .a } | { .b })",
+			expected: newSpansetOperation(OpSpansetAncestor,
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+			),
+		},
+		{
+			in: "({ .a } | { .b }) !> ({ .a } | { .b })",
+			expected: newSpansetOperation(OpSpansetNotChild,
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+			),
+		},
+		{
+			in: "({ .a } | { .b }) !< ({ .a } | { .b })",
+			expected: newSpansetOperation(OpSpansetNotParent,
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+			),
+		},
+		{
+			in: "({ .a } | { .b }) !~ ({ .a } | { .b })",
+			expected: newSpansetOperation(OpSpansetNotSibling,
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+			),
+		},
+		{
+			in: "({ .a } | { .b }) !>> ({ .a } | { .b })",
+			expected: newSpansetOperation(OpSpansetNotDescendant,
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+			),
+		},
+		{
+			in: "({ .a } | { .b }) !<< ({ .a } | { .b })",
+			expected: newSpansetOperation(OpSpansetNotAncestor,
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+			),
+		},
+		{
+			in: "({ .a } | { .b }) &> ({ .a } | { .b })",
+			expected: newSpansetOperation(OpSpansetUnionChild,
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+			),
+		},
+		{
+			in: "({ .a } | { .b }) &< ({ .a } | { .b })",
+			expected: newSpansetOperation(OpSpansetUnionParent,
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+			),
+		},
+		{
+			in: "({ .a } | { .b }) &~ ({ .a } | { .b })",
+			expected: newSpansetOperation(OpSpansetUnionSibling,
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+			),
+		},
+		{
+			in: "({ .a } | { .b }) &>> ({ .a } | { .b })",
+			expected: newSpansetOperation(OpSpansetUnionDescendant,
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+			),
+		},
+		{
+			in: "({ .a } | { .b }) &<< ({ .a } | { .b })",
+			expected: newSpansetOperation(OpSpansetUnionAncestor,
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+				newPipeline(
+					newSpansetFilter(NewAttribute("a")),
+					newSpansetFilter(NewAttribute("b")),
+				),
+			),
+		},
 	}
 
 	for _, tc := range tests {
@@ -134,7 +324,7 @@ func TestPipelineSpansetOperators(t *testing.T) {
 			actual, err := Parse(tc.in)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(tc.expected)}, actual)
+			require.Equal(t, newRootExpr(newPipeline(tc.expected)), actual)
 		})
 	}
 }
@@ -216,7 +406,7 @@ func TestPipelineScalarOperators(t *testing.T) {
 			actual, err := Parse(tc.in)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(tc.expected)}, actual)
+			require.Equal(t, newRootExpr(newPipeline(tc.expected)), actual)
 		})
 	}
 }
@@ -256,7 +446,7 @@ func TestPipelines(t *testing.T) {
 			actual, err := Parse(tc.in)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{tc.expected}, actual)
+			require.Equal(t, newRootExpr(tc.expected), actual)
 		})
 	}
 }
@@ -266,7 +456,7 @@ func TestGroupCoalesceErrors(t *testing.T) {
 		in  string
 		err error
 	}{
-		{in: "by(.a) && { .b }", err: newParseError("syntax error: unexpected &&", 0, 8)},
+		{in: "by(.a) && { .b }", err: newParseError("syntax error: unexpected &&, expecting with", 0, 8)},
 		{in: "by()", err: newParseError("syntax error: unexpected )", 1, 4)},
 		{in: "coalesce()", err: newParseError("syntax error: unexpected coalesce", 1, 1)},
 	}
@@ -294,7 +484,44 @@ func TestGroupCoalesceOperation(t *testing.T) {
 			actual, err := Parse(tc.in)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{tc.expected}, actual)
+			require.Equal(t, newRootExpr(tc.expected), actual)
+		})
+	}
+}
+
+func TestSelectErrors(t *testing.T) {
+	tests := []struct {
+		in  string
+		err error
+	}{
+		{in: "select(.a) && { .b }", err: newParseError("syntax error: unexpected &&, expecting with", 0, 12)},
+		{in: "select()", err: newParseError("syntax error: unexpected )", 1, 8)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.in, func(t *testing.T) {
+			_, err := Parse(tc.in)
+
+			require.Equal(t, tc.err, err)
+		})
+	}
+}
+
+func TestSelectOperation(t *testing.T) {
+	tests := []struct {
+		in       string
+		expected Pipeline
+	}{
+		{in: "select(.a)", expected: newPipeline(newSelectOperation([]Attribute{NewAttribute("a")}))},
+		{in: "select(.a,.b)", expected: newPipeline(newSelectOperation([]Attribute{NewAttribute("a"), NewAttribute("b")}))},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.in, func(t *testing.T) {
+			actual, err := Parse(tc.in)
+
+			require.NoError(t, err)
+			require.Equal(t, newRootExpr(tc.expected), actual)
 		})
 	}
 }
@@ -363,7 +590,7 @@ func TestSpansetExpressionPrecedence(t *testing.T) {
 			actual, err := Parse(tc.in)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(tc.expected)}, actual)
+			require.Equal(t, newRootExpr(newPipeline(tc.expected)), actual)
 		})
 	}
 }
@@ -375,11 +602,23 @@ func TestSpansetExpressionOperators(t *testing.T) {
 	}{
 		{in: "{ true } && { false }", expected: newSpansetOperation(OpSpansetAnd, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
 		{in: "{ true } > { false }", expected: newSpansetOperation(OpSpansetChild, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
+		{in: "{ true } < { false }", expected: newSpansetOperation(OpSpansetParent, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
 		{in: "{ true } >> { false }", expected: newSpansetOperation(OpSpansetDescendant, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
+		{in: "{ true } << { false }", expected: newSpansetOperation(OpSpansetAncestor, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
 		{in: "{ true } || { false }", expected: newSpansetOperation(OpSpansetUnion, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
 		{in: "{ true } ~ { false }", expected: newSpansetOperation(OpSpansetSibling, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
 		// this test was added to highlight the one shift/reduce conflict in the grammar. this could also be parsed as two spanset pipelines &&ed together.
 		{in: "({ true }) && ({ false })", expected: newSpansetOperation(OpSpansetAnd, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
+		{in: "{ true } !> { false }", expected: newSpansetOperation(OpSpansetNotChild, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
+		{in: "{ true } !< { false }", expected: newSpansetOperation(OpSpansetNotParent, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
+		{in: "{ true } !>> { false }", expected: newSpansetOperation(OpSpansetNotDescendant, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
+		{in: "{ true } !<< { false }", expected: newSpansetOperation(OpSpansetNotAncestor, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
+		{in: "{ true } !~ { false }", expected: newSpansetOperation(OpSpansetNotSibling, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
+		{in: "{ true } &> { false }", expected: newSpansetOperation(OpSpansetUnionChild, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
+		{in: "{ true } &< { false }", expected: newSpansetOperation(OpSpansetUnionParent, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
+		{in: "{ true } &>> { false }", expected: newSpansetOperation(OpSpansetUnionDescendant, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
+		{in: "{ true } &<< { false }", expected: newSpansetOperation(OpSpansetUnionAncestor, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
+		{in: "{ true } &~ { false }", expected: newSpansetOperation(OpSpansetUnionSibling, newSpansetFilter(NewStaticBool(true)), newSpansetFilter(NewStaticBool(false)))},
 	}
 
 	for _, tc := range tests {
@@ -387,7 +626,7 @@ func TestSpansetExpressionOperators(t *testing.T) {
 			actual, err := Parse(tc.in)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(tc.expected)}, actual)
+			require.Equal(t, newRootExpr(newPipeline(tc.expected)), actual)
 		})
 	}
 }
@@ -397,7 +636,7 @@ func TestScalarExpressionErrors(t *testing.T) {
 		in  string
 		err error
 	}{
-		{in: "(avg(.foo) > count()) + sum(.bar)", err: newParseError("syntax error: unexpected +", 1, 23)},
+		{in: "(avg(.foo) > count()) + sum(.bar)", err: newParseError("syntax error: unexpected +, expecting with", 1, 23)},
 		{in: "count(", err: newParseError("syntax error: unexpected $end, expecting )", 1, 7)},
 		{in: "count(avg)", err: newParseError("syntax error: unexpected avg, expecting )", 1, 7)},
 		{in: "count(.thing)", err: newParseError("syntax error: unexpected ., expecting )", 1, 7)},
@@ -444,7 +683,7 @@ func TestScalarExpressionPrecedence(t *testing.T) {
 			actual, err := Parse(tc.in)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(tc.expected)}, actual)
+			require.Equal(t, newRootExpr(newPipeline(tc.expected)), actual)
 		})
 	}
 }
@@ -466,7 +705,7 @@ func TestScalarExpressionOperators(t *testing.T) {
 			actual, err := Parse(tc.in)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(tc.expected)}, actual)
+			require.Equal(t, newRootExpr(newPipeline(tc.expected)), actual)
 		})
 	}
 }
@@ -605,7 +844,7 @@ func TestSpansetFilterOperatorPrecedence(t *testing.T) {
 			actual, err := Parse(tc.in)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(newSpansetFilter(tc.expected))}, actual)
+			require.Equal(t, newRootExpr(newPipeline(newSpansetFilter(tc.expected))), actual)
 		})
 	}
 }
@@ -626,6 +865,7 @@ func TestSpansetFilterStatics(t *testing.T) {
 		{in: "{ name }", expected: NewIntrinsic(IntrinsicName)},
 		{in: "{ parent }", expected: NewIntrinsic(IntrinsicParent)},
 		{in: "{ status }", expected: NewIntrinsic(IntrinsicStatus)},
+		{in: "{ statusMessage }", expected: NewIntrinsic(IntrinsicStatusMessage)},
 		{in: "{ 4321 }", expected: NewStaticInt(4321)},
 		{in: "{ 1.234 }", expected: NewStaticFloat(1.234)},
 		{in: "{ nil }", expected: NewStaticNil()},
@@ -647,7 +887,7 @@ func TestSpansetFilterStatics(t *testing.T) {
 			actual, err := Parse(tc.in)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(newSpansetFilter(tc.expected))}, actual)
+			require.Equal(t, newRootExpr(newPipeline(newSpansetFilter(tc.expected))), actual)
 		})
 	}
 }
@@ -682,16 +922,20 @@ func TestSpansetFilterOperators(t *testing.T) {
 		{in: "{ .a = 3 }", expected: newBinaryOperation(OpEqual, NewAttribute("a"), NewStaticInt(3)), alsoTestWithoutSpace: true},
 		{in: "{ .a = 3.0 }", expected: newBinaryOperation(OpEqual, NewAttribute("a"), NewStaticFloat(3)), alsoTestWithoutSpace: true},
 		{in: "{ .a = true }", expected: newBinaryOperation(OpEqual, NewAttribute("a"), NewStaticBool(true)), alsoTestWithoutSpace: true},
+
+		// existence
+		{in: "{ .a != nil }", expected: newBinaryOperation(OpNotEqual, NewAttribute("a"), NewStaticNil()), alsoTestWithoutSpace: true},
+		{in: "{ .a = nil }", expected: newBinaryOperation(OpEqual, NewAttribute("a"), NewStaticNil()), alsoTestWithoutSpace: true},
 	}
 
 	test := func(q string, expected FieldExpression) {
 		actual, err := Parse(q)
 		require.NoError(t, err, q)
-		require.Equal(t, &RootExpr{newPipeline(newSpansetFilter(expected))}, actual, q)
+		require.Equal(t, newRootExpr(newPipeline(newSpansetFilter(expected))), actual, q)
 	}
 
 	for _, tc := range tests {
-		t.Run(tc.in, func(t *testing.T) {
+		t.Run(tc.in, func(_ *testing.T) {
 			test(tc.in, tc.expected)
 			if tc.alsoTestWithoutSpace {
 				test(strings.ReplaceAll(tc.in, " ", ""), tc.expected)
@@ -706,9 +950,11 @@ func TestAttributeNameErrors(t *testing.T) {
 		err error
 	}{
 		{in: "{ . foo }", err: newParseError("syntax error: unexpected END_ATTRIBUTE, expecting IDENTIFIER", 1, 3)},
+		{in: `{ . "foo" }`, err: newParseError("syntax error: unexpected END_ATTRIBUTE, expecting IDENTIFIER", 1, 3)},
 		{in: "{ .foo .bar }", err: newParseError("syntax error: unexpected .", 1, 8)},
 		{in: "{ parent. }", err: newParseError("syntax error: unexpected END_ATTRIBUTE, expecting IDENTIFIER or resource. or span.", 0, 3)},
 		{in: ".3foo", err: newParseError("syntax error: unexpected IDENTIFIER", 1, 3)},
+		{in: `{ ."foo }`, err: newParseError(`unexpected EOF, expecting "`, 0, 3)},
 	}
 
 	for _, tc := range tests {
@@ -716,6 +962,36 @@ func TestAttributeNameErrors(t *testing.T) {
 			_, err := Parse(tc.in)
 
 			require.Equal(t, tc.err, err)
+		})
+	}
+}
+
+// TestBinaryAndUnaryOperationsCollapseToStatics tests code in the newBinaryOperation and newUnaryOperation functions
+// that attempts to simplify combinations of static values where possible.
+func TestBinaryAndUnaryOperationsCollapseToStatics(t *testing.T) {
+	tests := []struct {
+		in       string
+		expected FieldExpression
+	}{
+		{in: "{ duration > 1 + 2}", expected: newBinaryOperation(OpGreater, NewIntrinsic(IntrinsicDuration), NewStaticInt(3))},
+		{in: "{ -1 }", expected: NewStaticInt(-1)},
+		{in: "{ 1 + 1 > 1 }", expected: NewStaticBool(true)},
+		{in: "{ `foo` = `bar` }", expected: NewStaticBool(false)},
+		{in: "{ 1 = 1. }", expected: NewStaticBool(true)}, // this is an interesting case, it returns true even though { span.foo = 1 } would be false if span.foo had the float value 1.0
+		{in: "{ .1 + 1 }", expected: NewStaticFloat(1.1)},
+		{in: "{ 1 * -1 = -1 }", expected: NewStaticBool(true)},
+		{in: "{ .foo * -1. = -1 }", expected: newBinaryOperation(OpEqual, newBinaryOperation(OpMult, NewAttribute("foo"), NewStaticFloat(-1)), NewStaticInt(-1))},
+	}
+
+	test := func(t *testing.T, q string, expected FieldExpression) {
+		actual, err := Parse(q)
+		require.NoError(t, err, q)
+		require.Equal(t, newRootExpr(newPipeline(newSpansetFilter(expected))), actual, q)
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.in, func(t *testing.T) {
+			test(t, tc.in, tc.expected)
 		})
 	}
 }
@@ -744,10 +1020,23 @@ func TestAttributes(t *testing.T) {
 		{in: "parent.foo.bar.baz", expected: NewScopedAttribute(AttributeScopeNone, true, "foo.bar.baz")},
 		{in: "resource.foo.bar.baz", expected: NewScopedAttribute(AttributeScopeResource, false, "foo.bar.baz")},
 		{in: "span.foo.bar", expected: NewScopedAttribute(AttributeScopeSpan, false, "foo.bar")},
+		{in: "event.foo.bar", expected: NewScopedAttribute(AttributeScopeEvent, false, "foo.bar")},
+		{in: "link.foo.bar", expected: NewScopedAttribute(AttributeScopeLink, false, "foo.bar")},
+		{in: "instrumentation.foo.bar", expected: NewScopedAttribute(AttributeScopeInstrumentation, false, "foo.bar")},
 		{in: "parent.resource.foo", expected: NewScopedAttribute(AttributeScopeResource, true, "foo")},
 		{in: "parent.span.foo", expected: NewScopedAttribute(AttributeScopeSpan, true, "foo")},
 		{in: "parent.resource.foo.bar.baz", expected: NewScopedAttribute(AttributeScopeResource, true, "foo.bar.baz")},
 		{in: "parent.span.foo.bar", expected: NewScopedAttribute(AttributeScopeSpan, true, "foo.bar")},
+		{in: `."bar z".foo`, expected: NewAttribute("bar z.foo")},
+		{in: `span."bar z".foo`, expected: NewScopedAttribute(AttributeScopeSpan, false, "bar z.foo")},
+		{in: `."bar z".foo."bar"`, expected: NewAttribute("bar z.foo.bar")},
+		{in: `.foo."bar baz"`, expected: NewAttribute("foo.bar baz")},
+		{in: `.foo."bar baz".bar`, expected: NewAttribute("foo.bar baz.bar")},
+		{in: `.foo."bar \" baz"`, expected: NewAttribute(`foo.bar " baz`)},
+		{in: `.foo."bar \\ baz"`, expected: NewAttribute(`foo.bar \ baz`)},
+		{in: `.foo."bar \\"." baz"`, expected: NewAttribute(`foo.bar \. baz`)},
+		{in: `."foo.bar"`, expected: NewAttribute(`foo.bar`)},
+		{in: `."🤘"`, expected: NewAttribute(`🤘`)},
 	}
 
 	for _, tc := range tests {
@@ -756,25 +1045,25 @@ func TestAttributes(t *testing.T) {
 			actual, err := Parse(s)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(newSpansetFilter(tc.expected))}, actual)
+			require.Equal(t, newRootExpr(newPipeline(newSpansetFilter(tc.expected))), actual)
 
 			s = "{" + tc.in + "}"
 			actual, err = Parse(s)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(newSpansetFilter(tc.expected))}, actual)
+			require.Equal(t, newRootExpr(newPipeline(newSpansetFilter(tc.expected))), actual)
 
 			s = "{ (" + tc.in + ") }"
 			actual, err = Parse(s)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(newSpansetFilter(tc.expected))}, actual)
+			require.Equal(t, newRootExpr(newPipeline(newSpansetFilter(tc.expected))), actual)
 
 			s = "{ " + tc.in + " + " + tc.in + " }"
 			actual, err = Parse(s)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(newSpansetFilter(newBinaryOperation(OpAdd, tc.expected, tc.expected)))}, actual)
+			require.Equal(t, newRootExpr(newPipeline(newSpansetFilter(newBinaryOperation(OpAdd, tc.expected, tc.expected)))), actual)
 		})
 	}
 }
@@ -788,8 +1077,15 @@ func TestIntrinsics(t *testing.T) {
 		{in: "childCount", expected: IntrinsicChildCount},
 		{in: "name", expected: IntrinsicName},
 		{in: "status", expected: IntrinsicStatus},
+		{in: "statusMessage", expected: IntrinsicStatusMessage},
 		{in: "kind", expected: IntrinsicKind},
 		{in: "parent", expected: IntrinsicParent},
+		{in: "traceDuration", expected: IntrinsicTraceDuration},
+		{in: "rootServiceName", expected: IntrinsicTraceRootService},
+		{in: "rootName", expected: IntrinsicTraceRootSpan},
+		{in: "nestedSetLeft", expected: IntrinsicNestedSetLeft},
+		{in: "nestedSetRight", expected: IntrinsicNestedSetRight},
+		{in: "nestedSetParent", expected: IntrinsicNestedSetParent},
 	}
 
 	for _, tc := range tests {
@@ -799,65 +1095,65 @@ func TestIntrinsics(t *testing.T) {
 			actual, err := Parse(s)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(
+			require.Equal(t, newRootExpr(newPipeline(
 				newSpansetFilter(Attribute{
 					Scope:     AttributeScopeNone,
 					Parent:    false,
 					Name:      tc.in,
 					Intrinsic: tc.expected,
-				}))}, actual)
+				}))), actual)
 
 			// as attribute e.g .duration
 			s = "{ ." + tc.in + "}"
 			actual, err = Parse(s)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(
+			require.Equal(t, newRootExpr(newPipeline(
 				newSpansetFilter(Attribute{
 					Scope:     AttributeScopeNone,
 					Parent:    false,
 					Name:      tc.in,
 					Intrinsic: IntrinsicNone,
-				}))}, actual)
+				}))), actual)
 
 			// as span scoped attribute e.g span.duration
 			s = "{ span." + tc.in + "}"
 			actual, err = Parse(s)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(
+			require.Equal(t, newRootExpr(newPipeline(
 				newSpansetFilter(Attribute{
 					Scope:     AttributeScopeSpan,
 					Parent:    false,
 					Name:      tc.in,
 					Intrinsic: IntrinsicNone,
-				}))}, actual)
+				}))), actual)
 
 			// as resource scoped attribute e.g resource.duration
 			s = "{ resource." + tc.in + "}"
 			actual, err = Parse(s)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(
+			require.Equal(t, newRootExpr(newPipeline(
 				newSpansetFilter(Attribute{
 					Scope:     AttributeScopeResource,
 					Parent:    false,
 					Name:      tc.in,
 					Intrinsic: IntrinsicNone,
-				}))}, actual)
+				}))), actual)
 
 			// as parent scoped intrinsic e.g parent.duration
 			s = "{ parent." + tc.in + "}"
 			actual, err = Parse(s)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(
+			require.Equal(t, newRootExpr(newPipeline(
 				newSpansetFilter(Attribute{
 					Scope:     AttributeScopeNone,
 					Parent:    true,
 					Name:      tc.in,
-					Intrinsic: tc.expected,
-				}))}, actual)
+					Intrinsic: IntrinsicNone,
+				}))), actual)
 
 			// as nested parent scoped intrinsic e.g. parent.duration.foo
 			// this becomes lookup on attribute named "duration.foo"
@@ -865,39 +1161,91 @@ func TestIntrinsics(t *testing.T) {
 			actual, err = Parse(s)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(
+			require.Equal(t, newRootExpr(newPipeline(
 				newSpansetFilter(Attribute{
 					Scope:     AttributeScopeNone,
 					Parent:    true,
 					Name:      tc.in + ".foo",
 					Intrinsic: IntrinsicNone,
-				}))}, actual)
+				}))), actual)
 
 			// as parent resource scoped attribute e.g. parent.resource.duration
 			s = "{ parent.resource." + tc.in + "}"
 			actual, err = Parse(s)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(
+			require.Equal(t, newRootExpr(newPipeline(
 				newSpansetFilter(Attribute{
 					Scope:     AttributeScopeResource,
 					Parent:    true,
 					Name:      tc.in,
 					Intrinsic: IntrinsicNone,
-				}))}, actual)
+				}))), actual)
 
 			// as parent span scoped attribute e.g. praent.span.duration
 			s = "{ parent.span." + tc.in + "}"
 			actual, err = Parse(s)
 
 			require.NoError(t, err)
-			require.Equal(t, &RootExpr{newPipeline(
+			require.Equal(t, newRootExpr(newPipeline(
 				newSpansetFilter(Attribute{
 					Scope:     AttributeScopeSpan,
 					Parent:    true,
 					Name:      tc.in,
 					Intrinsic: IntrinsicNone,
-				}))}, actual)
+				}))), actual)
+		})
+	}
+}
+
+func TestScopedIntrinsics(t *testing.T) {
+	tests := []struct {
+		in          string
+		expected    Intrinsic
+		shouldError bool
+	}{
+		{in: "trace:duration", expected: IntrinsicTraceDuration},
+		{in: "trace:rootName", expected: IntrinsicTraceRootSpan},
+		{in: "trace:rootService", expected: IntrinsicTraceRootService},
+		{in: "trace:id", expected: IntrinsicTraceID},
+		{in: "span:duration", expected: IntrinsicDuration},
+		{in: "span:kind", expected: IntrinsicKind},
+		{in: "span:name", expected: IntrinsicName},
+		{in: "span:status", expected: IntrinsicStatus},
+		{in: "span:statusMessage", expected: IntrinsicStatusMessage},
+		{in: "span:id", expected: IntrinsicSpanID},
+		{in: "event:name", expected: IntrinsicEventName},
+		{in: "event:timeSinceStart", expected: IntrinsicEventTimeSinceStart},
+		{in: "link:traceID", expected: IntrinsicLinkTraceID},
+		{in: "link:spanID", expected: IntrinsicLinkSpanID},
+		{in: "instrumentation:name", expected: IntrinsicInstrumentationName},
+		{in: "instrumentation:version", expected: IntrinsicInstrumentationVersion},
+		{in: ":duration", shouldError: true},
+		{in: ":statusMessage", shouldError: true},
+		{in: "trace:name", shouldError: true},
+		{in: "trace:rootServiceName", shouldError: true},
+		{in: "span:rootServiceName", shouldError: true},
+		{in: "parent:id", shouldError: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.in, func(t *testing.T) {
+			// as scoped intrinsic e.g :duration
+			s := "{ " + tc.in + "}"
+			actual, err := Parse(s)
+
+			if tc.shouldError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, newRootExpr(newPipeline(
+					newSpansetFilter(Attribute{
+						Scope:     AttributeScopeNone,
+						Parent:    false,
+						Name:      tc.expected.String(),
+						Intrinsic: tc.expected,
+					}))), actual)
+			}
 		})
 	}
 }
@@ -906,6 +1254,7 @@ func TestParseIdentifier(t *testing.T) {
 	testCases := map[string]Attribute{
 		"name":             NewIntrinsic(IntrinsicName),
 		"status":           NewIntrinsic(IntrinsicStatus),
+		"statusMessage":    NewIntrinsic(IntrinsicStatusMessage),
 		"kind":             NewIntrinsic(IntrinsicKind),
 		".name":            NewAttribute("name"),
 		".status":          NewAttribute("status"),
@@ -934,7 +1283,149 @@ func TestEmptyQuery(t *testing.T) {
 		t.Run(tc.in, func(t *testing.T) {
 			actual, err := Parse(tc.in)
 			require.NoError(t, err, tc.in)
-			require.Equal(t, &RootExpr{newPipeline(newSpansetFilter(NewStaticBool(true)))}, actual, tc.in)
+			require.Equal(t, newRootExpr(newPipeline(newSpansetFilter(NewStaticBool(true)))), actual, tc.in)
+		})
+	}
+}
+
+func TestHints(t *testing.T) {
+	tests := []struct {
+		in       string
+		expected *RootExpr
+	}{
+		{
+			in: `{ } | rate() with(foo="bar")`,
+			expected: newRootExprWithMetrics(
+				newPipeline(newSpansetFilter(NewStaticBool(true))),
+				newMetricsAggregate(metricsAggregateRate, nil),
+			).withHints(newHints([]*Hint{
+				newHint("foo", NewStaticString("bar")),
+			})),
+		},
+		{
+			in: `{ } | rate() with(foo=0.5)`,
+			expected: newRootExprWithMetrics(
+				newPipeline(newSpansetFilter(NewStaticBool(true))),
+				newMetricsAggregate(metricsAggregateRate, nil),
+			).withHints(newHints([]*Hint{
+				newHint("foo", NewStaticFloat(0.5)),
+			})),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.in, func(t *testing.T) {
+			actual, err := Parse(tc.in)
+
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, actual)
+		})
+	}
+}
+
+func TestReallyLongQuery(t *testing.T) {
+	for i := 1000; i < 1050; i++ {
+		longVal := strings.Repeat("a", i)
+
+		// static value
+		query := fmt.Sprintf("{ .a = `%s` }", longVal)
+		expected := newBinaryOperation(OpEqual, NewAttribute("a"), NewStaticString(longVal))
+
+		actual, err := Parse(query)
+
+		require.NoError(t, err, "i=%d", i)
+		require.Equal(t, newRootExpr(newPipeline(newSpansetFilter(expected))), actual, "i=%d", i)
+
+		// attr name
+		query = fmt.Sprintf("{ .%s = `foo` }", longVal)
+		expected = newBinaryOperation(OpEqual, NewAttribute(longVal), NewStaticString("foo"))
+
+		actual, err = Parse(query)
+
+		require.NoError(t, err, "i=%d", i)
+		require.Equal(t, newRootExpr(newPipeline(newSpansetFilter(expected))), actual, "i=%d", i)
+	}
+}
+
+func TestMetrics(t *testing.T) {
+	tests := []struct {
+		in       string
+		expected *RootExpr
+	}{
+		{
+			in: `{ } | rate()`,
+			expected: newRootExprWithMetrics(
+				newPipeline(newSpansetFilter(NewStaticBool(true))),
+				newMetricsAggregate(metricsAggregateRate, nil),
+			),
+		},
+		{
+			in: `{ } | count_over_time() by(name, span.http.status_code)`,
+			expected: newRootExprWithMetrics(
+				newPipeline(newSpansetFilter(NewStaticBool(true))),
+				newMetricsAggregate(metricsAggregateCountOverTime, []Attribute{
+					NewIntrinsic(IntrinsicName),
+					NewScopedAttribute(AttributeScopeSpan, false, "http.status_code"),
+				}),
+			),
+		},
+		{
+			in: `{ } | min_over_time(duration) by(name, span.http.status_code)`,
+			expected: newRootExprWithMetrics(
+				newPipeline(newSpansetFilter(NewStaticBool(true))),
+				newMetricsAggregateWithAttr(metricsAggregateMinOverTime,
+					NewIntrinsic(IntrinsicDuration),
+					[]Attribute{
+						NewIntrinsic(IntrinsicName),
+						NewScopedAttribute(AttributeScopeSpan, false, "http.status_code"),
+					}),
+			),
+		},
+		{
+			in: `{ } | max_over_time(duration) by(name, span.http.status_code)`,
+			expected: newRootExprWithMetrics(
+				newPipeline(newSpansetFilter(NewStaticBool(true))),
+				newMetricsAggregateWithAttr(metricsAggregateMaxOverTime,
+					NewIntrinsic(IntrinsicDuration),
+					[]Attribute{
+						NewIntrinsic(IntrinsicName),
+						NewScopedAttribute(AttributeScopeSpan, false, "http.status_code"),
+					}),
+			),
+		},
+		{
+			in: `{ } | avg_over_time(duration) by(name, span.http.status_code)`,
+			expected: newRootExprWithMetrics(
+				newPipeline(newSpansetFilter(NewStaticBool(true))),
+				newAverageOverTimeMetricsAggregator(
+					NewIntrinsic(IntrinsicDuration),
+					[]Attribute{
+						NewIntrinsic(IntrinsicName),
+						NewScopedAttribute(AttributeScopeSpan, false, "http.status_code"),
+					}),
+			),
+		},
+		{
+			in: `{ } | quantile_over_time(duration, 0, 0.90, 0.95, 1) by(name, span.http.status_code)`,
+			expected: newRootExprWithMetrics(
+				newPipeline(newSpansetFilter(NewStaticBool(true))),
+				newMetricsAggregateQuantileOverTime(
+					NewIntrinsic(IntrinsicDuration),
+					[]float64{0, 0.9, 0.95, 1.0},
+					[]Attribute{
+						NewIntrinsic(IntrinsicName),
+						NewScopedAttribute(AttributeScopeSpan, false, "http.status_code"),
+					}),
+			),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.in, func(t *testing.T) {
+			actual, err := Parse(tc.in)
+
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, actual)
 		})
 	}
 }

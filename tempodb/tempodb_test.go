@@ -2,6 +2,7 @@ package tempodb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -12,9 +13,14 @@ import (
 	"github.com/go-kit/log"
 	"github.com/golang/protobuf/proto" //nolint:all
 	"github.com/google/uuid"
+	v2 "github.com/grafana/tempo/tempodb/encoding/v2"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/grafana/tempo/modules/cache/memcached"
+	"github.com/grafana/tempo/modules/cache/redis"
+	"github.com/grafana/tempo/pkg/cache"
 	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/model/trace"
 	"github.com/grafana/tempo/pkg/tempopb"
@@ -37,7 +43,7 @@ func testConfig(t *testing.T, enc backend.Encoding, blocklistPoll time.Duration,
 	tempDir := t.TempDir()
 
 	cfg := &Config{
-		Backend: "local",
+		Backend: backend.Local,
 		Local: &local.Config{
 			Path: path.Join(tempDir, "traces"),
 		},
@@ -53,13 +59,17 @@ func testConfig(t *testing.T, enc backend.Encoding, blocklistPoll time.Duration,
 			Filepath: path.Join(tempDir, "wal"),
 		},
 		BlocklistPoll: blocklistPoll,
+		Search: &SearchConfig{
+			ChunkSizeBytes:  1_000_000,
+			ReadBufferCount: 8, ReadBufferSizeBytes: 4 * 1024 * 1024,
+		},
 	}
 
 	for _, opt := range opts {
 		opt(cfg)
 	}
 
-	r, w, c, err := New(cfg, log.NewNopLogger())
+	r, w, c, err := New(cfg, nil, log.NewNopLogger())
 	require.NoError(t, err)
 	return r, w, c, tempDir
 }
@@ -75,13 +85,14 @@ func TestDB(t *testing.T) {
 	}, &mockSharder{}, &mockOverrides{})
 	require.NoError(t, err)
 
-	r.EnablePolling(&mockJobSharder{})
+	r.EnablePolling(context.Background(), &mockJobSharder{})
 
-	blockID := uuid.New()
+	blockID := backend.NewUUID()
 
 	wal := w.WAL()
 
-	head, err := wal.NewBlock(blockID, testTenantID, model.CurrentEncoding)
+	meta := &backend.BlockMeta{BlockID: blockID, TenantID: testTenantID}
+	head, err := wal.NewBlock(meta, model.CurrentEncoding)
 	assert.NoError(t, err)
 
 	dec := model.MustNewSegmentDecoder(model.CurrentEncoding)
@@ -104,7 +115,7 @@ func TestDB(t *testing.T) {
 
 	// read
 	for i, id := range ids {
-		bFound, failedBlocks, err := r.Find(context.Background(), testTenantID, id, BlockIDMin, BlockIDMax, 0, 0)
+		bFound, failedBlocks, err := r.Find(context.Background(), testTenantID, id, BlockIDMin, BlockIDMax, 0, 0, common.DefaultSearchOptions())
 		assert.NoError(t, err)
 		assert.Nil(t, failedBlocks)
 		assert.True(t, proto.Equal(bFound[0], reqs[i]))
@@ -126,14 +137,15 @@ func TestBlockSharding(t *testing.T) {
 	// search with different shards and check if its respecting the params
 	r, w, _, _ := testConfig(t, backend.EncLZ4_256k, 0)
 
-	r.EnablePolling(&mockJobSharder{})
+	r.EnablePolling(context.Background(), &mockJobSharder{})
 
 	// create block with known ID
-	blockID := uuid.New()
+	blockID := backend.NewUUID()
 	wal := w.WAL()
 
 	dec := model.MustNewSegmentDecoder(model.CurrentEncoding)
-	head, err := wal.NewBlock(blockID, testTenantID, model.CurrentEncoding)
+	meta := &backend.BlockMeta{BlockID: blockID, TenantID: testTenantID, DataEncoding: model.CurrentEncoding}
+	head, err := wal.NewBlock(meta, model.CurrentEncoding)
 	assert.NoError(t, err)
 
 	// add a trace to the block
@@ -155,7 +167,7 @@ func TestBlockSharding(t *testing.T) {
 	// check if it respects the blockstart/blockend params - case1: hit
 	blockStart := uuid.MustParse(BlockIDMin).String()
 	blockEnd := uuid.MustParse(BlockIDMax).String()
-	bFound, failedBlocks, err := r.Find(context.Background(), testTenantID, id, blockStart, blockEnd, 0, 0)
+	bFound, failedBlocks, err := r.Find(context.Background(), testTenantID, id, blockStart, blockEnd, 0, 0, common.DefaultSearchOptions())
 	assert.NoError(t, err)
 	assert.Nil(t, failedBlocks)
 	assert.Greater(t, len(bFound), 0)
@@ -164,7 +176,7 @@ func TestBlockSharding(t *testing.T) {
 	// check if it respects the blockstart/blockend params - case2: miss
 	blockStart = uuid.MustParse(BlockIDMin).String()
 	blockEnd = uuid.MustParse(BlockIDMin).String()
-	bFound, failedBlocks, err = r.Find(context.Background(), testTenantID, id, blockStart, blockEnd, 0, 0)
+	bFound, failedBlocks, err = r.Find(context.Background(), testTenantID, id, blockStart, blockEnd, 0, 0, common.DefaultSearchOptions())
 	assert.NoError(t, err)
 	assert.Nil(t, failedBlocks)
 	assert.Len(t, bFound, 0)
@@ -173,7 +185,7 @@ func TestBlockSharding(t *testing.T) {
 func TestNilOnUnknownTenantID(t *testing.T) {
 	r, _, _, _ := testConfig(t, backend.EncLZ4_256k, 0)
 
-	buff, failedBlocks, err := r.Find(context.Background(), "unknown", []byte{0x01}, BlockIDMin, BlockIDMax, 0, 0)
+	buff, failedBlocks, err := r.Find(context.Background(), "unknown", []byte{0x01}, BlockIDMin, BlockIDMax, 0, 0, common.DefaultSearchOptions())
 	assert.Nil(t, buff)
 	assert.Nil(t, err)
 	assert.Nil(t, failedBlocks)
@@ -190,13 +202,14 @@ func TestBlockCleanup(t *testing.T) {
 	}, &mockSharder{}, &mockOverrides{})
 	require.NoError(t, err)
 
-	r.EnablePolling(&mockJobSharder{})
+	r.EnablePolling(context.Background(), &mockJobSharder{})
 
-	blockID := uuid.New()
+	blockID := backend.NewUUID()
 
 	wal := w.WAL()
 
-	head, err := wal.NewBlock(blockID, testTenantID, model.CurrentEncoding)
+	meta := &backend.BlockMeta{BlockID: blockID, TenantID: testTenantID}
+	head, err := wal.NewBlock(meta, model.CurrentEncoding)
 	assert.NoError(t, err)
 
 	_, err = w.CompleteBlock(context.Background(), head)
@@ -224,26 +237,13 @@ func checkBlocklists(t *testing.T, expectedID uuid.UUID, expectedB int, expected
 	blocklist := rw.blocklist.Metas(testTenantID)
 	require.Len(t, blocklist, expectedB)
 	if expectedB > 0 && expectedID != uuid.Nil {
-		assert.Equal(t, expectedID, blocklist[0].BlockID)
-	}
-
-	//confirm blocklists are in starttime ascending order
-	lastTime := time.Time{}
-	for _, b := range blocklist {
-		assert.True(t, lastTime.Before(b.StartTime) || lastTime.Equal(b.StartTime))
-		lastTime = b.StartTime
+		require.Equal(t, expectedID, (uuid.UUID)(blocklist[0].BlockID))
 	}
 
 	compactedBlocklist := rw.blocklist.CompactedMetas(testTenantID)
-	assert.Len(t, compactedBlocklist, expectedCB)
+	require.Len(t, compactedBlocklist, expectedCB)
 	if expectedCB > 0 && expectedID != uuid.Nil {
-		assert.Equal(t, expectedID, compactedBlocklist[0].BlockID)
-	}
-
-	lastTime = time.Time{}
-	for _, b := range compactedBlocklist {
-		assert.True(t, lastTime.Before(b.StartTime) || lastTime.Equal(b.StartTime))
-		lastTime = b.StartTime
+		require.Equal(t, expectedID, (uuid.UUID)(compactedBlocklist[0].BlockID))
 	}
 }
 
@@ -265,9 +265,7 @@ func TestIncludeBlock(t *testing.T) {
 			blockStart: uuid.MustParse(BlockIDMin),
 			blockEnd:   uuid.MustParse(BlockIDMax),
 			meta: &backend.BlockMeta{
-				BlockID: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
-				MinID:   []byte{0x00},
-				MaxID:   []byte{0x10},
+				BlockID: backend.MustParse("50000000-0000-0000-0000-000000000000"),
 			},
 			start:    0,
 			end:      0,
@@ -279,9 +277,7 @@ func TestIncludeBlock(t *testing.T) {
 			blockStart: uuid.MustParse(BlockIDMin),
 			blockEnd:   uuid.MustParse(BlockIDMax),
 			meta: &backend.BlockMeta{
-				BlockID: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
-				MinID:   []byte{0x00},
-				MaxID:   []byte{0x10},
+				BlockID: backend.MustParse("50000000-0000-0000-0000-000000000000"),
 			},
 			start:    0,
 			end:      0,
@@ -293,9 +289,7 @@ func TestIncludeBlock(t *testing.T) {
 			blockStart: uuid.MustParse(BlockIDMin),
 			blockEnd:   uuid.MustParse(BlockIDMax),
 			meta: &backend.BlockMeta{
-				BlockID: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
-				MinID:   []byte{0x00},
-				MaxID:   []byte{0x10},
+				BlockID: backend.MustParse("50000000-0000-0000-0000-000000000000"),
 			},
 			start:    0,
 			end:      0,
@@ -307,9 +301,7 @@ func TestIncludeBlock(t *testing.T) {
 			blockStart: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
 			blockEnd:   uuid.MustParse(BlockIDMax),
 			meta: &backend.BlockMeta{
-				BlockID: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
-				MinID:   []byte{0x00},
-				MaxID:   []byte{0x10},
+				BlockID: backend.MustParse("50000000-0000-0000-0000-000000000000"),
 			},
 			start:    0,
 			end:      0,
@@ -321,9 +313,7 @@ func TestIncludeBlock(t *testing.T) {
 			blockStart: uuid.MustParse(BlockIDMin),
 			blockEnd:   uuid.MustParse("50000000-0000-0000-0000-000000000000"),
 			meta: &backend.BlockMeta{
-				BlockID:   uuid.MustParse("50000000-0000-0000-0000-000000000000"),
-				MinID:     []byte{0x00},
-				MaxID:     []byte{0x10},
+				BlockID:   backend.MustParse("50000000-0000-0000-0000-000000000000"),
 				StartTime: time.Unix(10000, 0),
 				EndTime:   time.Unix(20000, 0),
 			},
@@ -337,9 +327,7 @@ func TestIncludeBlock(t *testing.T) {
 			blockStart: uuid.MustParse(BlockIDMin),
 			blockEnd:   uuid.MustParse("50000000-0000-0000-0000-000000000000"),
 			meta: &backend.BlockMeta{
-				BlockID:   uuid.MustParse("50000000-0000-0000-0000-000000000000"),
-				MinID:     []byte{0x00},
-				MaxID:     []byte{0x10},
+				BlockID:   backend.MustParse("50000000-0000-0000-0000-000000000000"),
 				StartTime: time.Unix(1650285326, 0),
 				EndTime:   time.Unix(1650288990, 0),
 			},
@@ -353,9 +341,7 @@ func TestIncludeBlock(t *testing.T) {
 			blockStart: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
 			blockEnd:   uuid.MustParse("50000000-0000-0000-0000-000000000000"),
 			meta: &backend.BlockMeta{
-				BlockID: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
-				MinID:   []byte{0x05},
-				MaxID:   []byte{0x05},
+				BlockID: backend.MustParse("50000000-0000-0000-0000-000000000000"),
 			},
 			start:    0,
 			end:      0,
@@ -368,9 +354,7 @@ func TestIncludeBlock(t *testing.T) {
 			blockStart: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
 			blockEnd:   uuid.MustParse("51000000-0000-0000-0000-000000000000"),
 			meta: &backend.BlockMeta{
-				BlockID: uuid.MustParse("52000000-0000-0000-0000-000000000000"),
-				MinID:   []byte{0x00},
-				MaxID:   []byte{0x10},
+				BlockID: backend.MustParse("52000000-0000-0000-0000-000000000000"),
 			},
 		},
 		// todo: restore when this is fixed: https://github.com/grafana/tempo/issues/1903
@@ -381,8 +365,6 @@ func TestIncludeBlock(t *testing.T) {
 		// 	blockEnd:   uuid.MustParse(BlockIDMax),
 		// 	meta: &backend.BlockMeta{
 		// 		BlockID: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
-		// 		MinID:   []byte{0x01},
-		// 		MaxID:   []byte{0x10},
 		// 	},
 		// },
 		// {
@@ -392,8 +374,6 @@ func TestIncludeBlock(t *testing.T) {
 		// 	blockEnd:   uuid.MustParse(BlockIDMax),
 		// 	meta: &backend.BlockMeta{
 		// 		BlockID: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
-		// 		MinID:   []byte{0x01},
-		// 		MaxID:   []byte{0x10},
 		// 	},
 		// },
 		{
@@ -402,9 +382,7 @@ func TestIncludeBlock(t *testing.T) {
 			blockStart: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
 			blockEnd:   uuid.MustParse("51000000-0000-0000-0000-000000000000"),
 			meta: &backend.BlockMeta{
-				BlockID: uuid.MustParse("4FFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"),
-				MinID:   []byte{0x00},
-				MaxID:   []byte{0x10},
+				BlockID: backend.MustParse("4FFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"),
 			},
 		},
 		{
@@ -413,9 +391,7 @@ func TestIncludeBlock(t *testing.T) {
 			blockStart: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
 			blockEnd:   uuid.MustParse("51000000-0000-0000-0000-000000000000"),
 			meta: &backend.BlockMeta{
-				BlockID: uuid.MustParse("51000000-0000-0000-0000-000000000001"),
-				MinID:   []byte{0x00},
-				MaxID:   []byte{0x10},
+				BlockID: backend.MustParse("51000000-0000-0000-0000-000000000001"),
 			},
 		},
 	}
@@ -427,7 +403,7 @@ func TestIncludeBlock(t *testing.T) {
 			e, err := tc.blockEnd.MarshalBinary()
 			require.NoError(t, err)
 
-			assert.Equal(t, tc.expected, includeBlock(tc.meta, tc.searchID, s, e, tc.start, tc.end))
+			assert.Equal(t, tc.expected, includeBlock(tc.meta, tc.searchID, s, e, tc.start, tc.end, 0))
 		})
 	}
 }
@@ -453,9 +429,7 @@ func TestIncludeCompactedBlock(t *testing.T) {
 			end:        0,
 			meta: &backend.CompactedBlockMeta{
 				BlockMeta: backend.BlockMeta{
-					BlockID: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
-					MinID:   []byte{0x00},
-					MaxID:   []byte{0x10},
+					BlockID: backend.MustParse("50000000-0000-0000-0000-000000000000"),
 				},
 				CompactedTime: time.Now().Add(-(1 * blocklistPoll)),
 			},
@@ -470,9 +444,7 @@ func TestIncludeCompactedBlock(t *testing.T) {
 			end:        0,
 			meta: &backend.CompactedBlockMeta{
 				BlockMeta: backend.BlockMeta{
-					BlockID: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
-					MinID:   []byte{0x00},
-					MaxID:   []byte{0x10},
+					BlockID: backend.MustParse("50000000-0000-0000-0000-000000000000"),
 				},
 				CompactedTime: time.Now().Add(-(3 * blocklistPoll)),
 			},
@@ -487,9 +459,7 @@ func TestIncludeCompactedBlock(t *testing.T) {
 			end:        0,
 			meta: &backend.CompactedBlockMeta{
 				BlockMeta: backend.BlockMeta{
-					BlockID: uuid.MustParse("51000000-0000-0000-0000-000000000000"),
-					MinID:   []byte{0x00},
-					MaxID:   []byte{0x10},
+					BlockID: backend.MustParse("51000000-0000-0000-0000-000000000000"),
 				},
 				CompactedTime: time.Now().Add(-(1 * blocklistPoll)),
 			},
@@ -504,10 +474,9 @@ func TestIncludeCompactedBlock(t *testing.T) {
 			e, err := tc.blockEnd.MarshalBinary()
 			require.NoError(t, err)
 
-			assert.Equal(t, tc.expected, includeCompactedBlock(tc.meta, tc.searchID, s, e, blocklistPoll, tc.start, tc.end))
+			assert.Equal(t, tc.expected, includeCompactedBlock(tc.meta, tc.searchID, s, e, blocklistPoll, tc.start, tc.end, 0))
 		})
 	}
-
 }
 
 func TestSearchCompactedBlocks(t *testing.T) {
@@ -521,11 +490,12 @@ func TestSearchCompactedBlocks(t *testing.T) {
 	}, &mockSharder{}, &mockOverrides{})
 	require.NoError(t, err)
 
-	r.EnablePolling(&mockJobSharder{})
+	r.EnablePolling(context.Background(), &mockJobSharder{})
 
 	wal := w.WAL()
 
-	head, err := wal.NewBlock(uuid.New(), testTenantID, model.CurrentEncoding)
+	meta := &backend.BlockMeta{BlockID: backend.NewUUID(), TenantID: testTenantID}
+	head, err := wal.NewBlock(meta, model.CurrentEncoding)
 	assert.NoError(t, err)
 
 	dec := model.MustNewSegmentDecoder(model.CurrentEncoding)
@@ -555,7 +525,7 @@ func TestSearchCompactedBlocks(t *testing.T) {
 
 	// read
 	for i, id := range ids {
-		bFound, failedBlocks, err := r.Find(ctx, testTenantID, id, blockID, blockID, 0, 0)
+		bFound, failedBlocks, err := r.Find(ctx, testTenantID, id, blockID, blockID, 0, 0, common.DefaultSearchOptions())
 		require.NoError(t, err)
 		require.Nil(t, failedBlocks)
 		require.True(t, proto.Equal(bFound[0], reqs[i]))
@@ -564,7 +534,7 @@ func TestSearchCompactedBlocks(t *testing.T) {
 	// compact
 	var blockMetas []*backend.BlockMeta
 	blockMetas = append(blockMetas, complete.BlockMeta())
-	require.NoError(t, rw.compact(ctx, blockMetas, testTenantID))
+	require.NoError(t, rw.compactOneJob(ctx, blockMetas, testTenantID))
 
 	// poll
 	rw.pollBlocklist()
@@ -579,7 +549,7 @@ func TestSearchCompactedBlocks(t *testing.T) {
 
 	// find should succeed with old block range
 	for i, id := range ids {
-		bFound, failedBlocks, err := r.Find(ctx, testTenantID, id, blockID, blockID, 0, 0)
+		bFound, failedBlocks, err := r.Find(ctx, testTenantID, id, blockID, blockID, 0, 0, common.DefaultSearchOptions())
 		require.NoError(t, err)
 		require.Nil(t, failedBlocks)
 		require.True(t, proto.Equal(bFound[0], reqs[i]))
@@ -607,7 +577,12 @@ func testCompleteBlock(t *testing.T, from, to string) {
 
 	blockID := uuid.New()
 
-	block, err := wal.NewBlock(blockID, testTenantID, model.CurrentEncoding)
+	var dataEncoding string
+	if from == v2.VersionString {
+		dataEncoding = model.CurrentEncoding
+	}
+	meta := backend.NewBlockMeta(testTenantID, blockID, from, backend.EncNone, dataEncoding)
+	block, err := wal.NewBlock(meta, model.CurrentEncoding)
 	require.NoError(t, err, "unexpected error creating block")
 	require.Equal(t, block.BlockMeta().Version, from)
 
@@ -649,11 +624,10 @@ func TestCompleteBlockHonorsStartStopTimes(t *testing.T) {
 }
 
 func testCompleteBlockHonorsStartStopTimes(t *testing.T, targetBlockVersion string) {
-
 	tempDir := t.TempDir()
 
 	_, w, _, err := New(&Config{
-		Backend: "local",
+		Backend: backend.Local,
 		Local: &local.Config{
 			Path: path.Join(tempDir, "traces"),
 		},
@@ -670,18 +644,19 @@ func testCompleteBlockHonorsStartStopTimes(t *testing.T, targetBlockVersion stri
 			Filepath:       path.Join(tempDir, "wal"),
 		},
 		BlocklistPoll: 0,
-	}, log.NewNopLogger())
+	}, nil, log.NewNopLogger())
 	require.NoError(t, err)
 
 	dec := model.MustNewSegmentDecoder(model.CurrentEncoding)
 
 	wal := w.WAL()
 
-	now := time.Now().Unix()
-	oneHourAgo := time.Now().Add(-1 * time.Hour).Unix()
-	oneHour := time.Now().Add(time.Hour).Unix()
+	now := time.Now()
+	oneHourAgo := now.Add(-1 * time.Hour).Unix()
+	oneHour := now.Add(time.Hour).Unix()
 
-	block, err := wal.NewBlock(uuid.New(), testTenantID, model.CurrentEncoding)
+	meta := &backend.BlockMeta{BlockID: backend.NewUUID(), TenantID: testTenantID}
+	block, err := wal.NewBlock(meta, model.CurrentEncoding)
 	require.NoError(t, err, "unexpected error creating block")
 
 	// Write a trace from 1 hour ago.
@@ -694,73 +669,9 @@ func testCompleteBlockHonorsStartStopTimes(t *testing.T, targetBlockVersion stri
 	require.NoError(t, err, "unexpected error completing block")
 
 	// Verify the block time was constrained to the slack time.
-	require.Equal(t, now, complete.BlockMeta().StartTime.Unix())
-	require.Equal(t, now, complete.BlockMeta().EndTime.Unix())
-}
-func TestShouldCache(t *testing.T) {
-	tempDir := t.TempDir()
-
-	r, _, _, err := New(&Config{
-		Backend: "local",
-		Local: &local.Config{
-			Path: path.Join(tempDir, "traces"),
-		},
-		Block: &common.BlockConfig{
-			IndexDownsampleBytes: 17,
-			BloomFP:              .01,
-			BloomShardSizeBytes:  100_000,
-			Version:              encoding.DefaultEncoding().Version(),
-			Encoding:             backend.EncLZ4_256k,
-			IndexPageSizeBytes:   1000,
-		},
-		WAL: &wal.Config{
-			Filepath: path.Join(tempDir, "wal"),
-		},
-		BlocklistPoll:           0,
-		CacheMaxBlockAge:        time.Hour,
-		CacheMinCompactionLevel: 1,
-	}, log.NewNopLogger())
-	require.NoError(t, err)
-
-	rw := r.(*readerWriter)
-
-	testCases := []struct {
-		name            string
-		compactionLevel uint8
-		startTime       time.Time
-		cache           bool
-	}{
-		{
-			name:            "both pass",
-			compactionLevel: 1,
-			startTime:       time.Now(),
-			cache:           true,
-		},
-		{
-			name:            "startTime fail",
-			compactionLevel: 2,
-			startTime:       time.Now().Add(-2 * time.Hour),
-			cache:           false,
-		},
-		{
-			name:            "compactionLevel fail",
-			compactionLevel: 0,
-			startTime:       time.Now(),
-			cache:           false,
-		},
-		{
-			name:            "both fail",
-			compactionLevel: 0,
-			startTime:       time.Now(),
-			cache:           false,
-		},
-	}
-
-	for _, tt := range testCases {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.cache, rw.shouldCache(&backend.BlockMeta{CompactionLevel: tt.compactionLevel, StartTime: tt.startTime}, time.Now()))
-		})
-	}
+	// Accept a couple seconds of slack time to ensure test reliability.
+	require.Less(t, complete.BlockMeta().StartTime.Sub(now).Seconds(), 2.0)
+	require.Less(t, complete.BlockMeta().EndTime.Sub(now).Seconds(), 2.0)
 }
 
 func writeTraceToWal(t require.TestingT, b common.WALBlock, dec model.SegmentDecoder, id common.ID, tr *tempopb.Trace, start, end uint32) {
@@ -770,7 +681,7 @@ func writeTraceToWal(t require.TestingT, b common.WALBlock, dec model.SegmentDec
 	b2, err := dec.ToObject([][]byte{b1})
 	require.NoError(t, err)
 
-	err = b.Append(id, b2, start, end)
+	err = b.Append(id, b2, start, end, true)
 	require.NoError(t, err, "unexpected error writing req")
 }
 
@@ -789,7 +700,7 @@ func benchmarkCompleteBlock(b *testing.B, e encoding.VersionedEncoding) {
 
 	tempDir := b.TempDir()
 	_, w, _, err := New(&Config{
-		Backend: "local",
+		Backend: backend.Local,
 		Local: &local.Config{
 			Path: path.Join(tempDir, "traces"),
 		},
@@ -807,13 +718,14 @@ func benchmarkCompleteBlock(b *testing.B, e encoding.VersionedEncoding) {
 			Filepath:       path.Join(tempDir, "wal"),
 		},
 		BlocklistPoll: 0,
-	}, log.NewNopLogger())
+	}, nil, log.NewNopLogger())
 	require.NoError(b, err)
 
 	dec := model.MustNewSegmentDecoder(model.CurrentEncoding)
 
 	wal := w.WAL()
-	blk, err := wal.NewBlock(uuid.New(), testTenantID, model.CurrentEncoding)
+	meta := &backend.BlockMeta{BlockID: backend.NewUUID(), TenantID: testTenantID}
+	blk, err := wal.NewBlock(meta, model.CurrentEncoding)
 	require.NoError(b, err)
 
 	for i := 0; i < traceCount; i++ {
@@ -834,5 +746,83 @@ func benchmarkCompleteBlock(b *testing.B, e encoding.VersionedEncoding) {
 	for i := 0; i < b.N; i++ {
 		_, err := w.CompleteBlock(context.Background(), blk)
 		require.NoError(b, err)
+	}
+}
+
+func TestCreateLegacyCache(t *testing.T) {
+	tcs := []struct {
+		name          string
+		cfg           *Config
+		expectedErr   error
+		expectedRoles []cache.Role
+		expectedCache bool
+	}{
+		{
+			name: "no caches",
+			cfg:  &Config{},
+		},
+		{
+			name: "redis",
+			cfg: &Config{
+				Cache:           "redis",
+				Redis:           &redis.Config{},
+				BackgroundCache: &cache.BackgroundConfig{},
+			},
+			expectedRoles: []cache.Role{cache.RoleBloom, cache.RoleTraceIDIdx},
+			expectedCache: true,
+		},
+		{
+			name: "memcached",
+			cfg: &Config{
+				Cache:           "memcached",
+				Memcached:       &memcached.Config{},
+				BackgroundCache: &cache.BackgroundConfig{},
+			},
+			expectedRoles: []cache.Role{cache.RoleBloom, cache.RoleTraceIDIdx},
+			expectedCache: true,
+		},
+		{
+			name: "no cache but cache control",
+			cfg: &Config{
+				Search: &SearchConfig{
+					CacheControl: CacheControlConfig{
+						Footer: true,
+					},
+				},
+			},
+			expectedErr: errors.New("no legacy cache configured, but cache_control is enabled. Please use the new top level cache configuration."),
+		},
+		{
+			name: "memcached + cache control",
+			cfg: &Config{
+				Cache:           "memcached",
+				Memcached:       &memcached.Config{},
+				BackgroundCache: &cache.BackgroundConfig{},
+				Search: &SearchConfig{
+					CacheControl: CacheControlConfig{
+						Footer:      true,
+						ColumnIndex: true,
+						OffsetIndex: true,
+					},
+				},
+			},
+			expectedRoles: []cache.Role{cache.RoleBloom, cache.RoleTraceIDIdx, cache.RoleParquetColumnIdx, cache.RoleParquetFooter, cache.RoleParquetOffsetIdx},
+			expectedCache: true,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			prometheus.DefaultRegisterer = prometheus.NewRegistry() // prevent duplicate registration
+
+			cache, actualRoles, actualErr := createLegacyCache(tc.cfg, log.NewNopLogger())
+			require.Equal(t, tc.expectedErr, actualErr)
+			require.Equal(t, tc.expectedRoles, actualRoles)
+			if tc.expectedCache {
+				require.NotNil(t, cache)
+			} else {
+				require.Nil(t, cache)
+			}
+		})
 	}
 }

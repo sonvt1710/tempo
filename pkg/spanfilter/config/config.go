@@ -4,12 +4,11 @@ import (
 	"fmt"
 
 	"github.com/grafana/tempo/pkg/traceql"
-	"github.com/pkg/errors"
 )
 
 type FilterPolicy struct {
-	Include *PolicyMatch `yaml:"include"`
-	Exclude *PolicyMatch `yaml:"exclude"`
+	Include *PolicyMatch `yaml:"include" json:"include,omitempty"`
+	Exclude *PolicyMatch `yaml:"exclude" json:"exclude,omitempty"`
 }
 
 type MatchType string
@@ -19,22 +18,20 @@ const (
 	Regex  MatchType = "regex"
 )
 
-var (
-	supportedIntrinsics = []traceql.Intrinsic{
-		traceql.IntrinsicKind,
-		traceql.IntrinsicName,
-		traceql.IntrinsicStatus,
-	}
-)
+var supportedIntrinsics = []traceql.Intrinsic{
+	traceql.IntrinsicKind,
+	traceql.IntrinsicName,
+	traceql.IntrinsicStatus,
+}
 
 type PolicyMatch struct {
-	MatchType  MatchType              `yaml:"match_type"`
-	Attributes []MatchPolicyAttribute `yaml:"attributes"`
+	MatchType  MatchType              `yaml:"match_type" json:"match_type"`
+	Attributes []MatchPolicyAttribute `yaml:"attributes" json:"attributes"`
 }
 
 type MatchPolicyAttribute struct {
-	Key   string      `yaml:"key"`
-	Value interface{} `yaml:"value"`
+	Key   string      `yaml:"key" json:"key"`
+	Value interface{} `yaml:"value" json:"value"`
 }
 
 func ValidateFilterPolicy(policy FilterPolicy) error {
@@ -44,13 +41,13 @@ func ValidateFilterPolicy(policy FilterPolicy) error {
 
 	if policy.Include != nil {
 		if err := ValidatePolicyMatch(policy.Include); err != nil {
-			return errors.Wrap(err, "invalid include policy")
+			return fmt.Errorf("invalid include policy: %w", err)
 		}
 	}
 
 	if policy.Exclude != nil {
 		if err := ValidatePolicyMatch(policy.Exclude); err != nil {
-			return errors.Wrap(err, "invalid exclude policy")
+			return fmt.Errorf("invalid exclude policy: %w", err)
 		}
 	}
 
@@ -75,7 +72,7 @@ func ValidatePolicyMatch(match *PolicyMatch) error {
 			switch a.Intrinsic {
 			case traceql.IntrinsicKind, traceql.IntrinsicName, traceql.IntrinsicStatus: // currently supported
 			default:
-				return fmt.Errorf("currently unsupported intrinsic: %s; supported intrinsics: %q", a.Intrinsic, supportedIntrinsics)
+				return fmt.Errorf("unsupported intrinsic: %s; supported intrinsics: %q", a.Intrinsic, supportedIntrinsics)
 			}
 		}
 	}

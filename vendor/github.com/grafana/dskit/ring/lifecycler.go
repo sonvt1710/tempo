@@ -4,11 +4,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"sort"
-	strconv "strconv"
+	"strconv"
 	"sync"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/atomic"
 
+	"github.com/grafana/dskit/backoff"
 	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/kv"
 	"github.com/grafana/dskit/netutil"
@@ -53,6 +55,12 @@ type LifecyclerConfig struct {
 
 	// Injected internally
 	ListenPort int `yaml:"-"`
+	// HideTokensInStatusPage allows tokens to be hidden from management tools e.g. the status page, for use in contexts which do not utilize tokens.
+	HideTokensInStatusPage bool `yaml:"-"`
+
+	// If set, specifies the TokenGenerator implementation that will be used for generating tokens.
+	// Default value is nil, which means that RandomTokenGenerator is used.
+	RingTokenGenerator TokenGenerator `yaml:"-"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
@@ -97,7 +105,27 @@ func (cfg *LifecyclerConfig) RegisterFlagsWithPrefix(prefix string, f *flag.Flag
 	f.BoolVar(&cfg.EnableInet6, prefix+"enable-inet6", false, "Enable IPv6 support. Required to make use of IP addresses from IPv6 interfaces.")
 }
 
-// Lifecycler is responsible for managing the lifecycle of entries in the ring.
+// Validate checks the consistency of LifecyclerConfig, and fails if this cannot be achieved.
+func (cfg *LifecyclerConfig) Validate() error {
+	_, ok := cfg.RingTokenGenerator.(*SpreadMinimizingTokenGenerator)
+	if ok {
+		// If cfg.RingTokenGenerator is a SpreadMinimizingTokenGenerator, we must ensure that
+		// the tokens are not loaded from file.
+		if cfg.TokensFilePath != "" {
+			return errors.New("you can't configure the tokens file path when using the spread minimizing token strategy. Please set the tokens file path to an empty string")
+		}
+	}
+	return nil
+}
+
+/*
+Lifecycler is a Service that is responsible for publishing changes to a ring for a single instance.
+
+  - When a Lifecycler first starts, it will be in a [PENDING] state.
+  - After the configured [ring.LifecyclerConfig.JoinAfter] period, it selects some random tokens and enters the [JOINING] state, creating or updating the ring as needed.
+  - The lifecycler will then periodically, based on the [ring.LifecyclerConfig.ObservePeriod], attempt to verify that its tokens have been added to the ring, after which it will transition to the [ACTIVE] state.
+  - The lifecycler will update the key/value store with heartbeats, state changes, and token changes, based on the [ring.LifecyclerConfig.HeartbeatPeriod].
+*/
 type Lifecycler struct {
 	*services.BasicService
 
@@ -121,10 +149,12 @@ type Lifecycler struct {
 
 	// We need to remember the ingester state, tokens and registered timestamp just in case the KV store
 	// goes away and comes back empty. The state changes during lifecycle of instance.
-	stateMtx     sync.RWMutex
-	state        InstanceState
-	tokens       Tokens
-	registeredAt time.Time
+	stateMtx            sync.RWMutex
+	state               InstanceState
+	tokens              Tokens
+	registeredAt        time.Time
+	readOnly            bool
+	readOnlyLastUpdated time.Time
 
 	// Controls the ready-reporting
 	readyLock  sync.Mutex
@@ -132,11 +162,18 @@ type Lifecycler struct {
 	readySince time.Time
 
 	// Keeps stats updated at every heartbeat period
-	countersLock          sync.RWMutex
-	healthyInstancesCount int
-	instancesCount        int
-	instancesInZoneCount  int
-	zonesCount            int
+	countersLock                sync.RWMutex
+	healthyInstancesCount       int
+	instancesCount              int
+	readOnlyInstancesCount      int
+	healthyInstancesInZoneCount int
+	instancesInZoneCount        int
+	zonesCount                  int
+
+	tokenGenerator TokenGenerator
+	// The maximum time allowed to wait on the CanJoin() condition.
+	// Configurable for testing purposes only.
+	canJoinTimeout time.Duration
 
 	lifecyclerMetrics *LifecyclerMetrics
 	logger            log.Logger
@@ -167,6 +204,17 @@ func NewLifecycler(cfg LifecyclerConfig, flushTransferer FlushTransferer, ringNa
 		flushTransferer = NewNoopFlushTransferer()
 	}
 
+	tokenGenerator := cfg.RingTokenGenerator
+	if tokenGenerator == nil {
+		tokenGenerator = NewRandomTokenGenerator()
+	}
+
+	// We validate cfg before we create a Lifecycler.
+	err = cfg.Validate()
+	if err != nil {
+		return nil, err
+	}
+
 	l := &Lifecycler{
 		cfg:                   cfg,
 		flushTransferer:       flushTransferer,
@@ -181,6 +229,8 @@ func NewLifecycler(cfg LifecyclerConfig, flushTransferer FlushTransferer, ringNa
 		Zone:                  cfg.Zone,
 		actorChan:             make(chan func()),
 		state:                 PENDING,
+		tokenGenerator:        tokenGenerator,
+		canJoinTimeout:        5 * time.Minute,
 		lifecyclerMetrics:     NewLifecyclerMetrics(ringName, reg),
 		logger:                logger,
 	}
@@ -304,6 +354,26 @@ func (i *Lifecycler) ChangeState(ctx context.Context, state InstanceState) error
 	return <-errCh
 }
 
+func (i *Lifecycler) ChangeReadOnlyState(ctx context.Context, readOnly bool) error {
+	errCh := make(chan error)
+	fn := func() {
+		prevReadOnly, _ := i.GetReadOnlyState()
+		if prevReadOnly == readOnly {
+			errCh <- nil
+			return
+		}
+
+		level.Info(i.logger).Log("msg", "changing read-only state of instance in the ring", "readOnly", readOnly, "ring", i.RingName)
+		i.setReadOnlyState(readOnly, time.Now())
+		errCh <- i.updateConsul(ctx)
+	}
+
+	if err := i.sendToLifecyclerLoop(fn); err != nil {
+		return err
+	}
+	return <-errCh
+}
+
 func (i *Lifecycler) getTokens() Tokens {
 	i.stateMtx.RLock()
 	defer i.stateMtx.RUnlock()
@@ -332,6 +402,26 @@ func (i *Lifecycler) setRegisteredAt(registeredAt time.Time) {
 	i.stateMtx.Lock()
 	defer i.stateMtx.Unlock()
 	i.registeredAt = registeredAt
+}
+
+// GetReadOnlyState returns the read-only state of this instance -- whether instance is read-only, and when what the last
+// update of read-only state (possibly zero).
+func (i *Lifecycler) GetReadOnlyState() (bool, time.Time) {
+	i.stateMtx.RLock()
+	defer i.stateMtx.RUnlock()
+	return i.readOnly, i.readOnlyLastUpdated
+}
+
+func (i *Lifecycler) setReadOnlyState(readOnly bool, readOnlyLastUpdated time.Time) {
+	i.stateMtx.Lock()
+	defer i.stateMtx.Unlock()
+	i.readOnly = readOnly
+	i.readOnlyLastUpdated = readOnlyLastUpdated
+	if readOnly {
+		i.lifecyclerMetrics.readonly.Set(1)
+	} else {
+		i.lifecyclerMetrics.readonly.Set(0)
+	}
 }
 
 // ClaimTokensFor takes all the tokens for the supplied ingester and assigns them to this ingester.
@@ -395,6 +485,23 @@ func (i *Lifecycler) InstancesCount() int {
 	defer i.countersLock.RUnlock()
 
 	return i.instancesCount
+}
+
+// ReadOnlyInstancesCount returns the total number of instances in the ring that are read only, updated during the last heartbeat period.
+func (i *Lifecycler) ReadOnlyInstancesCount() int {
+	i.countersLock.RLock()
+	defer i.countersLock.RUnlock()
+
+	return i.readOnlyInstancesCount
+}
+
+// HealthyInstancesInZoneCount returns the number of healthy instances in the ring that are registered in
+// this lifecycler's zone, updated during the last heartbeat period.
+func (i *Lifecycler) HealthyInstancesInZoneCount() int {
+	i.countersLock.RLock()
+	defer i.countersLock.RUnlock()
+
+	return i.healthyInstancesInZoneCount
 }
 
 // InstancesInZoneCount returns the number of instances in the ring that are registered in
@@ -552,7 +659,7 @@ heartbeatLoop:
 }
 
 // initRing is the first thing we do when we start. It:
-// - add an ingester entry to the ring
+// - adds an ingester entry to the ring
 // - copies out our state and tokens if they exist
 func (i *Lifecycler) initRing(ctx context.Context) error {
 	var (
@@ -571,18 +678,15 @@ func (i *Lifecycler) initRing(ctx context.Context) error {
 	}
 
 	err = i.KVStore.CAS(ctx, i.RingKey, func(in interface{}) (out interface{}, retry bool, err error) {
-		if in == nil {
-			ringDesc = NewDesc()
-		} else {
-			ringDesc = in.(*Desc)
-		}
+		ringDesc = GetOrCreateRingDesc(in)
 
 		instanceDesc, ok := ringDesc.Ingesters[i.ID]
 		if !ok {
-			// The instance doesn't exist in the ring, so it's safe to set the registered timestamp
-			// as of now.
-			registeredAt := time.Now()
-			i.setRegisteredAt(registeredAt)
+			now := time.Now()
+			// The instance doesn't exist in the ring, so it's safe to set the registered timestamp as of now.
+			i.setRegisteredAt(now)
+			// Clear read-only state, and set last update time to "zero".
+			i.setReadOnlyState(false, time.Time{})
 
 			// We use the tokens from the file only if it does not exist in the ring yet.
 			if len(tokensFromFile) > 0 {
@@ -590,20 +694,25 @@ func (i *Lifecycler) initRing(ctx context.Context) error {
 				if len(tokensFromFile) >= i.cfg.NumTokens {
 					i.setState(ACTIVE)
 				}
-				ringDesc.AddIngester(i.ID, i.Addr, i.Zone, tokensFromFile, i.GetState(), registeredAt)
+				ro, rots := i.GetReadOnlyState()
+				ringDesc.AddIngester(i.ID, i.Addr, i.Zone, tokensFromFile, i.GetState(), i.getRegisteredAt(), ro, rots)
 				i.setTokens(tokensFromFile)
 				return ringDesc, true, nil
 			}
 
 			// Either we are a new ingester, or consul must have restarted
 			level.Info(i.logger).Log("msg", "instance not found in ring, adding with no tokens", "ring", i.RingName)
-			ringDesc.AddIngester(i.ID, i.Addr, i.Zone, []uint32{}, i.GetState(), registeredAt)
+			ro, rots := i.GetReadOnlyState()
+			ringDesc.AddIngester(i.ID, i.Addr, i.Zone, []uint32{}, i.GetState(), i.getRegisteredAt(), ro, rots)
 			return ringDesc, true, nil
 		}
 
 		// The instance already exists in the ring, so we can't change the registered timestamp (even if it's zero)
 		// but we need to update the local state accordingly.
 		i.setRegisteredAt(instanceDesc.GetRegisteredAt())
+
+		// Set lifecycler read-only state from ring entry. We will not modify ring entry's read-only state.
+		i.setReadOnlyState(instanceDesc.GetReadOnlyState())
 
 		// If the ingester is in the JOINING state this means it crashed due to
 		// a failed token transfer or some other reason during startup. We want
@@ -616,23 +725,43 @@ func (i *Lifecycler) initRing(ctx context.Context) error {
 			return ringDesc, true, nil
 		}
 
-		// If the ingester failed to clean its ring entry up in can leave its state in LEAVING
-		// OR unregister_on_shutdown=false
-		// Move it into ACTIVE to ensure the ingester joins the ring.
-		if instanceDesc.State == LEAVING && len(instanceDesc.Tokens) == i.cfg.NumTokens {
+		tokens := Tokens(instanceDesc.Tokens)
+		ro, rots := instanceDesc.GetReadOnlyState()
+		level.Info(i.logger).Log("msg", "existing instance found in ring", "state", instanceDesc.State, "tokens", len(tokens), "ring", i.RingName, "readOnly", ro, "readOnlyStateUpdate", rots)
+
+		// If the ingester fails to clean its ring entry up or unregister_on_shutdown=false, it can leave behind its
+		// ring state as LEAVING. Make sure to switch to the ACTIVE state.
+		if instanceDesc.State == LEAVING {
+			delta := i.cfg.NumTokens - len(tokens)
+			if delta > 0 {
+				// We need more tokens
+				level.Info(i.logger).Log("msg", "existing instance has too few tokens, adding difference",
+					"current_tokens", len(tokens), "desired_tokens", i.cfg.NumTokens)
+				newTokens := i.tokenGenerator.GenerateTokens(delta, ringDesc.GetTokens())
+				tokens = append(tokens, newTokens...)
+				sort.Sort(tokens)
+			} else if delta < 0 {
+				// We have too many tokens
+				level.Info(i.logger).Log("msg", "existing instance has too many tokens, removing difference",
+					"current_tokens", len(tokens), "desired_tokens", i.cfg.NumTokens)
+				// Make sure we don't pick the N smallest tokens, since that would increase the chance of the instance receiving only smaller hashes.
+				rand.Shuffle(len(tokens), tokens.Swap)
+				tokens = tokens[0:i.cfg.NumTokens]
+				sort.Sort(tokens)
+			}
+
 			instanceDesc.State = ACTIVE
+			instanceDesc.Tokens = tokens
 		}
 
-		// We're taking over this entry, update instanceDesc with our values
-		instanceDesc.Addr = i.Addr
-		instanceDesc.Zone = i.Zone
-
-		// We exist in the ring, so assume the ring is right and copy out tokens & state out of there.
+		// Set the local state based on the updated instance.
 		i.setState(instanceDesc.State)
-		tokens, _ := ringDesc.TokensFor(i.ID)
 		i.setTokens(tokens)
 
-		level.Info(i.logger).Log("msg", "existing entry found in ring", "state", i.GetState(), "tokens", len(tokens), "ring", i.RingName)
+		// We're taking over this entry, update instanceDesc with our values
+		instanceDesc.Id = i.ID
+		instanceDesc.Addr = i.Addr
+		instanceDesc.Zone = i.Zone
 
 		// Update the ring if the instance has been changed. We don't want to rely on heartbeat update, as heartbeat
 		// can be configured to long time, and until then lifecycler would not report this instance as ready in CheckReady.
@@ -662,27 +791,23 @@ func (i *Lifecycler) verifyTokens(ctx context.Context) bool {
 	result := false
 
 	err := i.KVStore.CAS(ctx, i.RingKey, func(in interface{}) (out interface{}, retry bool, err error) {
-		var ringDesc *Desc
-		if in == nil {
-			ringDesc = NewDesc()
-		} else {
-			ringDesc = in.(*Desc)
-		}
+		ringDesc := GetOrCreateRingDesc(in)
 
 		// At this point, we should have the same tokens as we have registered before
 		ringTokens, takenTokens := ringDesc.TokensFor(i.ID)
 
 		if !i.compareTokens(ringTokens) {
-			// uh, oh... our tokens are not our anymore. Let's try new ones.
+			// uh, oh... our tokens are not ours anymore. Let's try new ones.
 			needTokens := i.cfg.NumTokens - len(ringTokens)
 
 			level.Info(i.logger).Log("msg", "generating new tokens", "count", needTokens, "ring", i.RingName)
-			newTokens := GenerateTokens(needTokens, takenTokens)
+			newTokens := i.tokenGenerator.GenerateTokens(needTokens, takenTokens)
 
 			ringTokens = append(ringTokens, newTokens...)
 			sort.Sort(ringTokens)
 
-			ringDesc.AddIngester(i.ID, i.Addr, i.Zone, ringTokens, i.GetState(), i.getRegisteredAt())
+			ro, rots := i.GetReadOnlyState()
+			ringDesc.AddIngester(i.ID, i.Addr, i.Zone, ringTokens, i.GetState(), i.getRegisteredAt(), ro, rots)
 
 			i.setTokens(ringTokens)
 
@@ -720,16 +845,62 @@ func (i *Lifecycler) compareTokens(fromRing Tokens) bool {
 	return true
 }
 
+func (i *Lifecycler) waitBeforeJoining(ctx context.Context) error {
+	if !i.tokenGenerator.CanJoinEnabled() {
+		return nil
+	}
+
+	level.Info(i.logger).Log("msg", "waiting to be able to join the ring", "ring", i.RingName, "id", i.cfg.ID, "timeout", i.canJoinTimeout)
+
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, i.canJoinTimeout)
+	defer cancel()
+	retries := backoff.New(ctxWithTimeout, backoff.Config{
+		MinBackoff: 1 * time.Second,
+		MaxBackoff: 1 * time.Second,
+		MaxRetries: 0,
+	})
+
+	var lastError error
+	for ; retries.Ongoing(); retries.Wait() {
+		var desc interface{}
+		desc, lastError = i.KVStore.Get(ctxWithTimeout, i.RingKey)
+		if lastError != nil {
+			lastError = errors.Wrap(lastError, "error getting the ring from the KV store")
+			continue
+		}
+
+		ringDesc, ok := desc.(*Desc)
+		if !ok || ringDesc == nil {
+			lastError = fmt.Errorf("no ring returned from the KV store")
+			continue
+		}
+		lastError = i.tokenGenerator.CanJoin(ringDesc.GetIngesters())
+		if lastError == nil {
+			level.Info(i.logger).Log("msg", "it is now possible to join the ring", "ring", i.RingName, "id", i.cfg.ID, "retries", retries.NumRetries())
+			return nil
+		}
+	}
+
+	if lastError == nil {
+		lastError = retries.Err()
+	}
+	level.Warn(i.logger).Log("msg", "there was a problem while checking whether this instance could join the ring - will continue anyway", "ring", i.RingName, "id", i.cfg.ID, "err", lastError)
+
+	// Return error only in case the parent context has been cancelled.
+	// In all other cases, we just want to swallow the error and move on.
+	return ctx.Err()
+}
+
 // autoJoin selects random tokens & moves state to targetState
 func (i *Lifecycler) autoJoin(ctx context.Context, targetState InstanceState) error {
-	var ringDesc *Desc
+	err := i.waitBeforeJoining(ctx)
+	if err != nil {
+		return err
+	}
 
-	err := i.KVStore.CAS(ctx, i.RingKey, func(in interface{}) (out interface{}, retry bool, err error) {
-		if in == nil {
-			ringDesc = NewDesc()
-		} else {
-			ringDesc = in.(*Desc)
-		}
+	var ringDesc *Desc
+	err = i.KVStore.CAS(ctx, i.RingKey, func(in interface{}) (out interface{}, retry bool, err error) {
+		ringDesc = GetOrCreateRingDesc(in)
 
 		// At this point, we should not have any tokens, and we should be in PENDING state.
 		myTokens, takenTokens := ringDesc.TokensFor(i.ID)
@@ -737,15 +908,15 @@ func (i *Lifecycler) autoJoin(ctx context.Context, targetState InstanceState) er
 			level.Error(i.logger).Log("msg", "tokens already exist for this instance - wasn't expecting any!", "num_tokens", len(myTokens), "ring", i.RingName)
 		}
 
-		newTokens := GenerateTokens(i.cfg.NumTokens-len(myTokens), takenTokens)
+		newTokens := i.tokenGenerator.GenerateTokens(i.cfg.NumTokens-len(myTokens), takenTokens)
 		i.setState(targetState)
 
 		myTokens = append(myTokens, newTokens...)
 		sort.Sort(myTokens)
 		i.setTokens(myTokens)
 
-		ringDesc.AddIngester(i.ID, i.Addr, i.Zone, i.getTokens(), i.GetState(), i.getRegisteredAt())
-
+		ro, rots := i.GetReadOnlyState()
+		ringDesc.AddIngester(i.ID, i.Addr, i.Zone, i.getTokens(), i.GetState(), i.getRegisteredAt(), ro, rots)
 		return ringDesc, true, nil
 	})
 
@@ -763,30 +934,24 @@ func (i *Lifecycler) updateConsul(ctx context.Context) error {
 	var ringDesc *Desc
 
 	err := i.KVStore.CAS(ctx, i.RingKey, func(in interface{}) (out interface{}, retry bool, err error) {
-		if in == nil {
-			ringDesc = NewDesc()
-		} else {
-			ringDesc = in.(*Desc)
-		}
+		ringDesc = GetOrCreateRingDesc(in)
 
-		instanceDesc, ok := ringDesc.Ingesters[i.ID]
+		var tokens Tokens
+		instanceDesc, exists := ringDesc.Ingesters[i.ID]
 
-		if !ok {
+		if !exists {
 			// If the instance is missing in the ring, we need to add it back. However, due to how shuffle sharding work,
 			// the missing instance for some period of time could have cause a resharding of tenants among instances:
 			// to guarantee query correctness we need to update the registration timestamp to current time.
 			level.Info(i.logger).Log("msg", "instance is missing in the ring (e.g. the ring backend storage has been reset), registering the instance with an updated registration timestamp", "ring", i.RingName)
 			i.setRegisteredAt(time.Now())
-			ringDesc.AddIngester(i.ID, i.Addr, i.Zone, i.getTokens(), i.GetState(), i.getRegisteredAt())
+			tokens = i.getTokens()
 		} else {
-			instanceDesc.Timestamp = time.Now().Unix()
-			instanceDesc.State = i.GetState()
-			instanceDesc.Addr = i.Addr
-			instanceDesc.Zone = i.Zone
-			instanceDesc.RegisteredTimestamp = i.getRegisteredAt().Unix()
-			ringDesc.Ingesters[i.ID] = instanceDesc
+			tokens = instanceDesc.Tokens
 		}
 
+		ro, rots := i.GetReadOnlyState()
+		ringDesc.AddIngester(i.ID, i.Addr, i.Zone, tokens, i.GetState(), i.getRegisteredAt(), ro, rots)
 		return ringDesc, true, nil
 	})
 
@@ -819,7 +984,9 @@ func (i *Lifecycler) changeState(ctx context.Context, state InstanceState) error
 func (i *Lifecycler) updateCounters(ringDesc *Desc) {
 	healthyInstancesCount := 0
 	instancesCount := 0
+	readOnlyInstancesCount := 0
 	zones := map[string]int{}
+	healthyInstancesInZone := map[string]int{}
 
 	if ringDesc != nil {
 		now := time.Now()
@@ -827,10 +994,14 @@ func (i *Lifecycler) updateCounters(ringDesc *Desc) {
 		for _, ingester := range ringDesc.Ingesters {
 			zones[ingester.Zone]++
 			instancesCount++
+			if ingester.ReadOnly {
+				readOnlyInstancesCount++
+			}
 
 			// Count the number of healthy instances for Write operation.
 			if ingester.IsHealthy(Write, i.cfg.RingConfig.HeartbeatTimeout, now) {
 				healthyInstancesCount++
+				healthyInstancesInZone[ingester.Zone]++
 			}
 		}
 	}
@@ -839,6 +1010,8 @@ func (i *Lifecycler) updateCounters(ringDesc *Desc) {
 	i.countersLock.Lock()
 	i.healthyInstancesCount = healthyInstancesCount
 	i.instancesCount = instancesCount
+	i.readOnlyInstancesCount = readOnlyInstancesCount
+	i.healthyInstancesInZoneCount = healthyInstancesInZone[i.cfg.Zone]
 	i.instancesInZoneCount = zones[i.cfg.Zone]
 	i.zonesCount = len(zones)
 	i.countersLock.Unlock()
@@ -917,7 +1090,7 @@ func (i *Lifecycler) getRing(ctx context.Context) (*Desc, error) {
 }
 
 func (i *Lifecycler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	newRingPageHandler(i, i.cfg.HeartbeatTimeout).handle(w, req)
+	newRingPageHandler(i, i.cfg.HeartbeatTimeout, i.cfg.HideTokensInStatusPage).handle(w, req)
 }
 
 // unregister removes our entry from consul.

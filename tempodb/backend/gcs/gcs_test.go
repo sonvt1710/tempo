@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -17,10 +18,11 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/google/uuid"
-	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	raw "google.golang.org/api/storage/v1"
+
+	"github.com/grafana/tempo/tempodb/backend"
 )
 
 func TestHedge(t *testing.T) {
@@ -65,17 +67,17 @@ func TestHedge(t *testing.T) {
 
 			// the first call on each client initiates an extra http request
 			// clearing that here
-			_, _, _ = r.Read(ctx, "object", []string{"test"}, false)
+			_, _, _ = r.Read(ctx, "object", []string{"test"}, nil)
 			time.Sleep(tc.returnIn)
 			atomic.StoreInt32(&count, 0)
 
 			// calls that should hedge
-			_, _, _ = r.Read(ctx, "object", []string{"test"}, false)
+			_, _, _ = r.Read(ctx, "object", []string{"test"}, nil)
 			time.Sleep(tc.returnIn)
 			assert.Equal(t, tc.expectedHedgedRequests, atomic.LoadInt32(&count))
 			atomic.StoreInt32(&count, 0)
 
-			_ = r.ReadRange(ctx, "object", []string{"test"}, 10, []byte{}, false)
+			_ = r.ReadRange(ctx, "object", []string{"test"}, 10, []byte{}, nil)
 			time.Sleep(tc.returnIn)
 			assert.Equal(t, tc.expectedHedgedRequests, atomic.LoadInt32(&count))
 			atomic.StoreInt32(&count, 0)
@@ -85,7 +87,7 @@ func TestHedge(t *testing.T) {
 			assert.Equal(t, int32(1), atomic.LoadInt32(&count))
 			atomic.StoreInt32(&count, 0)
 
-			_ = w.Write(ctx, "object", []string{"test"}, bytes.NewReader([]byte{}), 0, false)
+			_ = w.Write(ctx, "object", []string{"test"}, bytes.NewReader([]byte{}), 0, nil)
 			assert.Equal(t, int32(1), atomic.LoadInt32(&count))
 			atomic.StoreInt32(&count, 0)
 		})
@@ -137,7 +139,7 @@ func TestObjectConfigAttributes(t *testing.T) {
 
 			ctx := context.Background()
 
-			_ = w.Write(ctx, "object", []string{"test"}, bytes.NewReader([]byte{}), 0, false)
+			_ = w.Write(ctx, "object", []string{"test"}, bytes.NewReader([]byte{}), 0, nil)
 			assert.Equal(t, tc.expectedObject, rawObject)
 		})
 	}
@@ -191,7 +193,6 @@ func fakeServer(t *testing.T, returnIn time.Duration, counter *int32) *httptest.
 
 func fakeServerWithObjectAttributes(t *testing.T, o *raw.Object) *httptest.Server {
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
 		// Check that we are making the call to update the attributes before attempting to decode the request body.
 		if strings.HasPrefix(r.RequestURI, "/upload/storage/v1/b/blerg2") {
 
@@ -203,7 +204,7 @@ func fakeServerWithObjectAttributes(t *testing.T, o *raw.Object) *httptest.Serve
 
 			for {
 				part, err := reader.NextPart()
-				if err == io.EOF {
+				if errors.Is(err, io.EOF) {
 					break
 				}
 				require.NoError(t, err)
@@ -226,7 +227,6 @@ func fakeServerWithObjectAttributes(t *testing.T, o *raw.Object) *httptest.Serve
 }
 
 func TestObjectWithPrefix(t *testing.T) {
-
 	tests := []struct {
 		name        string
 		prefix      string
@@ -293,8 +293,121 @@ func TestObjectWithPrefix(t *testing.T) {
 			require.NoError(t, err)
 
 			ctx := context.Background()
-			err = w.Write(ctx, tc.objectName, tc.keyPath, bytes.NewReader([]byte{}), 0, false)
+			err = w.Write(ctx, tc.objectName, tc.keyPath, bytes.NewReader([]byte{}), 0, nil)
 			assert.NoError(t, err)
+		})
+	}
+}
+
+func TestListBlocksWithPrefix(t *testing.T) {
+	tests := []struct {
+		name              string
+		prefix            string
+		tenant            string
+		liveBlockIDs      []uuid.UUID
+		compactedBlockIDs []uuid.UUID
+		httpHandler       func(t *testing.T) http.HandlerFunc
+	}{
+		{
+			name:              "with prefix",
+			prefix:            "a/b/c/",
+			tenant:            "single-tenant",
+			liveBlockIDs:      []uuid.UUID{uuid.MustParse("00000000-0000-0000-0000-000000000000")},
+			compactedBlockIDs: []uuid.UUID{uuid.MustParse("00000000-0000-0000-0000-000000000001")},
+			httpHandler: func(t *testing.T) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == "GET" {
+						assert.Equal(t, "a/b/c/single-tenant/", r.URL.Query().Get("prefix"))
+
+						_, _ = w.Write([]byte(`
+						{
+							"kind": "storage#objects",
+							"items": [{
+								"kind": "storage#object",
+								"id": "1",
+								"name": "a/b/c/single-tenant/00000000-0000-0000-0000-000000000000/meta.json",
+								"bucket": "blerg",
+								"storageClass": "STANDARD",
+								"size": "1024",
+								"timeCreated": "2024-03-01T00:00:00.000Z",
+								"updated": "2024-03-01T00:00:00.000Z"
+							}, {
+								"kind": "storage#object",
+								"id": "2",
+								"name": "a/b/c/single-tenant/00000000-0000-0000-0000-000000000001/meta.compacted.json",
+								"bucket": "blerg",
+								"storageClass": "STANDARD",
+								"size": "1024",
+								"timeCreated": "2024-03-01T00:00:00.000Z",
+								"updated": "2024-03-01T00:00:00.000Z"
+							}]
+						}
+						`))
+						return
+					}
+				}
+			},
+		},
+		{
+			name:              "without prefix",
+			prefix:            "",
+			tenant:            "single-tenant",
+			liveBlockIDs:      []uuid.UUID{uuid.MustParse("00000000-0000-0000-0000-000000000000")},
+			compactedBlockIDs: []uuid.UUID{uuid.MustParse("00000000-0000-0000-0000-000000000001")},
+			httpHandler: func(t *testing.T) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == "GET" {
+						assert.Equal(t, "single-tenant/", r.URL.Query().Get("prefix"))
+
+						_, _ = w.Write([]byte(`
+						{
+							"kind": "storage#objects",
+							"items": [{
+								"kind": "storage#object",
+								"id": "1",
+								"name": "single-tenant/00000000-0000-0000-0000-000000000000/meta.json",
+								"bucket": "blerg",
+								"storageClass": "STANDARD",
+								"size": "1024",
+								"timeCreated": "2024-03-01T00:00:00.000Z",
+								"updated": "2024-03-01T00:00:00.000Z"
+							}, {
+								"kind": "storage#object",
+								"id": "2",
+								"name": "single-tenant/00000000-0000-0000-0000-000000000001/meta.compacted.json",
+								"bucket": "blerg",
+								"storageClass": "STANDARD",
+								"size": "1024",
+								"timeCreated": "2024-03-01T00:00:00.000Z",
+								"updated": "2024-03-01T00:00:00.000Z"
+							}]
+						}
+						`))
+						return
+					}
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := testServer(t, tc.httpHandler(t))
+			r, _, _, err := NewNoConfirm(&Config{
+				BucketName:            "blerg",
+				Endpoint:              server.URL,
+				Insecure:              true,
+				Prefix:                tc.prefix,
+				ListBlocksConcurrency: 1,
+			})
+			require.NoError(t, err)
+
+			ctx := context.Background()
+			blockIDs, compactedBlockIDs, err := r.ListBlocks(ctx, tc.tenant)
+			assert.NoError(t, err)
+
+			assert.ElementsMatchf(t, tc.liveBlockIDs, blockIDs, "Block IDs did not match")
+			assert.ElementsMatchf(t, tc.compactedBlockIDs, compactedBlockIDs, "Compacted block IDs did not match")
 		})
 	}
 }

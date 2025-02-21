@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package ptrace // import "go.opentelemetry.io/collector/pdata/ptrace"
 
@@ -24,16 +13,26 @@ import (
 type Traces internal.Traces
 
 func newTraces(orig *otlpcollectortrace.ExportTraceServiceRequest) Traces {
-	return Traces(internal.NewTraces(orig))
+	state := internal.StateMutable
+	return Traces(internal.NewTraces(orig, &state))
 }
 
 func (ms Traces) getOrig() *otlpcollectortrace.ExportTraceServiceRequest {
 	return internal.GetOrigTraces(internal.Traces(ms))
 }
 
+func (ms Traces) getState() *internal.State {
+	return internal.GetTracesState(internal.Traces(ms))
+}
+
 // NewTraces creates a new Traces struct.
 func NewTraces() Traces {
 	return newTraces(&otlpcollectortrace.ExportTraceServiceRequest{})
+}
+
+// IsReadOnly returns true if this Traces instance is read-only.
+func (ms Traces) IsReadOnly() bool {
+	return *ms.getState() == internal.StateReadOnly
 }
 
 // CopyTo copies the Traces instance overriding the destination.
@@ -57,5 +56,10 @@ func (ms Traces) SpanCount() int {
 
 // ResourceSpans returns the ResourceSpansSlice associated with this Metrics.
 func (ms Traces) ResourceSpans() ResourceSpansSlice {
-	return newResourceSpansSlice(&ms.getOrig().ResourceSpans)
+	return newResourceSpansSlice(&ms.getOrig().ResourceSpans, internal.GetTracesState(internal.Traces(ms)))
+}
+
+// MarkReadOnly marks the Traces as shared so that no further modifications can be done on it.
+func (ms Traces) MarkReadOnly() {
+	internal.SetTracesState(internal.Traces(ms), internal.StateReadOnly)
 }

@@ -1,9 +1,17 @@
-FROM jaegertracing/jaeger-query:1.43.0
+FROM alpine:latest AS ca-certificates
+RUN apk add --update --no-cache ca-certificates
 
-ENV SPAN_STORAGE_TYPE=grpc-plugin \
-    GRPC_STORAGE_PLUGIN_BINARY=/tmp/tempo-query
+FROM gcr.io/distroless/static-debian12:debug
 
-# This is silly, but it's important that tempo-query gets copied into /tmp
-#  b/c it forces a /tmp dir to exist which hashicorp plugins depend on
+SHELL ["/busybox/sh", "-c"]
+
+RUN ["/busybox/addgroup", "-g", "10001", "-S", "tempo"]
+RUN ["/busybox/adduser", "-u", "10001", "-S", "tempo", "-G", "tempo"]
+
 ARG TARGETARCH
-COPY bin/linux/tempo-query-${TARGETARCH} /tmp/tempo-query
+COPY bin/linux/tempo-query-${TARGETARCH} /tempo-query
+COPY --from=ca-certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+USER 10001:10001
+
+ENTRYPOINT ["/tempo-query"]

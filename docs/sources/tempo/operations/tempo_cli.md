@@ -2,13 +2,13 @@
 title: Tempo CLI
 description: Guide to using tempo-cli
 keywords: ["tempo", "cli", "tempo-cli", "command line interface"]
-weight: 70
+weight: 800
 ---
 
 # Tempo CLI
 
 Tempo CLI is a separate executable that contains utility functions related to the Tempo software.
-Although it is not required for a working installation, Tempo CLI can be helpful for deeper analysis or for troubleshooting.
+Although it's not required for a working installation, Tempo CLI can be helpful for deeper analysis or for troubleshooting.
 
 ## Tempo CLI command syntax
 
@@ -51,15 +51,18 @@ The backend can be configured in a few ways:
     * `--backend <value>` The storage backend type, one of `s3`, `gcs`, `azure`, and `local`.
     * `--bucket <value>` The bucket name. The meaning of this value is backend-specific. Refer to [Configuration]({{< relref "../configuration" >}}) documentation for more information.
     * `--s3-endpoint <value>` The S3 API endpoint (i.e. s3.dualstack.us-east-2.amazonaws.com).
-    * `--s3-user <value>`, `--s3-password <value>` The S3 user name and password (or access key and secret key).
-      Optional, as Tempo CLI supports the same authentication mechanisms as Tempo. See [S3 permissions documentation]({{< relref "../configuration/s3" >}}) for more information.
+    * `--s3-user <value>`, `--s3-pass <value>` The S3 user name and password (or access key and secret key).
+      Optional, as Tempo CLI supports the same authentication mechanisms as Tempo. See [S3 permissions documentation]({{< relref "../configuration/hosted-storage/s3" >}}) for more information.
+    *  `--insecure-skip-verify` skip TLS verification, only applies to S3 and GCS.
 
 Each option applies only to the command in which it is used. For example, `--backend <value>` does not permanently change where Tempo stores data. It only changes it for command in which you apply the option.
 
 ## Query API command
-Call the tempo API and retrieve a trace by ID.
+
+### Trace ID
+Call the Tempo API and retrieve a trace by ID.
 ```bash
-tempo-cli query api <api-endpoint> <trace-id>
+tempo-cli query api trace-id <api-endpoint> <trace-id>
 ```
 
 Arguments:
@@ -68,18 +71,108 @@ Arguments:
 
 Options:
 - `--org-id <value>` Organization ID (for use in multi-tenant setup).
+- `--v1` use v1 API (use /api/traces endpoint to fetch traces, default: /api/v2/traces).
 
 **Example:**
 ```bash
-tempo-cli query api http://tempo:3200 f1cfe82a8eef933b
+tempo-cli query api trace-id http://tempo:3200 f1cfe82a8eef933b
 ```
 
+### Search
+Call the Tempo API and search using TraceQL.
+
+```bash
+tempo-cli query api search <host-port> <trace-ql> [<start> <end>]
+```
+Arguments:
+- `host-port` A host/port combination for Tempo. The scheme will be inferred based on the options provided.
+- `trace-ql` TraceQL query.
+- `start` Start of the time range to search: (YYYY-MM-DDThh:mm:ss)
+- `end` End of the time range to search: (YYYY-MM-DDThh:mm:ss)
+
+Options:
+- `--org-id <value>`      Organization ID (for use in multi-tenant setup).
+- `--use-grpc`            Use GRPC streaming
+- `--spss <value>`        Number of spans to return for each spanset
+- `--limit <value>`       Number of results to return
+- `--path-prefix <value>` String to prefix search paths with
+
+{{< admonition type="note" >}}
+Streaming over HTTP requires the `stream_over_http_enabled` flag to be set. For more information, refer to [Tempo GRPC API documentation]({{< relref "../api_docs" >}}).
+{{< /admonition >}}
+
+### Search tags
+Call the Tempo API and search attribute names.
+
+```bash
+tempo-cli query api search-tags <host-port> [<start> <end>]
+```
+Arguments:
+- `host-port` A host/port combination for Tempo. The scheme will be inferred based on the options provided.
+- `start` Start of the time range to search: (YYYY-MM-DDThh:mm:ss)
+- `end` End of the time range to search: (YYYY-MM-DDThh:mm:ss)
+
+Options:
+- `--org-id <value>`      Organization ID (for use in multi-tenant setup).
+- `--use-grpc`            Use GRPC streaming
+- `--path-prefix <value>` String to prefix search paths with
+
+{{< admonition type="note" >}}
+Streaming over HTTP requires the `stream_over_http_enabled` flag to be set. For more information, refer to [Tempo GRPC API documentation]({{< relref "../api_docs" >}}).
+{{< /admonition >}}
+
+### Search tag values
+Call the Tempo API and search attribute values.
+
+```bash
+tempo-cli query api search-tag-values <tag> <host-port> [<start> <end>]
+```
+Arguments:
+- `host-port` A host/port combination for Tempo. The scheme will be inferred based on the options provided.
+- `tag` The fully qualified traceql tag to search for. e.g. `resource.service.name`
+- `start` Start of the time range to search: (YYYY-MM-DDThh:mm:ss)
+- `end` End of the time range to search: (YYYY-MM-DDThh:mm:ss)
+
+Options:
+- `--org-id <value>`      Organization ID (for use in multi-tenant setup).
+- `--use-grpc`            Use GRPC streaming
+- `--path-prefix <value>` String to prefix search paths with
+
+{{< admonition type="note" >}}
+Streaming over HTTP requires the `stream_over_http_enabled` flag to be set. For more information, refer to [Tempo GRPC API documentation]({{< relref "../api_docs" >}}).
+{{< /admonition >}}
+
+### Metrics
+Call the Tempo API and generate metrics from traces using TraceQL.
+
+```bash
+tempo-cli query api metrics <host-port> <trace-ql metrics query> [<start> <end>]
+```
+Arguments:
+- `host-port` A host/port combination for Tempo. The scheme will be inferred based on the options provided.
+- `trace-ql metrics query` TraceQL metrics query.
+- `start` Start of the time range to search: (YYYY-MM-DDThh:mm:ss)
+- `end` End of the time range to search: (YYYY-MM-DDThh:mm:ss)
+
+Options:
+- `--org-id <value>`      Organization ID (for use in multi-tenant setup).
+- `--use-grpc`            Use GRPC streaming
+- `--path-prefix <value>` String to prefix search paths with
+
+{{< admonition type="note" >}}
+Streaming over HTTP requires the `stream_over_http_enabled` flag to be set. For more information, refer to [Tempo GRPC API documentation]({{< relref "../api_docs" >}}).
+{{< /admonition >}}
+
 ## Query blocks command
+
 Iterate over all backend blocks and dump all data found for a given trace id.
+
 ```bash
 tempo-cli query blocks <trace-id> <tenant-id>
 ```
- **Note:** can be intense as it downloads every bloom filter and some percentage of indexes/trace data.
+{{< admonition type="note" >}}
+ This can be intense as it downloads every bloom filter and some percentage of indexes/trace data.
+ {{< /admonition >}}
 
 Arguments:
 - `trace-id` Trace ID as a hexadecimal string.
@@ -93,6 +186,37 @@ See backend options above.
 tempo-cli query blocks f1cfe82a8eef933b single-tenant
 ```
 
+## Query trace summary command
+Iterate over all backend blocks and dump a summary for a given trace id.
+
+The summary includes:
+- number of blocks the trace is found in
+- span count
+- trace size
+- trace duration
+- root service name
+- root span info
+- top frequent service names
+
+```bash
+tempo-cli query trace-summary <trace-id> <tenant-id>
+```
+
+ **Note:** can be intense as it downloads every bloom filter and some percentage of indexes/trace data.
+
+Arguments:
+- `trace-id` Trace ID as a hexadecimal string.
+- `tenant-id` Tenant to search.
+
+Options:
+See backend options above.
+
+**Example:**
+```bash
+tempo-cli query trace-summary f1cfe82a8eef933b single-tenant
+```
+
+
 ## List blocks
 Lists information about all blocks for the given tenant, and optionally perform integrity checks on indexes for duplicate records.
 
@@ -101,7 +225,7 @@ tempo-cli list blocks <tenant-id>
 ```
 
 Arguments:
-- `tenant-id` The tenant ID.  Use `single-tenant` for single tenant setups.
+- `tenant-id` The tenant ID. Use `single-tenant` for single tenant setups.
 
 Options:
 - `--include-compacted` Include blocks that have been compacted. Default behavior is to display only active blocks.
@@ -134,7 +258,7 @@ tempo-cli list block <tenant-id> <block-id>
 ```
 
 Arguments:
-- `tenant-id` The tenant ID.  Use `single-tenant` for single tenant setups.
+- `tenant-id` The tenant ID. Use `single-tenant` for single tenant setups.
 - `block-id` The block ID as UUID string.
 
 Options:
@@ -153,7 +277,7 @@ tempo-cli list compaction-summary <tenant-id>
 ```
 
 Arguments:
-- `tenant-id` The tenant ID.  Use `single-tenant` for single tenant setups.
+- `tenant-id` The tenant ID. Use `single-tenant` for single tenant setups.
 
 **Example:**
 ```bash
@@ -162,14 +286,14 @@ tempo-cli list compaction-summary -c ./tempo.yaml single-tenant
 
 ## List cache summary
 Prints information about the number of bloom filter shards per day per compaction level. This command is useful to
-estimate and fine-tune cache storage. Read the [caching topic]({{< relref "caching/" >}}) for more information.
+estimate and fine-tune cache storage. Read the [caching topic]({{< relref "./caching" >}}) for more information.
 
 ```bash
 tempo-cli list cache-summary <tenant-id>
 ```
 
 Arguments:
-- `tenant-id` The tenant ID.  Use `single-tenant` for single tenant setups.
+- `tenant-id` The tenant ID. Use `single-tenant` for single tenant setups.
 
 **Example:**
 ```bash
@@ -184,7 +308,7 @@ tempo-cli list index <tenant-id> <block-id>
 ```
 
 Arguments:
-- `tenant-id` The tenant ID.  Use `single-tenant` for single tenant setups.
+- `tenant-id` The tenant ID. Use `single-tenant` for single tenant setups.
 - `block-id` The block ID as UUID string.
 
 **Example:**
@@ -200,7 +324,7 @@ tempo-cli view index <tenant-id> <block-id>
 ```
 
 Arguments:
-- `tenant-id` The tenant ID.  Use `single-tenant` for single tenant setups.
+- `tenant-id` The tenant ID. Use `single-tenant` for single tenant setups.
 - `block-id` The block ID as UUID string.
 
 **Example:**
@@ -215,7 +339,7 @@ To generate the bloom filter for a block if the files were deleted/corrupted.
 **Note:** ensure that the block is in a local backend in the expected directory hierarchy, i.e. `path / tenant / blocks`.
 
 Arguments:
-- `tenant-id` The tenant ID.  Use `single-tenant` for single tenant setups.
+- `tenant-id` The tenant ID. Use `single-tenant` for single tenant setups.
 - `block-id` The block ID as UUID string.
 - `bloom-fp` The false positive to be used for the bloom filter.
 - `bloom-shard-size` The shard size to be used for the bloom filter.
@@ -234,7 +358,7 @@ To generate the index/bloom for a block if the files were deleted/corrupted.
 **Note:** ensure that the block is in a local backend in the expected directory hierarchy, i.e. `path / tenant / blocks`.
 
 Arguments:
-- `tenant-id` The tenant ID.  Use `single-tenant` for single tenant setups.
+- `tenant-id` The tenant ID. Use `single-tenant` for single tenant setups.
 - `block-id` The block ID as UUID string.
 
 **Example:**
@@ -282,6 +406,26 @@ Arguments:
 ```bash
 tempo-cli parquet convert data.parquet out.parquet
 ```
+## Parquet convert 2 to 3 command
+Converts a vParquet2 file (actual data.parquet) to a vParquet3 block with an optional list of dedicated attribute columns.
+This utility command is useful when testing the impact of different combinations of dedicated columns. Currently,
+all listed columns are assumed to be at the span scope.
+
+```bash
+tempo-cli parquet convert-2-to-3 <in file> <out path> <list of dedicated columns>
+```
+
+Arguments:
+- `in file` Filename of an existing vParquet2 file containing Tempo trace data
+- `out path` Path to write the vParquet3 block to.
+- `list of dedicated columns` Additional params indicating which columns to make dedicated. Max 10. Dedicated columns
+  should be named using TraceQL syntax with scope. i.e. `span.db.statement` or `resource.namespace`.
+
+**Example:**
+```bash
+tempo-cli parquet convert-2-to-3 data.parquet ./out db.statement db.name
+```
+
 
 ## Migrate tenant command
 Copy blocks from one backend and tenant to another. Blocks can be copied within the same backend or between two
@@ -302,4 +446,88 @@ Options:
 **Example:**
 ```bash
 tempo-cli migrate tenant --source-config source.yaml --config-file dest.yaml my-tenant my-other-tenant
+```
+
+## Migrate overrides config command
+Migrate overrides config from inline format (legacy) to idented YAML format (new).
+
+```bash
+tempo-cli migrate overrides-config <source config file>
+```
+
+Arguments:
+- `source config file` Configuration file to migrate
+
+Options:
+- `--config-dest <value>` Destination file for the migrated config. If not specified, config is printed to stdout.
+- `--overrides-dest <value>` Destination file for the migrated overrides. If not specified, overrides are printed to stdout.
+
+**Example:**
+```bash
+tempo-cli migrate overrides-config config.yaml --config-dest config-tmp.yaml --overrides-dest overrides-tmp.yaml
+```
+
+## Analyse block
+<!-- Note that the command uses analyse and not analyze -->
+
+Analyses a block and outputs a summary of the block's generic attributes.
+It's of particular use when trying to determine candidates for dedicated attribute columns in vParquet3.
+
+Arguments:
+- `tenant-id` The tenant ID. Use `single-tenant` for single tenant setups.
+- `block-id` The block ID as UUID string.
+
+Options:
+- [Backend options](#backend-options)
+- `--num-attr <value>` Number of attributes to output (default: 10)
+
+**Example:**
+```bash
+tempo-cli analyse block --backend=local --bucket=./cmd/tempo-cli/test-data/ single-tenant b18beca6-4d7f-4464-9f72-f343e688a4a0
+```
+
+## Analyse blocks
+
+Analyses all blocks in a given time range and outputs a summary of the blocks' generic attributes.
+It's of particular use when trying to determine candidates for dedicated attribute columns in vParquet3 and vParquet4.
+
+Arguments:
+- `tenant-id` The tenant ID. Use `single-tenant` for single-tenant setups.
+
+Options:
+- [Backend options](#backend-options)
+- `--num-attr <value>` Number of attributes to output (default: 10)
+- `--min-compaction-level <value>` Minimum compaction level to include in the analysis (default: 3)
+- `--max-blocks <value>` Maximum number of blocks to analyze (default: 10)
+- `--max-start-time <value>` Oldest start time for a block to be processed. RFC3339 format (default: disabled)
+- `--min-end-time <value>` Newest end time for a block to be processed. RFC3339 format (default: disabled)
+
+**Example:**
+```bash
+tempo-cli analyse blocks --backend=local --bucket=./cmd/tempo-cli/test-data/ single-tenant
+```
+
+## Drop traces by ID
+
+Rewrites all blocks for a tenant that contain a specific trace IDs. The traces are dropped from
+the new blocks and the rewritten blocks are marked compacted so they will be cleaned up.
+
+Arguments:
+- `tenant-id` The tenant ID. Use `single-tenant` for single tenant setups.
+- `trace-ids` The comma-separated trace IDs to drop (also supports single trace ID)
+
+Options:
+- [Backend options](#backend-options)
+- `--drop-traces` By default, this command runs in dry run mode. Supplying this argument causes it to actually rewrite blocks with the traces dropped.
+
+### Examples
+
+Drop one trace:
+```bash
+tempo-cli rewrite-blocks drop-trace --backend=local --bucket=./cmd/tempo-cli/test-data/ single-tenant 04d5f549746c96e4f3daed6202571db2
+```
+
+Drop multiple traces:
+```bash
+tempo-cli rewrite-blocks drop-trace --backend=local --bucket=./cmd/tempo-cli/test-data/ single-tenant 04d5f549746c96e4f3daed6202571db2,111fa1850042aea83c17cd7e674210b8
 ```

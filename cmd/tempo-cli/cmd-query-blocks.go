@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"math/rand"
 	"strconv"
 
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/google/uuid"
+
 	"github.com/grafana/tempo/pkg/boundedwaitgroup"
 	"github.com/grafana/tempo/pkg/model/trace"
 	"github.com/grafana/tempo/pkg/tempopb"
@@ -26,8 +29,9 @@ type queryResults struct {
 type queryBlocksCmd struct {
 	backendOptions
 
-	TraceID  string `arg:"" help:"trace ID to retrieve"`
-	TenantID string `arg:"" help:"tenant ID to search"`
+	TraceID    string  `arg:"" help:"trace ID to retrieve"`
+	TenantID   string  `arg:"" help:"tenant ID to search"`
+	Percentage float32 `help:"percentage of blocks to scan e.g..1 for 10%"`
 }
 
 func (cmd *queryBlocksCmd) Run(ctx *globalOptions) error {
@@ -41,13 +45,13 @@ func (cmd *queryBlocksCmd) Run(ctx *globalOptions) error {
 		return err
 	}
 
-	results, err := queryBucket(context.Background(), r, c, cmd.TenantID, id)
+	results, err := queryBucket(context.Background(), cmd.Percentage, r, c, cmd.TenantID, id)
 	if err != nil {
 		return err
 	}
 
 	var (
-		combiner   = trace.NewCombiner()
+		combiner   = trace.NewCombiner(0, true)
 		marshaller = new(jsonpb.Marshaler)
 		jsonBytes  = bytes.Buffer{}
 	)
@@ -64,7 +68,10 @@ func (cmd *queryBlocksCmd) Run(ctx *globalOptions) error {
 
 		fmt.Println(jsonBytes.String())
 		jsonBytes.Reset()
-		combiner.ConsumeWithFinal(result.trace, i == len(results)-1)
+		_, err = combiner.ConsumeWithFinal(result.trace, i == len(results)-1)
+		if err != nil {
+			return fmt.Errorf("error combining trace: %w", err)
+		}
 	}
 
 	combinedTrace, _ := combiner.Result()
@@ -78,16 +85,27 @@ func (cmd *queryBlocksCmd) Run(ctx *globalOptions) error {
 	return nil
 }
 
-func queryBucket(ctx context.Context, r backend.Reader, c backend.Compactor, tenantID string, traceID common.ID) ([]queryResults, error) {
-	blockIDs, err := r.Blocks(context.Background(), tenantID)
+func queryBucket(ctx context.Context, percentage float32, r backend.Reader, c backend.Compactor, tenantID string, traceID common.ID) ([]queryResults, error) {
+	blockIDs, compactedBlockIDs, err := r.Blocks(context.Background(), tenantID)
 	if err != nil {
 		return nil, err
 	}
 
-	fmt.Println("total blocks: ", len(blockIDs))
+	if percentage > 0 {
+		// shuffle
+		rand.Shuffle(len(blockIDs), func(i, j int) { blockIDs[i], blockIDs[j] = blockIDs[j], blockIDs[i] })
+
+		// get the first n%
+		total := len(blockIDs)
+		total = int(float32(total) * percentage)
+		blockIDs = blockIDs[:total]
+	}
+	fmt.Println("total blocks to search: ", len(blockIDs))
+
+	blockIDs = append(blockIDs, compactedBlockIDs...)
 
 	// Load in parallel
-	wg := boundedwaitgroup.New(20)
+	wg := boundedwaitgroup.New(100)
 	resultsCh := make(chan queryResults, len(blockIDs))
 
 	for blockNum, id := range blockIDs {
@@ -120,28 +138,21 @@ func queryBucket(ctx context.Context, r backend.Reader, c backend.Compactor, ten
 	return results, nil
 }
 
-func queryBlock(ctx context.Context, r backend.Reader, c backend.Compactor, blockNum int, id uuid.UUID, tenantID string, traceID common.ID) (*queryResults, error) {
+func queryBlock(ctx context.Context, r backend.Reader, _ backend.Compactor, blockNum int, id uuid.UUID, tenantID string, traceID common.ID) (*queryResults, error) {
 	fmt.Print(".")
 	if blockNum%100 == 0 {
 		fmt.Print(strconv.Itoa(blockNum))
 	}
 
 	meta, err := r.BlockMeta(context.Background(), id, tenantID)
-	if err != nil && err != backend.ErrDoesNotExist {
+	if err != nil && !errors.Is(err, backend.ErrDoesNotExist) {
 		return nil, err
 	}
 
-	if err == backend.ErrDoesNotExist {
-		compactedMeta, err := c.CompactedBlockMeta(id, tenantID)
-		if err != nil && err != backend.ErrDoesNotExist {
-			return nil, err
-		}
-
-		if compactedMeta == nil {
-			return nil, fmt.Errorf("compacted meta nil?")
-		}
-
-		meta = &compactedMeta.BlockMeta
+	if errors.Is(err, backend.ErrDoesNotExist) {
+		// tempo proper searches compacted blocks, b/c each querier has a different view of the backend blocks.
+		// however, with a single snaphot of the backend, we can only search the noncompacted blocks.
+		return nil, nil
 	}
 
 	block, err := encoding.OpenBlock(meta, r)

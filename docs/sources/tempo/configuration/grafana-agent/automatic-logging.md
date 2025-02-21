@@ -1,5 +1,7 @@
 ---
-title: Automatic logging
+title: 'Automatic logging: Trace discovery through logs'
+description: Automatic logging provides an easy and fast way of getting trace discovery through logs.
+menuTitle: Automatic logging
 weight: 200
 aliases:
 - /docs/tempo/grafana-agent/automatic-logging
@@ -7,15 +9,29 @@ aliases:
 
 # Automatic logging: Trace discovery through logs
 
-Running distributed tracing systems is very powerful, but it brings its own challenges,
-and one of them is trace discovery.
-Tempo supports finding a trace if you know the trace identifier,
-so we leverage other tools like logs and metrics to discover traces.
+{{< docs/shared source="alloy" lookup="agent-deprecation.md" version="next" >}}
 
-Automatic logging provides an easy and fast way of getting trace discovery through logs.
-Automatic logging writes a well formatted log line to a Loki instance or to stdout for each span, root or process that passes through the tracing pipeline.
-This allows for automatically building a mechanism for trace discovery.
-On top of that, we also get metrics from traces using Loki.
+Running instrumented distributed systems is a very powerful way to gain
+understanding over a system, but it brings its own challenges. One of them is
+discovering which traces exist.
+
+In the beginning of Tempo, querying for a trace was only possible if you knew
+the ID of the trace you were looking for. One solution was automatic logging.
+Automatic logging provides an easy and fast way of discovering trace IDs
+through log messages. Well-formatted log lines are written to a Loki instance
+or to `stdout` for each span, root, or process that passes through the tracing
+pipeline. This allows for automatically building a mechanism for trace
+discovery. On top of that, you can also get metrics from traces using Loki, and
+allow quickly jumping from a log message to the trace view in Grafana.
+
+While this approach is useful, it isn't as powerful as TraceQL.
+If you are here because you know you want to log the
+trace ID, to enable jumping from logs to traces, then read on!
+
+If you want to query the system directly, read the [TraceQL
+documentation](https://grafana.com/docs/tempo/<TEMPO_VERSION>/traceql).
+
+## Configuration
 
 For high throughput systems, logging for every span may generate too much volume.
 In such cases, logging per root span or process is recommended.
@@ -27,11 +43,17 @@ This allows searching by those key-value pairs in Loki.
 
 ## Before you begin
 
+{{< admonition type="note">}}
+Grafana Alloy provides tooling to convert your Agent Static or Flow configuration files into a format that can be used by Alloy.
+
+For more information, refer to [Migrate to Alloy](https://grafana.com/docs/tempo/<TEMPO_VERSION>/configuration/grafana-alloy/migrate-alloy).
+{{< /admonition>}}
+
 To configure automatic logging, you need to select your preferred backend and the trace data to log.
 
-To see all the available config options, refer to the [configuration reference](/docs/agent/latest/configuration/traces-config).
+To see all the available configuration options, refer to the [configuration reference](https://grafana.com/docs/agent/latest/configuration/traces-config).
 
-This simple example logs trace roots to stdout and is a good way to get started using automatic logging:
+This simple example logs trace roots to `stdout` and is a good way to get started using automatic logging:
 ```yaml
 traces:
   configs:

@@ -1,17 +1,6 @@
 // Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package spanstore
 
@@ -36,7 +25,7 @@ type Reader interface {
 	// GetTrace retrieves the trace with a given id.
 	//
 	// If no spans are stored for this trace, it returns ErrTraceNotFound.
-	GetTrace(ctx context.Context, traceID model.TraceID) (*model.Trace, error)
+	GetTrace(ctx context.Context, query GetTraceParameters) (*model.Trace, error)
 
 	// GetServices returns all service names known to the backend from spans
 	// within its retention period.
@@ -59,6 +48,13 @@ type Reader interface {
 	//
 	// If no matching traces are found, the function returns (nil, nil).
 	FindTraceIDs(ctx context.Context, query *TraceQueryParameters) ([]model.TraceID, error)
+}
+
+// GetTraceParameters contains parameters of a trace get.
+type GetTraceParameters struct {
+	TraceID   model.TraceID
+	StartTime time.Time // optional
+	EndTime   time.Time // optional
 }
 
 // TraceQueryParameters contains parameters of a trace query.

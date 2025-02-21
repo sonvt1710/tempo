@@ -2,11 +2,11 @@ package vparquet2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
-	"github.com/pkg/errors"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 
 	tempo_io "github.com/grafana/tempo/pkg/io"
 	"github.com/grafana/tempo/pkg/parquetquery"
@@ -14,12 +14,12 @@ import (
 )
 
 func (b *backendBlock) open(ctx context.Context) (*parquet.File, *parquet.Reader, error) { //nolint:all //deprecated
-	rr := NewBackendReaderAt(ctx, b.r, DataFileName, b.meta.BlockID, b.meta.TenantID)
+	rr := NewBackendReaderAt(ctx, b.r, DataFileName, b.meta)
 
 	// 128 MB memory buffering
-	br := tempo_io.NewBufferedReaderAt(rr, int64(b.meta.Size), 2*1024*1024, 64)
+	br := tempo_io.NewBufferedReaderAt(rr, int64(b.meta.Size_), 2*1024*1024, 64)
 
-	pf, err := parquet.OpenFile(br, int64(b.meta.Size), parquet.SkipBloomFilters(true), parquet.SkipPageIndex(true))
+	pf, err := parquet.OpenFile(br, int64(b.meta.Size_), parquet.SkipBloomFilters(true), parquet.SkipPageIndex(true))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -28,7 +28,7 @@ func (b *backendBlock) open(ctx context.Context) (*parquet.File, *parquet.Reader
 	return pf, r, nil
 }
 
-func (b *backendBlock) RawIterator(ctx context.Context, pool *rowPool) (*rawIterator, error) {
+func (b *backendBlock) rawIter(ctx context.Context, pool *rowPool) (*rawIterator, error) {
 	pf, r, err := b.open(ctx)
 	if err != nil {
 		return nil, err
@@ -54,7 +54,8 @@ var _ RawIterator = (*rawIterator)(nil)
 func (i *rawIterator) getTraceID(r parquet.Row) common.ID {
 	for _, v := range r {
 		if v.Column() == i.traceIDIndex {
-			return v.ByteArray()
+			// Important - clone to get a detached copy that lives outside the pool.
+			return v.Clone().ByteArray()
 		}
 	}
 	return nil
@@ -67,14 +68,17 @@ func (i *rawIterator) Next(context.Context) (common.ID, parquet.Row, error) {
 		return i.getTraceID(rows[0]), rows[0], nil
 	}
 
-	if err == io.EOF {
+	if errors.Is(err, io.EOF) {
 		return nil, nil, nil
 	}
 
-	return nil, nil, errors.Wrap(err, fmt.Sprintf("error iterating through block %s", i.blockID))
+	if err != nil {
+		return nil, nil, fmt.Errorf("error iterating through block %s: %w", i.blockID, err)
+	}
+	return nil, nil, nil
 }
 
-func (i *rawIterator) peekNextID(ctx context.Context) (common.ID, error) { // nolint:unused // this is required to satisfy the bookmarkIterator interface
+func (i *rawIterator) peekNextID(context.Context) (common.ID, error) { // nolint:unused // this is required to satisfy the bookmarkIterator interface
 	return nil, common.ErrUnsupported
 }
 

@@ -5,11 +5,11 @@ import (
 	crand "crypto/rand"
 	"testing"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/jaegerexporter"
+	"github.com/grafana/dskit/user"
+	"github.com/grafana/e2e"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/zipkinexporter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/weaveworks/common/user"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/configgrpc"
@@ -18,18 +18,18 @@ import (
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/otlpexporter"
 	"go.opentelemetry.io/collector/pdata/ptrace"
-	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/trace"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/zap"
 
-	"github.com/grafana/e2e"
-	util "github.com/grafana/tempo/integration"
+	"github.com/grafana/tempo/integration/util"
+	"github.com/grafana/tempo/pkg/httpclient"
 	tempoUtil "github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/pkg/util/test"
 )
 
 const (
-	configAllInOneLocal = "config-all-in-one-local.yaml"
+	configAllInOneLocal = "deployments/config-all-in-one-local.yaml"
 )
 
 func TestReceivers(t *testing.T) {
@@ -48,30 +48,14 @@ func TestReceivers(t *testing.T) {
 		endpoint string
 	}{
 		{
-			"jaeger gRPC",
-			jaegerexporter.NewFactory(),
-			func(factory exporter.Factory, endpoint string) component.Config {
-				exporterCfg := factory.CreateDefaultConfig()
-				jaegerCfg := exporterCfg.(*jaegerexporter.Config)
-				jaegerCfg.GRPCClientSettings = configgrpc.GRPCClientSettings{
-					Endpoint: endpoint,
-					TLSSetting: configtls.TLSClientSetting{
-						Insecure: true,
-					},
-				}
-				return jaegerCfg
-			},
-			tempo.Endpoint(14250),
-		},
-		{
 			"otlp gRPC",
 			otlpexporter.NewFactory(),
 			func(factory exporter.Factory, endpoint string) component.Config {
 				exporterCfg := factory.CreateDefaultConfig()
 				otlpCfg := exporterCfg.(*otlpexporter.Config)
-				otlpCfg.GRPCClientSettings = configgrpc.GRPCClientSettings{
+				otlpCfg.ClientConfig = configgrpc.ClientConfig{
 					Endpoint: endpoint,
-					TLSSetting: configtls.TLSClientSetting{
+					TLSSetting: configtls.ClientConfig{
 						Insecure: true,
 					},
 				}
@@ -85,9 +69,9 @@ func TestReceivers(t *testing.T) {
 			func(factory exporter.Factory, endpoint string) component.Config {
 				exporterCfg := factory.CreateDefaultConfig()
 				zipkinCfg := exporterCfg.(*zipkinexporter.Config)
-				zipkinCfg.HTTPClientSettings = confighttp.HTTPClientSettings{
+				zipkinCfg.ClientConfig = confighttp.ClientConfig{
 					Endpoint: endpoint,
-					TLSSetting: configtls.TLSClientSetting{
+					TLSSetting: configtls.ClientConfig{
 						Insecure: true,
 					},
 				}
@@ -102,13 +86,13 @@ func TestReceivers(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// create exporter
 			logger, _ := zap.NewDevelopment()
-			exporter, err := tc.factory.CreateTracesExporter(
+			exporter, err := tc.factory.CreateTraces(
 				context.Background(),
-				exporter.CreateSettings{
+				exporter.Settings{
 					TelemetrySettings: component.TelemetrySettings{
 						Logger:         logger,
-						TracerProvider: trace.NewNoopTracerProvider(),
-						MeterProvider:  metric.NewNoopMeterProvider(),
+						TracerProvider: tracenoop.NewTracerProvider(),
+						MeterProvider:  metricnoop.NewMeterProvider(),
 					},
 					BuildInfo: component.NewDefaultBuildInfo(),
 				},
@@ -128,7 +112,7 @@ func TestReceivers(t *testing.T) {
 			// zipkin doesn't support events and will 400 if you attempt to push one. just strip
 			// all events from the trace here
 			if tc.name == "zipkin" {
-				for _, b := range req.Batches {
+				for _, b := range req.ResourceSpans {
 					for _, ss := range b.ScopeSpans {
 						for _, s := range ss.Spans {
 							s.Events = nil
@@ -157,12 +141,12 @@ func TestReceivers(t *testing.T) {
 			require.NoError(t, exporter.Shutdown(context.Background()))
 
 			// query for the trace
-			client := tempoUtil.NewClient("http://"+tempo.Endpoint(3200), tempoUtil.FakeTenantID)
+			client := httpclient.New("http://"+tempo.Endpoint(3200), tempoUtil.FakeTenantID)
 			trace, err := client.QueryTrace(tempoUtil.TraceIDToHexString(traceID))
 			require.NoError(t, err)
 
 			// just compare spanCount because otel flattens all ILS into one
-			assert.Equal(t, spanCount(req), spanCount(trace))
+			assert.Equal(t, util.SpanCount(req), util.SpanCount(trace))
 		})
 	}
 }

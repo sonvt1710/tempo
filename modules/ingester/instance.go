@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"hash/fnv"
@@ -11,20 +12,19 @@ import (
 	"sync"
 	"time"
 
+	kitlog "github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/gogo/status"
 	"github.com/google/uuid"
-	"github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"go.uber.org/atomic"
 	"google.golang.org/grpc/codes"
 
 	"github.com/grafana/tempo/modules/overrides"
 	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/model/trace"
 	"github.com/grafana/tempo/pkg/tempopb"
+	"github.com/grafana/tempo/pkg/tracesizes"
 	"github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/pkg/validation"
 	"github.com/grafana/tempo/tempodb"
@@ -34,34 +34,14 @@ import (
 	"github.com/grafana/tempo/tempodb/encoding/common"
 )
 
-type traceTooLargeError struct {
-	traceID           common.ID
-	instanceID        string
-	maxBytes, reqSize int
-}
-
-func newTraceTooLargeError(traceID common.ID, instanceID string, maxBytes, reqSize int) *traceTooLargeError {
-	return &traceTooLargeError{
-		traceID:    traceID,
-		instanceID: instanceID,
-		maxBytes:   maxBytes,
-		reqSize:    reqSize,
-	}
-}
-
-func (e traceTooLargeError) Error() string {
-	return fmt.Sprintf(
-		"%s max size of trace (%d) exceeded while adding %d bytes to trace %s for tenant %s",
-		overrides.ErrorPrefixTraceTooLarge, e.maxBytes, e.reqSize, hex.EncodeToString(e.traceID), e.instanceID)
-}
-
-// Errors returned on Query.
 var (
-	ErrTraceMissing = errors.New("Trace missing")
+	errTraceTooLarge = errors.New(overrides.ErrorPrefixTraceTooLarge)
+	errMaxLiveTraces = errors.New(overrides.ErrorPrefixLiveTracesExceeded)
 )
 
 const (
-	traceDataType = "trace"
+	traceDataType             = "trace"
+	maxTraceLogLinesPerSecond = 10
 )
 
 var (
@@ -74,6 +54,11 @@ var (
 		Namespace: "tempo",
 		Name:      "ingester_live_traces",
 		Help:      "The current number of lives traces per tenant.",
+	}, []string{"tenant"})
+	metricLiveTraceBytes = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "tempo",
+		Name:      "ingester_live_trace_bytes",
+		Help:      "The current number of bytes consumed by lives traces per tenant.",
 	}, []string{"tenant"})
 	metricBlocksClearedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "tempo",
@@ -93,23 +78,28 @@ var (
 )
 
 type instance struct {
-	tracesMtx  sync.Mutex
-	traces     map[uint32]*liveTrace
-	traceSizes map[uint32]uint32
-	traceCount atomic.Int32
+	tracesMtx      sync.Mutex
+	traces         map[uint32]*liveTrace
+	traceSizes     *tracesizes.Tracker
+	traceSizeBytes uint64
+
+	headBlockMtx sync.RWMutex
+	headBlock    common.WALBlock
 
 	blocksMtx        sync.RWMutex
-	headBlock        common.WALBlock
 	completingBlocks []common.WALBlock
-	completeBlocks   []*localBlock
+	completeBlocks   []*LocalBlock
 
 	lastBlockCut time.Time
 
 	instanceID         string
 	tracesCreatedTotal prometheus.Counter
 	bytesReceivedTotal *prometheus.CounterVec
-	limiter            *Limiter
+	limiter            Limiter
 	writer             tempodb.Writer
+
+	dedicatedColumns backend.DedicatedColumns
+	overrides        ingesterOverrides
 
 	local       *local.Backend
 	localReader backend.Reader
@@ -117,13 +107,15 @@ type instance struct {
 
 	hash hash.Hash32
 
-	autocompleteFilteringEnabled bool
+	logger         kitlog.Logger
+	maxTraceLogger *log.RateLimitedLogger
 }
 
-func newInstance(instanceID string, limiter *Limiter, writer tempodb.Writer, l *local.Backend, autocompleteFiltering bool) (*instance, error) {
+func newInstance(instanceID string, limiter Limiter, overrides ingesterOverrides, writer tempodb.Writer, l *local.Backend, dedicatedColumns backend.DedicatedColumns) (*instance, error) {
+	logger := kitlog.With(log.Logger, "tenant", instanceID)
 	i := &instance{
 		traces:     map[uint32]*liveTrace{},
-		traceSizes: map[uint32]uint32{},
+		traceSizes: tracesizes.New(),
 
 		instanceID:         instanceID,
 		tracesCreatedTotal: metricTracesCreatedTotal.WithLabelValues(instanceID),
@@ -131,13 +123,17 @@ func newInstance(instanceID string, limiter *Limiter, writer tempodb.Writer, l *
 		limiter:            limiter,
 		writer:             writer,
 
+		dedicatedColumns: dedicatedColumns,
+		overrides:        overrides,
+
 		local:       l,
 		localReader: backend.NewReader(l),
 		localWriter: backend.NewWriter(l),
 
 		hash: fnv.New32(),
 
-		autocompleteFilteringEnabled: autocompleteFiltering,
+		logger:         logger,
+		maxTraceLogger: log.NewRateLimitedLogger(maxTraceLogLinesPerSecond, level.Warn(logger)),
 	}
 	err := i.resetHeadBlock()
 	if err != nil {
@@ -146,28 +142,55 @@ func newInstance(instanceID string, limiter *Limiter, writer tempodb.Writer, l *
 	return i, nil
 }
 
-func (i *instance) PushBytesRequest(ctx context.Context, req *tempopb.PushBytesRequest) error {
+func (i *instance) PushBytesRequest(ctx context.Context, req *tempopb.PushBytesRequest) *tempopb.PushResponse {
+	pr := &tempopb.PushResponse{}
+
 	for j := range req.Traces {
-		err := i.PushBytes(ctx, req.Ids[j].Slice, req.Traces[j].Slice)
-		if err != nil {
-			return err
-		}
+		err := i.PushBytes(ctx, req.Ids[j], req.Traces[j].Slice)
+		pr.ErrorsByTrace = i.addTraceError(pr.ErrorsByTrace, err, len(req.Traces), j)
 	}
-	return nil
+
+	return pr
+}
+
+func (i *instance) addTraceError(errorsByTrace []tempopb.PushErrorReason, pushError error, numTraces int, traceIndex int) []tempopb.PushErrorReason {
+	if pushError != nil {
+		// only make list if there is at least one error
+		if len(errorsByTrace) == 0 {
+			errorsByTrace = make([]tempopb.PushErrorReason, 0, numTraces)
+			// because this is the first error, fill list with NO_ERROR for the traces before this one
+			for k := 0; k < traceIndex; k++ {
+				errorsByTrace = append(errorsByTrace, tempopb.PushErrorReason_NO_ERROR)
+			}
+		}
+		if errors.Is(pushError, errMaxLiveTraces) {
+			errorsByTrace = append(errorsByTrace, tempopb.PushErrorReason_MAX_LIVE_TRACES)
+			return errorsByTrace
+		}
+
+		if errors.Is(pushError, errTraceTooLarge) {
+			errorsByTrace = append(errorsByTrace, tempopb.PushErrorReason_TRACE_TOO_LARGE)
+			return errorsByTrace
+		}
+
+		// error is not either MaxLiveTraces or TraceTooLarge
+		level.Error(i.logger).Log("msg", "Unexpected error during PushBytes", "error", pushError)
+		errorsByTrace = append(errorsByTrace, tempopb.PushErrorReason_UNKNOWN_ERROR)
+		return errorsByTrace
+
+	} else if len(errorsByTrace) > 0 {
+		errorsByTrace = append(errorsByTrace, tempopb.PushErrorReason_NO_ERROR)
+	}
+
+	return errorsByTrace
 }
 
 // PushBytes is used to push an unmarshalled tempopb.Trace to the instance
-func (i *instance) PushBytes(ctx context.Context, id []byte, traceBytes []byte) error {
+func (i *instance) PushBytes(ctx context.Context, id, traceBytes []byte) error {
 	i.measureReceivedBytes(traceBytes)
 
 	if !validation.ValidTraceID(id) {
 		return status.Errorf(codes.InvalidArgument, "%s is not a valid traceid", hex.EncodeToString(id))
-	}
-
-	// check for max traces before grabbing the lock to better load shed
-	err := i.limiter.AssertMaxTracesPerUser(i.instanceID, int(i.traceCount.Load()))
-	if err != nil {
-		return status.Errorf(codes.FailedPrecondition, "%s max live traces exceeded for tenant %s: %v", overrides.ErrorPrefixLiveTracesExceeded, i.instanceID, err)
 	}
 
 	return i.push(ctx, id, traceBytes)
@@ -177,30 +200,28 @@ func (i *instance) push(ctx context.Context, id, traceBytes []byte) error {
 	i.tracesMtx.Lock()
 	defer i.tracesMtx.Unlock()
 
-	tkn := i.tokenForTraceID(id)
-	maxBytes := i.limiter.limits.MaxBytesPerTrace(i.instanceID)
-
-	if maxBytes > 0 {
-		prevSize := int(i.traceSizes[tkn])
-		reqSize := len(traceBytes)
-		if prevSize+reqSize > maxBytes {
-			return status.Errorf(codes.FailedPrecondition, (newTraceTooLargeError(id, i.instanceID, maxBytes, reqSize).Error()))
-		}
+	err := i.limiter.AssertMaxTracesPerUser(i.instanceID, len(i.traces))
+	if err != nil {
+		return errMaxLiveTraces
 	}
 
-	trace := i.getOrCreateTrace(id, tkn, maxBytes)
+	maxBytes := i.limiter.Limits().MaxBytesPerTrace(i.instanceID)
+	reqSize := len(traceBytes)
 
-	err := trace.Push(ctx, i.instanceID, traceBytes)
+	if maxBytes > 0 && !i.traceSizes.Allow(id, reqSize, maxBytes) {
+		i.maxTraceLogger.Log("msg", overrides.ErrorPrefixTraceTooLarge, "max", maxBytes, "size", reqSize, "trace", hex.EncodeToString(id))
+		return errTraceTooLarge
+	}
+
+	tkn := i.tokenForTraceID(id)
+	trace := i.getOrCreateTrace(id, tkn)
+
+	err = trace.Push(ctx, i.instanceID, traceBytes)
 	if err != nil {
-		if e, ok := err.(*traceTooLargeError); ok {
-			return status.Errorf(codes.FailedPrecondition, e.Error())
-		}
 		return err
 	}
 
-	if maxBytes > 0 {
-		i.traceSizes[tkn] += uint32(len(traceBytes))
-	}
+	i.traceSizeBytes += uint64(reqSize)
 
 	return nil
 }
@@ -241,16 +262,16 @@ func (i *instance) CutCompleteTraces(cutoff time.Duration, immediate bool) error
 		tempopb.ReuseByteSlices(t.batches)
 	}
 
-	i.blocksMtx.Lock()
-	defer i.blocksMtx.Unlock()
+	i.headBlockMtx.Lock()
+	defer i.headBlockMtx.Unlock()
 	return i.headBlock.Flush()
 }
 
 // CutBlockIfReady cuts a completingBlock from the HeadBlock if ready.
 // Returns the ID of a block if one was cut or a nil ID if one was not cut, along with the error (if any).
 func (i *instance) CutBlockIfReady(maxBlockLifetime time.Duration, maxBlockBytes uint64, immediate bool) (uuid.UUID, error) {
-	i.blocksMtx.Lock()
-	defer i.blocksMtx.Unlock()
+	i.headBlockMtx.Lock()
+	defer i.headBlockMtx.Unlock()
 
 	if i.headBlock == nil || i.headBlock.DataLength() == 0 {
 		return uuid.Nil, nil
@@ -258,6 +279,8 @@ func (i *instance) CutBlockIfReady(maxBlockLifetime time.Duration, maxBlockBytes
 
 	now := time.Now()
 	if i.lastBlockCut.Add(maxBlockLifetime).Before(now) || i.headBlock.DataLength() >= maxBlockBytes || immediate {
+		// Reset trace sizes when cutting block
+		i.traceSizes.ClearIdle(i.lastBlockCut)
 
 		// Final flush
 		err := i.headBlock.Flush()
@@ -267,6 +290,15 @@ func (i *instance) CutBlockIfReady(maxBlockLifetime time.Duration, maxBlockBytes
 
 		completingBlock := i.headBlock
 
+		// Now that we are adding a new block take the blocks mutex.
+		// A warning about deadlocks!!  This area does a hard-acquire of both mutexes.
+		// To avoid deadlocks this function and all others must acquire them in
+		// the ** same_order ** or else!!! i.e. another function can't acquire blocksMtx
+		// then headblockMtx. Even if the likelihood is low it is a statistical certainly
+		// that eventually a deadlock will occur.
+		i.blocksMtx.Lock()
+		defer i.blocksMtx.Unlock()
+
 		i.completingBlocks = append(i.completingBlocks, completingBlock)
 
 		err = i.resetHeadBlock()
@@ -274,18 +306,18 @@ func (i *instance) CutBlockIfReady(maxBlockLifetime time.Duration, maxBlockBytes
 			return uuid.Nil, fmt.Errorf("failed to resetHeadBlock: %w", err)
 		}
 
-		return completingBlock.BlockMeta().BlockID, nil
+		return (uuid.UUID)(completingBlock.BlockMeta().BlockID), nil
 	}
 
 	return uuid.Nil, nil
 }
 
 // CompleteBlock moves a completingBlock to a completeBlock. The new completeBlock has the same ID.
-func (i *instance) CompleteBlock(blockID uuid.UUID) error {
+func (i *instance) CompleteBlock(ctx context.Context, blockID uuid.UUID) error {
 	i.blocksMtx.Lock()
 	var completingBlock common.WALBlock
 	for _, iterBlock := range i.completingBlocks {
-		if iterBlock.BlockMeta().BlockID == blockID {
+		if (uuid.UUID)(iterBlock.BlockMeta().BlockID) == blockID {
 			completingBlock = iterBlock
 			break
 		}
@@ -296,14 +328,12 @@ func (i *instance) CompleteBlock(blockID uuid.UUID) error {
 		return fmt.Errorf("error finding completingBlock")
 	}
 
-	ctx := context.Background()
-
 	backendBlock, err := i.writer.CompleteBlockWithBackend(ctx, completingBlock, i.localReader, i.localWriter)
 	if err != nil {
-		return errors.Wrap(err, "error completing wal block with local backend")
+		return fmt.Errorf("error completing wal block with local backend: %w", err)
 	}
 
-	ingesterBlock := newLocalBlock(ctx, backendBlock, i.local)
+	ingesterBlock := NewLocalBlock(ctx, backendBlock, i.local)
 
 	i.blocksMtx.Lock()
 	i.completeBlocks = append(i.completeBlocks, ingesterBlock)
@@ -318,7 +348,7 @@ func (i *instance) ClearCompletingBlock(blockID uuid.UUID) error {
 
 	var completingBlock common.WALBlock
 	for j, iterBlock := range i.completingBlocks {
-		if iterBlock.BlockMeta().BlockID == blockID {
+		if (uuid.UUID)(iterBlock.BlockMeta().BlockID) == blockID {
 			completingBlock = iterBlock
 			i.completingBlocks = append(i.completingBlocks[:j], i.completingBlocks[j+1:]...)
 			break
@@ -333,12 +363,12 @@ func (i *instance) ClearCompletingBlock(blockID uuid.UUID) error {
 }
 
 // GetBlockToBeFlushed gets a list of blocks that can be flushed to the backend.
-func (i *instance) GetBlockToBeFlushed(blockID uuid.UUID) *localBlock {
+func (i *instance) GetBlockToBeFlushed(blockID uuid.UUID) *LocalBlock {
 	i.blocksMtx.RLock()
 	defer i.blocksMtx.RUnlock()
 
 	for _, c := range i.completeBlocks {
-		if c.BlockMeta().BlockID == blockID && c.FlushedTime().IsZero() {
+		if (uuid.UUID)(c.BlockMeta().BlockID) == blockID && c.FlushedTime().IsZero() {
 			return c
 		}
 	}
@@ -361,7 +391,7 @@ func (i *instance) ClearFlushedBlocks(completeBlockTimeout time.Duration) error 
 		if flushedTime.Add(completeBlockTimeout).Before(time.Now()) {
 			i.completeBlocks = append(i.completeBlocks[:idx], i.completeBlocks[idx+1:]...)
 
-			err = i.local.ClearBlock(b.BlockMeta().BlockID, i.instanceID)
+			err = i.local.ClearBlock((uuid.UUID)(b.BlockMeta().BlockID), i.instanceID)
 			if err == nil {
 				metricBlocksClearedTotal.Inc()
 			}
@@ -372,9 +402,9 @@ func (i *instance) ClearFlushedBlocks(completeBlockTimeout time.Duration) error 
 	return err
 }
 
-func (i *instance) FindTraceByID(ctx context.Context, id []byte) (*tempopb.Trace, error) {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "instance.FindTraceByID")
-	defer span.Finish()
+func (i *instance) FindTraceByID(ctx context.Context, id []byte, allowPartialTrace bool) (*tempopb.Trace, error) {
+	ctx, span := tracer.Start(ctx, "instance.FindTraceByID")
+	defer span.End()
 
 	var err error
 	var completeTrace *tempopb.Trace
@@ -390,35 +420,52 @@ func (i *instance) FindTraceByID(ctx context.Context, id []byte) (*tempopb.Trace
 	}
 	i.tracesMtx.Unlock()
 
-	i.blocksMtx.RLock()
-	defer i.blocksMtx.RUnlock()
+	maxBytes := i.limiter.Limits().MaxBytesPerTrace(i.instanceID)
+	searchOpts := common.DefaultSearchOptionsWithMaxBytes(maxBytes)
 
-	combiner := trace.NewCombiner()
-	combiner.Consume(completeTrace)
+	combiner := trace.NewCombiner(maxBytes, allowPartialTrace)
+	_, err = combiner.Consume(completeTrace)
+	if err != nil {
+		return nil, err
+	}
 
 	// headBlock
-	tr, err := i.headBlock.FindTraceByID(ctx, id, common.DefaultSearchOptions())
+	i.headBlockMtx.RLock()
+	tr, err := i.headBlock.FindTraceByID(ctx, id, searchOpts)
+	i.headBlockMtx.RUnlock()
 	if err != nil {
 		return nil, fmt.Errorf("headBlock.FindTraceByID failed: %w", err)
 	}
-	combiner.Consume(tr)
+	_, err = combiner.Consume(tr)
+	if err != nil {
+		return nil, err
+	}
+
+	i.blocksMtx.RLock()
+	defer i.blocksMtx.RUnlock()
 
 	// completingBlock
 	for _, c := range i.completingBlocks {
-		tr, err = c.FindTraceByID(ctx, id, common.DefaultSearchOptions())
+		tr, err = c.FindTraceByID(ctx, id, searchOpts)
 		if err != nil {
 			return nil, fmt.Errorf("completingBlock.FindTraceByID failed: %w", err)
 		}
-		combiner.Consume(tr)
+		_, err = combiner.Consume(tr)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// completeBlock
 	for _, c := range i.completeBlocks {
-		found, err := c.FindTraceByID(ctx, id, common.DefaultSearchOptions())
+		found, err := c.FindTraceByID(ctx, id, searchOpts)
 		if err != nil {
 			return nil, fmt.Errorf("completeBlock.FindTraceByID failed: %w", err)
 		}
-		combiner.Consume(found)
+		_, err = combiner.Consume(found)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	result, _ := combiner.Result()
@@ -438,16 +485,14 @@ func (i *instance) AddCompletingBlock(b common.WALBlock) {
 // getOrCreateTrace will return a new trace object for the given request
 //
 //	It must be called under the i.tracesMtx lock
-func (i *instance) getOrCreateTrace(traceID []byte, fp uint32, maxBytes int) *liveTrace {
+func (i *instance) getOrCreateTrace(traceID []byte, fp uint32) *liveTrace {
 	trace, ok := i.traces[fp]
 	if ok {
 		return trace
 	}
 
-	trace = newTrace(traceID, maxBytes)
+	trace = newTrace(traceID)
 	i.traces[fp] = trace
-	i.tracesCreatedTotal.Inc()
-	i.traceCount.Inc()
 
 	return trace
 }
@@ -461,13 +506,14 @@ func (i *instance) tokenForTraceID(id []byte) uint32 {
 
 // resetHeadBlock() should be called under lock
 func (i *instance) resetHeadBlock() error {
+	dedicatedColumns := i.getDedicatedColumns()
 
-	// Reset trace sizes when cutting block
-	i.tracesMtx.Lock()
-	i.traceSizes = make(map[uint32]uint32, len(i.traceSizes))
-	i.tracesMtx.Unlock()
-
-	newHeadBlock, err := i.writer.WAL().NewBlock(uuid.New(), i.instanceID, model.CurrentEncoding)
+	meta := &backend.BlockMeta{
+		BlockID:          backend.NewUUID(),
+		TenantID:         i.instanceID,
+		DedicatedColumns: dedicatedColumns,
+	}
+	newHeadBlock, err := i.writer.WAL().NewBlock(meta, model.CurrentEncoding)
 	if err != nil {
 		return err
 	}
@@ -478,12 +524,26 @@ func (i *instance) resetHeadBlock() error {
 	return nil
 }
 
+func (i *instance) getDedicatedColumns() backend.DedicatedColumns {
+	if cols := i.overrides.DedicatedColumns(i.instanceID); cols != nil {
+		err := cols.Validate()
+		if err != nil {
+			level.Error(i.logger).Log("msg", "Unable to apply overrides for dedicated attribute columns. Columns invalid.", "error", err)
+			return i.dedicatedColumns
+		}
+
+		return cols
+	}
+	return i.dedicatedColumns
+}
+
 func (i *instance) tracesToCut(cutoff time.Duration, immediate bool) []*liveTrace {
 	i.tracesMtx.Lock()
 	defer i.tracesMtx.Unlock()
 
 	// Set this before cutting to give a more accurate number.
 	metricLiveTraces.WithLabelValues(i.instanceID).Set(float64(len(i.traces)))
+	metricLiveTraceBytes.WithLabelValues(i.instanceID).Set(float64(i.traceSizeBytes))
 
 	cutoffTime := time.Now().Add(cutoff)
 	tracesToCut := make([]*liveTrace, 0, len(i.traces))
@@ -491,19 +551,23 @@ func (i *instance) tracesToCut(cutoff time.Duration, immediate bool) []*liveTrac
 	for key, trace := range i.traces {
 		if cutoffTime.After(trace.lastAppend) || immediate {
 			tracesToCut = append(tracesToCut, trace)
+
+			// decrease live trace bytes
+			i.traceSizeBytes -= trace.Size()
+
 			delete(i.traces, key)
 		}
 	}
-	i.traceCount.Store(int32(len(i.traces)))
 
 	return tracesToCut
 }
 
 func (i *instance) writeTraceToHeadBlock(id common.ID, b []byte, start, end uint32) error {
-	i.blocksMtx.Lock()
-	defer i.blocksMtx.Unlock()
+	i.headBlockMtx.Lock()
+	defer i.headBlockMtx.Unlock()
 
-	err := i.headBlock.Append(id, b, start, end)
+	i.tracesCreatedTotal.Inc()
+	err := i.headBlock.Append(id, b, start, end, true)
 	if err != nil {
 		return err
 	}
@@ -511,8 +575,8 @@ func (i *instance) writeTraceToHeadBlock(id common.ID, b []byte, start, end uint
 	return nil
 }
 
-func (i *instance) rediscoverLocalBlocks(ctx context.Context) ([]*localBlock, error) {
-	ids, err := i.localReader.Blocks(ctx, i.instanceID)
+func (i *instance) rediscoverLocalBlocks(ctx context.Context) ([]*LocalBlock, error) {
+	ids, _, err := i.localReader.Blocks(ctx, i.instanceID)
 	if err != nil {
 		return nil, err
 	}
@@ -521,17 +585,16 @@ func (i *instance) rediscoverLocalBlocks(ctx context.Context) ([]*localBlock, er
 		i.blocksMtx.RLock()
 		defer i.blocksMtx.RUnlock()
 		for _, b := range i.completingBlocks {
-			if b.BlockMeta().BlockID == id {
+			if (uuid.UUID)(b.BlockMeta().BlockID) == id {
 				return true
 			}
 		}
 		return false
 	}
 
-	var rediscoveredBlocks []*localBlock
+	var rediscoveredBlocks []*LocalBlock
 
 	for _, id := range ids {
-
 		// Ignore blocks that have a matching wal. The wal will be replayed and the local block recreated.
 		// NOTE - Wal replay must be done beforehand.
 		if hasWal(id) {
@@ -542,16 +605,16 @@ func (i *instance) rediscoverLocalBlocks(ctx context.Context) ([]*localBlock, er
 		// If meta missing then block was not successfully written.
 		meta, err := i.localReader.BlockMeta(ctx, id, i.instanceID)
 		if err != nil {
-			if err == backend.ErrDoesNotExist {
+			if errors.Is(err, backend.ErrDoesNotExist) {
 				// Partial/incomplete block found, remove, it will be recreated from data in the wal.
-				level.Warn(log.Logger).Log("msg", "Unable to reload meta for local block. This indicates an incomplete block and will be deleted", "tenant", i.instanceID, "block", id.String())
+				level.Warn(i.logger).Log("msg", "Unable to reload meta for local block. This indicates an incomplete block and will be deleted", "block", id.String())
 				err = i.local.ClearBlock(id, i.instanceID)
 				if err != nil {
-					return nil, errors.Wrapf(err, "deleting bad local block tenant %v block %v", i.instanceID, id.String())
+					return nil, fmt.Errorf("deleting bad local block tenant %v block %v: %w", i.instanceID, id.String(), err)
 				}
 			} else {
 				// Block with unknown error
-				level.Error(log.Logger).Log("msg", "Unexpected error reloading meta for local block. Ignoring and continuing. This block should be investigated.", "tenant", i.instanceID, "block", id.String(), "error", err)
+				level.Error(i.logger).Log("msg", "Unexpected error reloading meta for local block. Ignoring and continuing. This block should be investigated.", "block", id.String(), "error", err)
 				metricReplayErrorsTotal.WithLabelValues(i.instanceID).Inc()
 			}
 
@@ -563,10 +626,25 @@ func (i *instance) rediscoverLocalBlocks(ctx context.Context) ([]*localBlock, er
 			return nil, err
 		}
 
-		ib := newLocalBlock(ctx, b, i.local)
+		// validate the block before adding it to the list. if we drop a block here and its not in the wal this is data loss, but there is no way to recover. this is likely due to disk
+		// level corruption
+		err = b.Validate(ctx)
+		if err != nil && !errors.Is(err, common.ErrUnsupported) {
+			level.Error(i.logger).Log("msg", "local block failed validation, dropping", "block", id.String(), "error", err)
+			metricReplayErrorsTotal.WithLabelValues(i.instanceID).Inc()
+
+			err = i.local.ClearBlock(id, i.instanceID)
+			if err != nil {
+				return nil, fmt.Errorf("deleting invalid local block tenant %v block %v: %w", i.instanceID, id.String(), err)
+			}
+
+			continue
+		}
+
+		ib := NewLocalBlock(ctx, b, i.local)
 		rediscoveredBlocks = append(rediscoveredBlocks, ib)
 
-		level.Info(log.Logger).Log("msg", "reloaded local block", "tenantID", i.instanceID, "block", id.String(), "flushed", ib.FlushedTime())
+		level.Info(i.logger).Log("msg", "reloaded local block", "block", id.String(), "flushed", ib.FlushedTime())
 	}
 
 	i.blocksMtx.Lock()

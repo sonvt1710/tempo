@@ -2,14 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
 	"github.com/google/uuid"
+	"github.com/parquet-go/parquet-go"
 
 	pq "github.com/grafana/tempo/pkg/parquetquery"
-	"github.com/grafana/tempo/tempodb/encoding/vparquet"
-	"github.com/segmentio/parquet-go"
+	"github.com/grafana/tempo/tempodb/encoding/vparquet3"
 )
 
 type listColumnCmd struct {
@@ -31,8 +32,8 @@ func (cmd *listColumnCmd) Run(ctx *globalOptions) error {
 		return err
 	}
 
-	rr := vparquet.NewBackendReaderAt(context.Background(), r, vparquet.DataFileName, meta.BlockID, meta.TenantID)
-	pf, err := parquet.OpenFile(rr, int64(meta.Size))
+	rr := vparquet3.NewBackendReaderAt(context.Background(), r, vparquet3.DataFileName, meta)
+	pf, err := parquet.OpenFile(rr, int64(meta.Size_))
 	if err != nil {
 		return err
 	}
@@ -47,14 +48,18 @@ func (cmd *listColumnCmd) Run(ctx *globalOptions) error {
 		fmt.Printf("\n***************       rowgroup %d      ********************\n\n\n", i)
 
 		pages := cc.Pages()
-		numPages := cc.ColumnIndex().NumPages()
-		fmt.Println("Min Value of rowgroup", cc.ColumnIndex().MinValue(0).Bytes())
-		fmt.Println("Max Value of rowgroup", cc.ColumnIndex().MaxValue(numPages-1).Bytes())
+		idx, err := cc.ColumnIndex()
+		if err != nil {
+			return err
+		}
+		numPages := idx.NumPages()
+		fmt.Println("Min Value of rowgroup", idx.MinValue(0).Bytes())
+		fmt.Println("Max Value of rowgroup", idx.MaxValue(numPages-1).Bytes())
 
 		buffer := make([]parquet.Value, 10000)
 		for {
 			pg, err := pages.ReadPage()
-			if pg == nil || err == io.EOF {
+			if pg == nil || errors.Is(err, io.EOF) {
 				break
 			}
 
@@ -66,7 +71,7 @@ func (cmd *listColumnCmd) Run(ctx *globalOptions) error {
 				}
 
 				// check for EOF after processing any returned data
-				if err == io.EOF {
+				if errors.Is(err, io.EOF) {
 					break
 				}
 				// todo: better error handling

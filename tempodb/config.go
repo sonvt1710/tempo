@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/grafana/tempo/modules/cache/memcached"
+	"github.com/grafana/tempo/modules/cache/redis"
+
 	"github.com/grafana/tempo/pkg/cache"
 	"github.com/grafana/tempo/tempodb/backend/azure"
-	"github.com/grafana/tempo/tempodb/backend/cache/memcached"
-	"github.com/grafana/tempo/tempodb/backend/cache/redis"
+	backend_cache "github.com/grafana/tempo/tempodb/backend/cache"
 	"github.com/grafana/tempo/tempodb/backend/gcs"
 	"github.com/grafana/tempo/tempodb/backend/local"
 	"github.com/grafana/tempo/tempodb/backend/s3"
@@ -20,11 +22,16 @@ import (
 )
 
 const (
-	DefaultBlocklistPoll            = 5 * time.Minute
-	DefaultMaxTimePerTenant         = 5 * time.Minute
-	DefaultBlocklistPollConcurrency = uint(50)
-	DefaultRetentionConcurrency     = uint(10)
-	DefaultTenantIndexBuilders      = 2
+	DefaultBlocklistPoll                  = 5 * time.Minute
+	DefaultMaxTimePerTenant               = 5 * time.Minute
+	DefaultBlocklistPollConcurrency       = uint(50)
+	DefaultBlocklistPollTenantConcurrency = uint(1)
+	DefaultRetentionConcurrency           = uint(10)
+	DefaultTenantIndexBuilders            = 2
+	DefaultTolerateConsecutiveErrors      = 1
+	DefaultTolerateTenantFailures         = 1
+
+	DefaultEmptyTenantDeletionAge = 12 * time.Hour
 
 	DefaultPrefetchTraceCount   = 1000
 	DefaultSearchChunkSizeBytes = 1_000_000
@@ -40,12 +47,18 @@ type Config struct {
 	Block  *common.BlockConfig `yaml:"block"`
 	Search *SearchConfig       `yaml:"search"`
 
-	BlocklistPoll                    time.Duration `yaml:"blocklist_poll"`
-	BlocklistPollConcurrency         uint          `yaml:"blocklist_poll_concurrency"`
-	BlocklistPollFallback            bool          `yaml:"blocklist_poll_fallback"`
-	BlocklistPollTenantIndexBuilders int           `yaml:"blocklist_poll_tenant_index_builders"`
-	BlocklistPollStaleTenantIndex    time.Duration `yaml:"blocklist_poll_stale_tenant_index"`
-	BlocklistPollJitterMs            int           `yaml:"blocklist_poll_jitter_ms"`
+	BlocklistPoll                          time.Duration `yaml:"blocklist_poll"`
+	BlocklistPollConcurrency               uint          `yaml:"blocklist_poll_concurrency"`
+	BlocklistPollTenantConcurrency         uint          `yaml:"blocklist_poll_tenant_concurrency"`
+	BlocklistPollFallback                  bool          `yaml:"blocklist_poll_fallback"`
+	BlocklistPollTenantIndexBuilders       int           `yaml:"blocklist_poll_tenant_index_builders"`
+	BlocklistPollStaleTenantIndex          time.Duration `yaml:"blocklist_poll_stale_tenant_index"`
+	BlocklistPollJitterMs                  int           `yaml:"blocklist_poll_jitter_ms"`
+	BlocklistPollTolerateConsecutiveErrors int           `yaml:"blocklist_poll_tolerate_consecutive_errors"`
+	BlocklistPollTolerateTenantFailures    int           `yaml:"blocklist_poll_tolerate_tenant_failures"`
+
+	EmptyTenantDeletionEnabled bool          `yaml:"empty_tenant_deletion_enabled"`
+	EmptyTenantDeletionAge     time.Duration `yaml:"empty_tenant_deletion_age"`
 
 	// backends
 	Backend string        `yaml:"backend"`
@@ -54,13 +67,20 @@ type Config struct {
 	S3      *s3.Config    `yaml:"s3"`
 	Azure   *azure.Config `yaml:"azure"`
 
-	// caches
-	Cache                   string                  `yaml:"cache"`
-	CacheMinCompactionLevel uint8                   `yaml:"cache_min_compaction_level"`
-	CacheMaxBlockAge        time.Duration           `yaml:"cache_max_block_age"`
-	BackgroundCache         *cache.BackgroundConfig `yaml:"background_cache"`
-	Memcached               *memcached.Config       `yaml:"memcached"`
-	Redis                   *redis.Config           `yaml:"redis"`
+	// legacy cache config. this is loaded by tempodb and added to the cache
+	// provider on construction
+	Cache           string                  `yaml:"cache"`
+	BackgroundCache *cache.BackgroundConfig `yaml:"background_cache"`
+	Memcached       *memcached.Config       `yaml:"memcached"`
+	Redis           *redis.Config           `yaml:"redis"`
+
+	BloomCacheCfg backend_cache.BloomConfig `yaml:",inline"`
+}
+
+type CacheControlConfig struct {
+	Footer      bool `yaml:"footer"`
+	ColumnIndex bool `yaml:"column_index"`
+	OffsetIndex bool `yaml:"offset_index"`
 }
 
 type SearchConfig struct {
@@ -71,14 +91,11 @@ type SearchConfig struct {
 	// vParquet blocks
 	ReadBufferCount     int `yaml:"read_buffer_count"`
 	ReadBufferSizeBytes int `yaml:"read_buffer_size_bytes"`
-	CacheControl        struct {
-		Footer      bool `yaml:"footer"`
-		ColumnIndex bool `yaml:"column_index"`
-		OffsetIndex bool `yaml:"offset_index"`
-	} `yaml:"cache_control"`
+	// todo: consolidate caching config in one spot
+	CacheControl CacheControlConfig `yaml:"cache_control"`
 }
 
-func (c *SearchConfig) RegisterFlagsAndApplyDefaults(_ string, f *flag.FlagSet) {
+func (c *SearchConfig) RegisterFlagsAndApplyDefaults(string, *flag.FlagSet) {
 	c.ChunkSizeBytes = DefaultSearchChunkSizeBytes
 	c.PrefetchTraceCount = DefaultPrefetchTraceCount
 	c.ReadBufferCount = DefaultReadBufferCount
@@ -103,10 +120,6 @@ func (c SearchConfig) ApplyToOptions(o *common.SearchOptions) {
 	if o.ReadBufferCount <= 0 {
 		o.ReadBufferCount = DefaultReadBufferCount
 	}
-
-	o.CacheControl.Footer = c.CacheControl.Footer
-	o.CacheControl.ColumnIndex = c.CacheControl.ColumnIndex
-	o.CacheControl.OffsetIndex = c.CacheControl.OffsetIndex
 }
 
 // CompactorConfig contains compaction configuration options
@@ -150,7 +163,7 @@ func validateConfig(cfg *Config) error {
 		cfg.WAL.Version = cfg.Block.Version
 	}
 
-	err := wal.ValidateConfig(cfg.WAL)
+	err := cfg.WAL.Validate()
 	if err != nil {
 		return fmt.Errorf("wal config validation failed: %w", err)
 	}

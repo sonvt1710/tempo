@@ -30,15 +30,20 @@ func Test_generateTenantRemoteWriteConfigs(t *testing.T) {
 		},
 	}
 
-	result := generateTenantRemoteWriteConfigs(original, "my-tenant", logger)
+	addOrgIDHeader := true
 
+	result := generateTenantRemoteWriteConfigs(original, "my-tenant", nil, addOrgIDHeader, logger, false)
+
+	// First case doesn't have a header, gets set.
 	assert.Equal(t, original[0].URL, result[0].URL)
 	assert.Equal(t, map[string]string{}, original[0].Headers, "Original headers have been modified")
 	assert.Equal(t, map[string]string{"X-Scope-OrgID": "my-tenant"}, result[0].Headers)
 
+	// Second case already contains header, not overwritten
+	// Also checks case-insensitivity
 	assert.Equal(t, original[1].URL, result[1].URL)
 	assert.Equal(t, map[string]string{"foo": "bar", "x-scope-orgid": "fake-tenant"}, original[1].Headers, "Original headers have been modified")
-	assert.Equal(t, map[string]string{"foo": "bar", "X-Scope-OrgID": "my-tenant"}, result[1].Headers)
+	assert.Equal(t, map[string]string{"foo": "bar", "x-scope-orgid": "fake-tenant"}, result[1].Headers, "Existing header was incorrectly overwritten")
 }
 
 func Test_generateTenantRemoteWriteConfigs_singleTenant(t *testing.T) {
@@ -57,7 +62,9 @@ func Test_generateTenantRemoteWriteConfigs_singleTenant(t *testing.T) {
 		},
 	}
 
-	result := generateTenantRemoteWriteConfigs(original, util.FakeTenantID, logger)
+	addOrgIDHeader := true
+
+	result := generateTenantRemoteWriteConfigs(original, util.FakeTenantID, nil, addOrgIDHeader, logger, false)
 
 	assert.Equal(t, original[0].URL, result[0].URL)
 
@@ -70,6 +77,51 @@ func Test_generateTenantRemoteWriteConfigs_singleTenant(t *testing.T) {
 	assert.Equal(t, map[string]string{"x-scope-orgid": "my-custom-tenant-id"}, original[1].Headers, "Original headers have been modified")
 	// X-Scope-OrgID has not been modified
 	assert.Equal(t, map[string]string{"x-scope-orgid": "my-custom-tenant-id"}, result[1].Headers)
+}
+
+func Test_generateTenantRemoteWriteConfigs_addOrgIDHeader(t *testing.T) {
+	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stdout))
+
+	original := []prometheus_config.RemoteWriteConfig{
+		{
+			URL:     &prometheus_common_config.URL{URL: urlMustParse("http://prometheus-1/api/prom/push")},
+			Headers: map[string]string{},
+		},
+		{
+			URL: &prometheus_common_config.URL{URL: urlMustParse("http://prometheus-2/api/prom/push")},
+			Headers: map[string]string{
+				"foo":           "bar",
+				"x-scope-orgid": "fake-tenant",
+			},
+		},
+	}
+
+	addOrgIDHeader := false
+
+	result := generateTenantRemoteWriteConfigs(original, "my-tenant", nil, addOrgIDHeader, logger, false)
+
+	assert.Equal(t, original[0].URL, result[0].URL)
+	assert.Empty(t, original[0].Headers, "X-Scope-OrgID header is not added")
+
+	assert.Equal(t, original[1].URL, result[1].URL)
+	assert.Equal(t, map[string]string{"foo": "bar", "x-scope-orgid": "fake-tenant"}, result[1].Headers, "Original headers not modified")
+}
+
+func Test_generateTenantRemoteWriteConfigs_sendNativeHistograms(t *testing.T) {
+	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stdout))
+
+	original := []prometheus_config.RemoteWriteConfig{
+		{
+			URL:     &prometheus_common_config.URL{URL: urlMustParse("http://prometheus-1/api/prom/push")},
+			Headers: map[string]string{},
+		},
+	}
+
+	result := generateTenantRemoteWriteConfigs(original, "my-tenant", nil, false, logger, true)
+	assert.Equal(t, true, result[0].SendNativeHistograms, "SendNativeHistograms should be true")
+
+	result = generateTenantRemoteWriteConfigs(original, "my-tenant", nil, false, logger, false)
+	assert.Equal(t, false, result[0].SendNativeHistograms, "SendNativeHistograms should be true")
 }
 
 func Test_copyMap(t *testing.T) {

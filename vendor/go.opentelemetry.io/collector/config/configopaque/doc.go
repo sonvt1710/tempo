@@ -1,21 +1,21 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-// Package configopaque implements String type alias to mask sensitive information.
+// Package configopaque implements a String type alias to mask sensitive information.
 // Use configopaque.String on the type of sensitive fields, to mask the
 // opaque string as `[REDACTED]`.
 //
-// This ensure that no sensitive information is leaked when printing the
+// This ensures that no sensitive information is leaked in logs or when printing the
 // full Collector configurations.
+//
+// The only way to view the value stored in a configopaque.String is to first convert
+// it to a string by casting with the builtin `string` function.
+//
+// To achieve this, configopaque.String implements standard library interfaces
+// like fmt.Stringer, encoding.TextMarshaler and others to ensure that the
+// underlying value is masked when printed or serialized.
+//
+// If new interfaces that would leak opaque values are added to the standard library
+// or become widely used in the Go ecosystem, these will eventually be implemented
+// by configopaque.String as well. This is not considered a breaking change.
 package configopaque // import "go.opentelemetry.io/collector/config/configopaque"

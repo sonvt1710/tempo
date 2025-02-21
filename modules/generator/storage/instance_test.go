@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/grafana/dskit/test"
+	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
 	prometheus_common_config "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
@@ -22,8 +24,9 @@ import (
 	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/weaveworks/common/user"
 	"go.uber.org/atomic"
+
+	"github.com/grafana/tempo/modules/overrides"
 )
 
 // Verify basic functionality like sending metrics and exemplars, buffering and retrying failed
@@ -40,7 +43,7 @@ func TestInstance(t *testing.T) {
 	cfg.Path = t.TempDir()
 	cfg.RemoteWrite = mockServer.remoteWriteConfig()
 
-	instance, err := New(&cfg, "test-tenant", prometheus.DefaultRegisterer, logger)
+	instance, err := New(&cfg, &mockOverrides{}, "test-tenant", &noopRegisterer{}, logger)
 	require.NoError(t, err)
 
 	// Refuse requests - the WAL should buffer data until requests succeed
@@ -72,18 +75,18 @@ func TestInstance(t *testing.T) {
 	})
 
 	// Wait until remote.Storage has tried at least once to send data
-	err = waitUntil(10*time.Second, func() bool {
+	test.Poll(t, 30*time.Second, true, func() interface{} {
 		mockServer.mtx.Lock()
 		defer mockServer.mtx.Unlock()
 
 		return mockServer.refusedRequests > 0
 	})
-	require.NoError(t, err, "timed out while waiting for refused requests")
 
 	// Allow requests
 	mockServer.refuseRequests.Store(false)
 
 	// Shutdown the instance - even though previous requests failed, remote.Storage should flush pending data
+	cancel()
 	err = instance.Close()
 	assert.NoError(t, err)
 
@@ -115,7 +118,7 @@ func TestInstance_multiTenancy(t *testing.T) {
 	var instances []Storage
 
 	for i := 0; i < 3; i++ {
-		instance, err := New(&cfg, strconv.Itoa(i), prometheus.DefaultRegisterer, logger)
+		instance, err := New(&cfg, &mockOverrides{}, strconv.Itoa(i), &noopRegisterer{}, logger)
 		assert.NoError(t, err)
 		instances = append(instances, instance)
 	}
@@ -142,7 +145,7 @@ func TestInstance_multiTenancy(t *testing.T) {
 	})
 
 	// Wait until every tenant received at least one request
-	err = waitUntil(10*time.Second, func() bool {
+	test.Poll(t, 45*time.Second, true, func() interface{} {
 		mockServer.mtx.Lock()
 		defer mockServer.mtx.Unlock()
 
@@ -153,8 +156,8 @@ func TestInstance_multiTenancy(t *testing.T) {
 		}
 		return true
 	})
-	require.NoError(t, err, "timed out while waiting for accepted requests")
 
+	cancel()
 	for _, instance := range instances {
 		// Shutdown the instance - remote write should flush pending data
 		err = instance.Close()
@@ -183,10 +186,83 @@ func TestInstance_cantWriteToWAL(t *testing.T) {
 	cfg.Path = "/root"
 
 	// We should be able to attempt to create the instance multiple times
-	_, err := New(&cfg, "test-tenant", prometheus.DefaultRegisterer, log.NewNopLogger())
+	_, err := New(&cfg, &mockOverrides{}, "test-tenant", &noopRegisterer{}, log.NewNopLogger())
 	require.Error(t, err)
-	_, err = New(&cfg, "test-tenant", prometheus.DefaultRegisterer, log.NewNopLogger())
+	_, err = New(&cfg, &mockOverrides{}, "test-tenant", &noopRegisterer{}, log.NewNopLogger())
 	require.Error(t, err)
+}
+
+func TestInstance_remoteWriteHeaders(t *testing.T) {
+	var err error
+	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stdout))
+
+	mockServer := newMockPrometheusRemoteWriterServer(logger)
+	defer mockServer.close()
+
+	var cfg Config
+	cfg.RegisterFlagsAndApplyDefaults("", nil)
+	cfg.Path = t.TempDir()
+	cfg.RemoteWrite = mockServer.remoteWriteConfig()
+
+	headers := map[string]string{user.OrgIDHeaderName: "my-other-tenant"}
+
+	instance, err := New(&cfg, &mockOverrides{headers, overrides.HistogramMethodClassic}, "test-tenant", &noopRegisterer{}, logger)
+	require.NoError(t, err)
+
+	// Refuse requests - the WAL should buffer data until requests succeed
+	mockServer.refuseRequests.Store(true)
+
+	sendCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Append some data every second
+	go poll(sendCtx, time.Second, func() {
+		appender := instance.Appender(context.Background())
+
+		lbls := labels.FromMap(map[string]string{"__name__": "my-metrics"})
+		ref, err := appender.Append(0, lbls, time.Now().UnixMilli(), 1.0)
+		assert.NoError(t, err)
+
+		_, err = appender.AppendExemplar(ref, lbls, exemplar.Exemplar{
+			Labels: labels.FromMap(map[string]string{"traceID": "123"}),
+			Value:  1.2,
+		})
+		assert.NoError(t, err)
+
+		if sendCtx.Err() != nil {
+			return
+		}
+
+		err = appender.Commit()
+		assert.NoError(t, err)
+	})
+
+	// Wait until remote.Storage has tried at least once to send data
+	test.Poll(t, 30*time.Second, true, func() interface{} {
+		mockServer.mtx.Lock()
+		defer mockServer.mtx.Unlock()
+
+		return mockServer.refusedRequests > 0
+	})
+
+	// Allow requests
+	mockServer.refuseRequests.Store(false)
+
+	// Shutdown the instance - even though previous requests failed, remote.Storage should flush pending data
+	cancel()
+	err = instance.Close()
+	assert.NoError(t, err)
+
+	// WAL should be empty again
+	entries, err := os.ReadDir(cfg.Path)
+	assert.NoError(t, err)
+	assert.Len(t, entries, 0)
+
+	// Verify we received metrics
+	assert.Len(t, mockServer.timeSeries, 1)
+	assert.Contains(t, mockServer.timeSeries, "my-other-tenant")
+	// We should have received at least 2 time series: one for the sample and one for the examplar
+	assert.GreaterOrEqual(t, len(mockServer.timeSeries["my-other-tenant"]), 2)
 }
 
 type mockPrometheusRemoteWriteServer struct {
@@ -259,6 +335,7 @@ func (m *mockPrometheusRemoteWriteServer) close() {
 // poll executes f every interval until ctx is done or cancelled.
 func poll(ctx context.Context, interval time.Duration, f func()) {
 	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -270,18 +347,27 @@ func poll(ctx context.Context, interval time.Duration, f func()) {
 	}
 }
 
-// waitUntil executes f until it returns true or timeout is reached.
-func waitUntil(timeout time.Duration, f func() bool) error {
-	start := time.Now()
+var _ Overrides = (*mockOverrides)(nil)
 
-	for {
-		if f() {
-			return nil
-		}
-		if time.Since(start) > timeout {
-			return fmt.Errorf("timed out while waiting for condition")
-		}
-
-		time.Sleep(50 * time.Millisecond)
-	}
+type mockOverrides struct {
+	headers          map[string]string
+	nativeHistograms overrides.HistogramMethod
 }
+
+func (m *mockOverrides) MetricsGeneratorRemoteWriteHeaders(string) map[string]string {
+	return m.headers
+}
+
+func (m *mockOverrides) MetricsGeneratorGenerateNativeHistograms(string) overrides.HistogramMethod {
+	return m.nativeHistograms
+}
+
+var _ prometheus.Registerer = (*noopRegisterer)(nil)
+
+type noopRegisterer struct{}
+
+func (n *noopRegisterer) Register(prometheus.Collector) error { return nil }
+
+func (n *noopRegisterer) MustRegister(...prometheus.Collector) {}
+
+func (n *noopRegisterer) Unregister(prometheus.Collector) bool { return true }

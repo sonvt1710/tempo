@@ -13,12 +13,12 @@ spec:
       name: query-frontend
   strategy:
     rollingUpdate:
-      maxSurge: 3
+      maxSurge: 0
       maxUnavailable: 1
   template:
     metadata:
       annotations:
-        config_hash: b9f7e4635447322231244804b290b00f
+        config_hash: 46188d18f0d8adfa8586e9dbeb744db2
       labels:
         app: query-frontend
         name: query-frontend
@@ -52,25 +52,7 @@ spec:
           name: tempo-conf
         - mountPath: /overrides
           name: overrides
-      - args:
-        - --query.base-path=/tempo
-        - --grpc-storage-plugin.configuration-file=/conf/tempo-query.yaml
-        - --query.bearer-token-propagation=true
-        image: grafana/tempo-query:latest
-        imagePullPolicy: IfNotPresent
-        name: tempo-query
-        ports:
-        - containerPort: 16686
-          name: jaeger-ui
-        - containerPort: 16687
-          name: jaeger-metrics
-        volumeMounts:
-        - mountPath: /conf
-          name: tempo-query-conf
       volumes:
-      - configMap:
-          name: tempo-query
-        name: tempo-query-conf
       - configMap:
           name: tempo-query-frontend
         name: tempo-conf

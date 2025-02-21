@@ -75,31 +75,25 @@
      "steppedLine": false,
      "targets": [
       {
-       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"cortex-gw(-internal)?\"}[$__interval]))",
+       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"cortex-gw(-internal)?\"}[$__rate_interval]))",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{pod}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(container_spec_cpu_quota{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"cortex-gw(-internal)?\"} / container_spec_cpu_period{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"cortex-gw(-internal)?\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "limit",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"cortex-gw(-internal)?\", resource=\"cpu\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "request",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -192,28 +186,22 @@
        "expr": "sum by(pod) (container_memory_working_set_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"cortex-gw(-internal)?\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{pod}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(container_spec_memory_limit_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"cortex-gw(-internal)?\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "limit",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"cortex-gw(-internal)?\", resource=\"memory\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "request",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -297,10 +285,8 @@
        "expr": "sum by(instance) (go_memstats_heap_inuse_bytes{cluster=~\"$cluster\", job=~\"($namespace)/cortex-gw(-internal)?\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{instance}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -402,31 +388,25 @@
      "steppedLine": false,
      "targets": [
       {
-       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"distributor\"}[$__interval]))",
+       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"distributor\"}[$__rate_interval]))",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{pod}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(container_spec_cpu_quota{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"distributor\"} / container_spec_cpu_period{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"distributor\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "limit",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"distributor\", resource=\"cpu\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "request",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -519,28 +499,22 @@
        "expr": "sum by(pod) (container_memory_working_set_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"distributor\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{pod}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(container_spec_memory_limit_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"distributor\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "limit",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"distributor\", resource=\"memory\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "request",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -624,10 +598,8 @@
        "expr": "sum by(instance) (go_memstats_heap_inuse_bytes{cluster=~\"$cluster\", job=~\"($namespace)/distributor\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{instance}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -729,31 +701,25 @@
      "steppedLine": false,
      "targets": [
       {
-       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"ingester\"}[$__interval]))",
+       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"ingester\"}[$__rate_interval]))",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{pod}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(container_spec_cpu_quota{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"ingester\"} / container_spec_cpu_period{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"ingester\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "limit",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"ingester\", resource=\"cpu\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "request",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -846,28 +812,22 @@
        "expr": "sum by(pod) (container_memory_working_set_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"ingester\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{pod}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(container_spec_memory_limit_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"ingester\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "limit",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"ingester\", resource=\"memory\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "request",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -951,10 +911,8 @@
        "expr": "sum by(instance) (go_memstats_heap_inuse_bytes{cluster=~\"$cluster\", job=~\"($namespace)/ingester\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{instance}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -1056,31 +1014,25 @@
      "steppedLine": false,
      "targets": [
       {
-       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"metrics-generator\"}[$__interval]))",
+       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"metrics-generator\"}[$__rate_interval]))",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{pod}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(container_spec_cpu_quota{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"metrics-generator\"} / container_spec_cpu_period{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"metrics-generator\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "limit",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"metrics-generator\", resource=\"cpu\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "request",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -1173,28 +1125,22 @@
        "expr": "sum by(pod) (container_memory_working_set_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"metrics-generator\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{pod}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(container_spec_memory_limit_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"metrics-generator\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "limit",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"metrics-generator\", resource=\"memory\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "request",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -1278,10 +1224,8 @@
        "expr": "sum by(instance) (go_memstats_heap_inuse_bytes{cluster=~\"$cluster\", job=~\"($namespace)/metrics-generator\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{instance}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -1383,31 +1327,25 @@
      "steppedLine": false,
      "targets": [
       {
-       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"query-frontend\"}[$__interval]))",
+       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"query-frontend\"}[$__rate_interval]))",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{pod}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(container_spec_cpu_quota{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"query-frontend\"} / container_spec_cpu_period{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"query-frontend\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "limit",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"query-frontend\", resource=\"cpu\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "request",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -1500,28 +1438,22 @@
        "expr": "sum by(pod) (container_memory_working_set_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"query-frontend\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{pod}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(container_spec_memory_limit_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"query-frontend\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "limit",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"query-frontend\", resource=\"memory\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "request",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -1605,10 +1537,8 @@
        "expr": "sum by(instance) (go_memstats_heap_inuse_bytes{cluster=~\"$cluster\", job=~\"($namespace)/query-frontend\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{instance}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -1710,31 +1640,25 @@
      "steppedLine": false,
      "targets": [
       {
-       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"querier\"}[$__interval]))",
+       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"querier\"}[$__rate_interval]))",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{pod}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(container_spec_cpu_quota{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"querier\"} / container_spec_cpu_period{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"querier\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "limit",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"querier\", resource=\"cpu\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "request",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -1827,28 +1751,22 @@
        "expr": "sum by(pod) (container_memory_working_set_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"querier\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{pod}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(container_spec_memory_limit_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"querier\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "limit",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"querier\", resource=\"memory\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "request",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -1932,10 +1850,8 @@
        "expr": "sum by(instance) (go_memstats_heap_inuse_bytes{cluster=~\"$cluster\", job=~\"($namespace)/querier\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{instance}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -2037,31 +1953,25 @@
      "steppedLine": false,
      "targets": [
       {
-       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"compactor\"}[$__interval]))",
+       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"compactor\"}[$__rate_interval]))",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{pod}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(container_spec_cpu_quota{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"compactor\"} / container_spec_cpu_period{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"compactor\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "limit",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"compactor\", resource=\"cpu\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "request",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -2154,28 +2064,22 @@
        "expr": "sum by(pod) (container_memory_working_set_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"compactor\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{pod}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(container_spec_memory_limit_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"compactor\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "limit",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       },
       {
        "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"compactor\", resource=\"memory\"} > 0)",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "request",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -2259,10 +2163,8 @@
        "expr": "sum by(instance) (go_memstats_heap_inuse_bytes{cluster=~\"$cluster\", job=~\"($namespace)/compactor\"})",
        "format": "time_series",
        "interval": "1m",
-       "intervalFactor": 2,
        "legendFormat": "{{instance}}",
-       "legendLink": null,
-       "step": 10
+       "legendLink": null
       }
      ],
      "thresholds": [
@@ -2312,6 +2214,319 @@
    "showTitle": true,
    "title": "Compactor",
    "titleSize": "h6"
+  },
+  {
+   "collapse": false,
+   "height": "250px",
+   "panels": [
+    {
+     "aliasColors": {
+
+     },
+     "bars": false,
+     "dashLength": 10,
+     "dashes": false,
+     "datasource": "$datasource",
+     "fill": 1,
+     "id": 22,
+     "legend": {
+      "avg": false,
+      "current": false,
+      "max": false,
+      "min": false,
+      "show": true,
+      "total": false,
+      "values": false
+     },
+     "lines": true,
+     "linewidth": 1,
+     "links": [
+
+     ],
+     "nullPointMode": "null as zero",
+     "percentage": false,
+     "pointradius": 5,
+     "points": false,
+     "renderer": "flot",
+     "seriesOverrides": [
+      {
+       "alias": "limit",
+       "color": "#E02F44",
+       "fill": 0
+      },
+      {
+       "alias": "request",
+       "color": "#FCE300",
+       "fill": 0
+      }
+     ],
+     "spaceLength": 10,
+     "span": 4,
+     "stack": false,
+     "steppedLine": false,
+     "targets": [
+      {
+       "expr": "sum by(pod) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"block-builder\"}[$__rate_interval]))",
+       "format": "time_series",
+       "interval": "1m",
+       "legendFormat": "{{pod}}",
+       "legendLink": null
+      },
+      {
+       "expr": "min(container_spec_cpu_quota{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"block-builder\"} / container_spec_cpu_period{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"block-builder\"})",
+       "format": "time_series",
+       "interval": "1m",
+       "legendFormat": "limit",
+       "legendLink": null
+      },
+      {
+       "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"block-builder\", resource=\"cpu\"} > 0)",
+       "format": "time_series",
+       "interval": "1m",
+       "legendFormat": "request",
+       "legendLink": null
+      }
+     ],
+     "thresholds": [
+
+     ],
+     "timeFrom": null,
+     "timeShift": null,
+     "title": "CPU",
+     "tooltip": {
+      "shared": true,
+      "sort": 2,
+      "value_type": "individual"
+     },
+     "type": "graph",
+     "xaxis": {
+      "buckets": null,
+      "mode": "time",
+      "name": null,
+      "show": true,
+      "values": [
+
+      ]
+     },
+     "yaxes": [
+      {
+       "format": "short",
+       "label": null,
+       "logBase": 1,
+       "max": null,
+       "min": 0,
+       "show": true
+      },
+      {
+       "format": "short",
+       "label": null,
+       "logBase": 1,
+       "max": null,
+       "min": null,
+       "show": false
+      }
+     ]
+    },
+    {
+     "aliasColors": {
+
+     },
+     "bars": false,
+     "dashLength": 10,
+     "dashes": false,
+     "datasource": "$datasource",
+     "fill": 1,
+     "id": 23,
+     "legend": {
+      "avg": false,
+      "current": false,
+      "max": false,
+      "min": false,
+      "show": true,
+      "total": false,
+      "values": false
+     },
+     "lines": true,
+     "linewidth": 1,
+     "links": [
+
+     ],
+     "nullPointMode": "null as zero",
+     "percentage": false,
+     "pointradius": 5,
+     "points": false,
+     "renderer": "flot",
+     "seriesOverrides": [
+      {
+       "alias": "limit",
+       "color": "#E02F44",
+       "fill": 0
+      },
+      {
+       "alias": "request",
+       "color": "#FCE300",
+       "fill": 0
+      }
+     ],
+     "spaceLength": 10,
+     "span": 4,
+     "stack": false,
+     "steppedLine": false,
+     "targets": [
+      {
+       "expr": "sum by(pod) (container_memory_working_set_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"block-builder\"})",
+       "format": "time_series",
+       "interval": "1m",
+       "legendFormat": "{{pod}}",
+       "legendLink": null
+      },
+      {
+       "expr": "min(container_spec_memory_limit_bytes{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"block-builder\"} > 0)",
+       "format": "time_series",
+       "interval": "1m",
+       "legendFormat": "limit",
+       "legendLink": null
+      },
+      {
+       "expr": "min(kube_pod_container_resource_requests{cluster=~\"$cluster\", namespace=~\"$namespace\",container=~\"block-builder\", resource=\"memory\"} > 0)",
+       "format": "time_series",
+       "interval": "1m",
+       "legendFormat": "request",
+       "legendLink": null
+      }
+     ],
+     "thresholds": [
+
+     ],
+     "timeFrom": null,
+     "timeShift": null,
+     "title": "Memory (workingset)",
+     "tooltip": {
+      "shared": true,
+      "sort": 2,
+      "value_type": "individual"
+     },
+     "type": "graph",
+     "xaxis": {
+      "buckets": null,
+      "mode": "time",
+      "name": null,
+      "show": true,
+      "values": [
+
+      ]
+     },
+     "yaxes": [
+      {
+       "format": "bytes",
+       "label": null,
+       "logBase": 1,
+       "max": null,
+       "min": 0,
+       "show": true
+      },
+      {
+       "format": "short",
+       "label": null,
+       "logBase": 1,
+       "max": null,
+       "min": null,
+       "show": false
+      }
+     ]
+    },
+    {
+     "aliasColors": {
+
+     },
+     "bars": false,
+     "dashLength": 10,
+     "dashes": false,
+     "datasource": "$datasource",
+     "fill": 1,
+     "id": 24,
+     "legend": {
+      "avg": false,
+      "current": false,
+      "max": false,
+      "min": false,
+      "show": true,
+      "total": false,
+      "values": false
+     },
+     "lines": true,
+     "linewidth": 1,
+     "links": [
+
+     ],
+     "nullPointMode": "null as zero",
+     "percentage": false,
+     "pointradius": 5,
+     "points": false,
+     "renderer": "flot",
+     "seriesOverrides": [
+
+     ],
+     "spaceLength": 10,
+     "span": 4,
+     "stack": false,
+     "steppedLine": false,
+     "targets": [
+      {
+       "expr": "sum by(instance) (go_memstats_heap_inuse_bytes{cluster=~\"$cluster\", job=~\"($namespace)/block-builder\"})",
+       "format": "time_series",
+       "interval": "1m",
+       "legendFormat": "{{instance}}",
+       "legendLink": null
+      }
+     ],
+     "thresholds": [
+
+     ],
+     "timeFrom": null,
+     "timeShift": null,
+     "title": "Memory (go heap inuse)",
+     "tooltip": {
+      "shared": true,
+      "sort": 2,
+      "value_type": "individual"
+     },
+     "type": "graph",
+     "xaxis": {
+      "buckets": null,
+      "mode": "time",
+      "name": null,
+      "show": true,
+      "values": [
+
+      ]
+     },
+     "yaxes": [
+      {
+       "format": "bytes",
+       "label": null,
+       "logBase": 1,
+       "max": null,
+       "min": 0,
+       "show": true
+      },
+      {
+       "format": "short",
+       "label": null,
+       "logBase": 1,
+       "max": null,
+       "min": null,
+       "show": false
+      }
+     ]
+    }
+   ],
+   "repeat": null,
+   "repeatIteration": null,
+   "repeatRowId": null,
+   "showTitle": true,
+   "title": "Block builder",
+   "titleSize": "h6"
   }
  ],
  "schemaVersion": 14,
@@ -2327,7 +2542,7 @@
      "value": "default"
     },
     "hide": 0,
-    "label": "Data Source",
+    "label": "Data source",
     "name": "datasource",
     "options": [
 

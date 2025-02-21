@@ -1,16 +1,5 @@
-// Copyright  The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package mapstructure // import "go.opentelemetry.io/collector/confmap/internal/mapstructure"
 
@@ -21,7 +10,8 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/mitchellh/mapstructure"
+	"github.com/go-viper/mapstructure/v2"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -33,9 +23,7 @@ const (
 	optionSkip          = "-"
 )
 
-var (
-	errNonStringEncodedKey = errors.New("non string-encoded key")
-)
+var errNonStringEncodedKey = errors.New("non string-encoded key")
 
 // tagInfo stores the mapstructure tag details.
 type tagInfo struct {
@@ -179,11 +167,18 @@ func (e *Encoder) encodeMap(value reflect.Value) (any, error) {
 		if err != nil {
 			return nil, fmt.Errorf("error encoding key: %w", err)
 		}
-		key, ok := encoded.(string)
-		if !ok {
-			return nil, fmt.Errorf("%w key %q, kind: %v", errNonStringEncodedKey, iterator.Key().Interface(), iterator.Key().Kind())
+
+		v := reflect.ValueOf(encoded)
+		var key string
+
+		switch v.Kind() {
+		case reflect.String:
+			key = v.String()
+		default:
+			return nil, fmt.Errorf("%w, key: %q, kind: %v, type: %T", errNonStringEncodedKey, iterator.Key().Interface(), iterator.Key().Kind(), encoded)
 		}
-		if _, ok = result[key]; ok {
+
+		if _, ok := result[key]; ok {
 			return nil, fmt.Errorf("duplicate key %q while encoding", key)
 		}
 		if result[key], err = e.encode(iterator.Value()); err != nil {
@@ -230,5 +225,37 @@ func TextMarshalerHookFunc() mapstructure.DecodeHookFuncValue {
 			return nil, err
 		}
 		return string(out), nil
+	}
+}
+
+// YamlMarshalerHookFunc returns a DecodeHookFuncValue that checks for structs
+// that have yaml tags but no mapstructure tags. If found, it will convert the struct
+// to map[string]any using the yaml package, which respects the yaml tags. Ultimately,
+// this allows mapstructure to later marshal the map[string]any in a generic way.
+func YamlMarshalerHookFunc() mapstructure.DecodeHookFuncValue {
+	return func(from reflect.Value, _ reflect.Value) (any, error) {
+		if from.Kind() == reflect.Struct {
+			for i := 0; i < from.NumField(); i++ {
+				if _, ok := from.Type().Field(i).Tag.Lookup("mapstructure"); ok {
+					// The struct has at least one mapstructure tag so don't do anything.
+					return from.Interface(), nil
+				}
+
+				if _, ok := from.Type().Field(i).Tag.Lookup("yaml"); ok {
+					// The struct has at least one yaml tag, so convert it to map[string]any using yaml.
+					yamlBytes, err := yaml.Marshal(from.Interface())
+					if err != nil {
+						return nil, err
+					}
+					var m map[string]any
+					err = yaml.Unmarshal(yamlBytes, &m)
+					if err != nil {
+						return nil, err
+					}
+					return m, nil
+				}
+			}
+		}
+		return from.Interface(), nil
 	}
 }

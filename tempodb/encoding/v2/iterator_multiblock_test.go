@@ -2,16 +2,17 @@ package v2
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
-
-	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
+
+	"github.com/grafana/tempo/tempodb/encoding/common"
 )
 
 var testLogger log.Logger = log.NewLogfmtLogger(log.NewSyncWriter(os.Stdout))
@@ -50,7 +51,6 @@ func (i *testIterator) NextBytes(context.Context) (common.ID, []byte, error) {
 func (*testIterator) Close() {}
 
 func TestBookmarkIteration(t *testing.T) {
-
 	recordCount := 100
 	iter := &testIterator{}
 	for i := 0; i < recordCount; i++ {
@@ -62,7 +62,7 @@ func TestBookmarkIteration(t *testing.T) {
 	i := 0
 	for {
 		id, data, err := bm.current(context.Background())
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		require.NoError(t, err)
@@ -92,7 +92,7 @@ func TestMultiblockSorts(t *testing.T) {
 	lastID := -1
 	for {
 		id, _, err := iter.NextBytes(context.TODO())
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		require.NoError(t, err)
@@ -127,7 +127,6 @@ func TestMultiblockIteratorCanBeCancelled(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-
 			inner := &testIterator{}
 			for i := 0; i < recordCount; i++ {
 				inner.Add(make([]byte, i), make([]byte, i), nil)
@@ -162,7 +161,7 @@ func TestMultiblockIteratorCanBeCancelled(t *testing.T) {
 	}
 }
 
-func TestMultiblockIteratorCanBeCancelledMultipleTimes(t *testing.T) {
+func TestMultiblockIteratorCanBeCancelledMultipleTimes(*testing.T) {
 	inner := &testIterator{}
 
 	iter := NewMultiblockIterator(context.TODO(), []BytesIterator{inner}, 1, &mockCombiner{}, "", testLogger)

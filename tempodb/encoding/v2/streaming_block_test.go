@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -13,14 +14,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/google/uuid"
+
 	"github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -112,11 +114,9 @@ func TestStreamingBlockAddObject(t *testing.T) {
 
 	assert.Equal(t, time.Unix(10000, 0), meta.StartTime)
 	assert.Equal(t, time.Unix(25000, 0), meta.EndTime)
-	assert.Equal(t, minID, common.ID(meta.MinID))
-	assert.Equal(t, maxID, common.ID(meta.MaxID))
 	assert.Equal(t, testTenantID, meta.TenantID)
-	assert.Equal(t, numObjects, meta.TotalObjects)
-	assert.Greater(t, meta.Size, uint64(0))
+	assert.Equal(t, int64(numObjects), meta.TotalObjects)
+	assert.Greater(t, meta.Size_, uint64(0))
 	assert.Greater(t, cb.bloom.GetShardCount(), 0)
 
 	// bloom
@@ -164,7 +164,7 @@ func testStreamingBlockToBackendBlock(t *testing.T, cfg *common.BlockConfig) {
 	_, ids, reqs := streamingBlock(t, cfg, w)
 
 	// meta?
-	uuids, err := r.Blocks(context.Background(), testTenantID)
+	uuids, _, err := r.Blocks(context.Background(), testTenantID)
 	require.NoError(t, err, "error listing blocks")
 	require.Len(t, uuids, 1)
 
@@ -187,7 +187,7 @@ func testStreamingBlockToBackendBlock(t *testing.T, cfg *common.BlockConfig) {
 	for i, id := range ids {
 		idsToObjs[util.TokenForTraceID(id)] = reqs[i]
 	}
-	sort.Slice(ids, func(i int, j int) bool { return bytes.Compare(ids[i], ids[j]) == -1 })
+	sort.Slice(ids, func(i, j int) bool { return bytes.Compare(ids[i], ids[j]) == -1 })
 
 	iterator, err := backendBlock.Iterator(50 * 1024)
 	require.NoError(t, err, "error getting iterator")
@@ -244,7 +244,7 @@ func streamingBlock(t *testing.T, cfg *common.BlockConfig, w backend.Writer) (*S
 	originatingMeta.StartTime = time.Now().Add(-5 * time.Minute)
 	originatingMeta.EndTime = time.Now().Add(5 * time.Minute)
 	originatingMeta.DataEncoding = "foo"
-	originatingMeta.TotalObjects = numMsgs
+	originatingMeta.TotalObjects = int64(numMsgs)
 
 	// calc expected records
 	dataReader, err := NewDataReader(backend.NewContextReaderWithAllReader(bytes.NewReader(buffer.Bytes())), backend.EncNone)
@@ -253,7 +253,7 @@ func streamingBlock(t *testing.T, cfg *common.BlockConfig, w backend.Writer) (*S
 		dataReader,
 		NewObjectReaderWriter())
 
-	block, err := NewStreamingBlock(cfg, originatingMeta.BlockID, originatingMeta.TenantID, []*backend.BlockMeta{originatingMeta}, originatingMeta.TotalObjects)
+	block, err := NewStreamingBlock(cfg, (uuid.UUID)(originatingMeta.BlockID), originatingMeta.TenantID, []*backend.BlockMeta{originatingMeta}, int(originatingMeta.TotalObjects))
 	require.NoError(t, err, "unexpected error completing block")
 
 	expectedBloomShards := block.bloom.GetShardCount()
@@ -261,7 +261,7 @@ func streamingBlock(t *testing.T, cfg *common.BlockConfig, w backend.Writer) (*S
 	ctx := context.Background()
 	for {
 		id, data, err := iter.NextBytes(ctx)
-		if err != io.EOF {
+		if !errors.Is(err, io.EOF) {
 			require.NoError(t, err)
 		}
 
@@ -279,8 +279,6 @@ func streamingBlock(t *testing.T, cfg *common.BlockConfig, w backend.Writer) (*S
 	require.NoError(t, err)
 
 	// test downsample config
-	require.True(t, bytes.Equal(block.BlockMeta().MinID, minID))
-	require.True(t, bytes.Equal(block.BlockMeta().MaxID, maxID))
 	require.Equal(t, originatingMeta.StartTime, block.BlockMeta().StartTime)
 	require.Equal(t, originatingMeta.EndTime, block.BlockMeta().EndTime)
 	require.Equal(t, originatingMeta.TenantID, block.BlockMeta().TenantID)
@@ -288,7 +286,7 @@ func streamingBlock(t *testing.T, cfg *common.BlockConfig, w backend.Writer) (*S
 	require.Equal(t, expectedBloomShards, int(block.BlockMeta().BloomShardCount))
 
 	// Verify block size was written
-	require.Greater(t, block.BlockMeta().Size, uint64(0))
+	require.Greater(t, block.BlockMeta().Size_, uint64(0))
 
 	return block, ids, reqs
 }
@@ -302,18 +300,23 @@ func BenchmarkWriteGzip(b *testing.B) {
 func BenchmarkWriteSnappy(b *testing.B) {
 	benchmarkCompressBlock(b, backend.EncSnappy, benchDownsample, false)
 }
+
 func BenchmarkWriteLZ4256(b *testing.B) {
 	benchmarkCompressBlock(b, backend.EncLZ4_256k, benchDownsample, false)
 }
+
 func BenchmarkWriteLZ41M(b *testing.B) {
 	benchmarkCompressBlock(b, backend.EncLZ4_1M, benchDownsample, false)
 }
+
 func BenchmarkWriteNone(b *testing.B) {
 	benchmarkCompressBlock(b, backend.EncNone, benchDownsample, false)
 }
+
 func BenchmarkWriteZstd(b *testing.B) {
 	benchmarkCompressBlock(b, backend.EncZstd, benchDownsample, false)
 }
+
 func BenchmarkWriteS2(b *testing.B) {
 	benchmarkCompressBlock(b, backend.EncS2, benchDownsample, false)
 }
@@ -321,21 +324,27 @@ func BenchmarkWriteS2(b *testing.B) {
 func BenchmarkReadGzip(b *testing.B) {
 	benchmarkCompressBlock(b, backend.EncGZIP, benchDownsample, true)
 }
+
 func BenchmarkReadSnappy(b *testing.B) {
 	benchmarkCompressBlock(b, backend.EncSnappy, benchDownsample, true)
 }
+
 func BenchmarkReadLZ4256(b *testing.B) {
 	benchmarkCompressBlock(b, backend.EncLZ4_256k, benchDownsample, true)
 }
+
 func BenchmarkReadLZ41M(b *testing.B) {
 	benchmarkCompressBlock(b, backend.EncLZ4_1M, benchDownsample, true)
 }
+
 func BenchmarkReadNone(b *testing.B) {
 	benchmarkCompressBlock(b, backend.EncNone, benchDownsample, true)
 }
+
 func BenchmarkReadZstd(b *testing.B) {
 	benchmarkCompressBlock(b, backend.EncZstd, benchDownsample, true)
 }
+
 func BenchmarkReadS2(b *testing.B) {
 	benchmarkCompressBlock(b, backend.EncS2, benchDownsample, true)
 }
@@ -377,16 +386,16 @@ func benchmarkCompressBlock(b *testing.B, encoding backend.Encoding, indexDownsa
 		Encoding:             encoding,
 		IndexPageSizeBytes:   10 * 1024 * 1024,
 		BloomShardSizeBytes:  100000,
-	}, uuid.New(), meta.TenantID, []*backend.BlockMeta{meta}, meta.TotalObjects)
+	}, uuid.New(), meta.TenantID, []*backend.BlockMeta{meta}, int(meta.TotalObjects))
 	require.NoError(b, err, "unexpected error completing block")
 
 	ctx := context.Background()
 	for {
 		id, data, err := iter.NextBytes(ctx)
-		if err != io.EOF {
+		if !errors.Is(err, io.EOF) {
 			require.NoError(b, err)
 		}
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 
@@ -418,7 +427,7 @@ func benchmarkCompressBlock(b *testing.B, encoding backend.Encoding, indexDownsa
 	o := NewObjectReaderWriter()
 	for {
 		tempBuffer, _, err = pr.NextPage(tempBuffer)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		require.NoError(b, err)
@@ -427,7 +436,7 @@ func benchmarkCompressBlock(b *testing.B, encoding backend.Encoding, indexDownsa
 
 		for {
 			_, _, err = o.UnmarshalObjectFromReader(bufferReader)
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 		}

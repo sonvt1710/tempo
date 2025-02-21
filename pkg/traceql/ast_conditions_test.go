@@ -89,13 +89,29 @@ func TestSpansetFilter_extractConditions(t *testing.T) {
 			},
 			allConditions: true,
 		},
+		{
+			query: `{ .foo = .bar + 1 }`,
+			conditions: []Condition{
+				newCondition(NewAttribute("foo"), OpNone),
+				newCondition(NewAttribute("bar"), OpNone),
+			},
+			allConditions: true,
+		},
+		{
+			query: `{ (.foo = 2) && (.bar / 1 > 3) }`,
+			conditions: []Condition{
+				newCondition(NewAttribute("foo"), OpEqual, NewStaticInt(2)),
+				newCondition(NewAttribute("bar"), OpNone),
+			},
+			allConditions: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.query, func(t *testing.T) {
 			expr, err := Parse(tt.query)
 			require.NoError(t, err)
 
-			spansetFilter := expr.Pipeline.Elements[0].(SpansetFilter)
+			spansetFilter := expr.Pipeline.Elements[0].(*SpansetFilter)
 
 			req := &FetchSpansRequest{
 				Conditions:    []Condition{},
@@ -104,6 +120,7 @@ func TestSpansetFilter_extractConditions(t *testing.T) {
 			spansetFilter.extractConditions(req)
 
 			assert.Equal(t, tt.conditions, req.Conditions)
+			assert.Nil(t, req.SecondPassConditions)
 			assert.Equal(t, tt.allConditions, req.AllConditions, "FetchSpansRequest.AllConditions")
 		})
 	}
@@ -130,6 +147,21 @@ func TestScalarFilter_extractConditions(t *testing.T) {
 			},
 			allConditions: false,
 		},
+		{
+			query: `({ span.http.status_code = 200 } | count()) > ({ span.http.status_code = 500 } | count())`,
+			conditions: []Condition{
+				newCondition(NewScopedAttribute(AttributeScopeSpan, false, "http.status_code"), OpEqual, NewStaticInt(200)),
+				newCondition(NewScopedAttribute(AttributeScopeSpan, false, "http.status_code"), OpEqual, NewStaticInt(500)),
+			},
+			allConditions: false,
+		},
+		{
+			query: `{ .foo = "a" } | 3 > 2`,
+			conditions: []Condition{
+				newCondition(NewAttribute("foo"), OpEqual, NewStaticString("a")),
+			},
+			allConditions: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.query, func(t *testing.T) {
@@ -143,7 +175,153 @@ func TestScalarFilter_extractConditions(t *testing.T) {
 			expr.Pipeline.extractConditions(req)
 
 			assert.Equal(t, tt.conditions, req.Conditions)
+			assert.Nil(t, req.SecondPassConditions)
 			assert.Equal(t, tt.allConditions, req.AllConditions, "FetchSpansRequest.AllConditions")
+		})
+	}
+}
+
+func TestStructuralNestedSet_extractConditions(t *testing.T) {
+	tests := []struct {
+		query         string
+		conditions    []Condition
+		allConditions bool
+	}{
+		{
+			query: `{} >> {}`,
+			conditions: []Condition{
+				newCondition(NewIntrinsic(IntrinsicStructuralDescendant), OpNone),
+			},
+			allConditions: false,
+		},
+		{
+			query: `{ nestedSetRight = 2 }`,
+			conditions: []Condition{
+				newCondition(NewIntrinsic(IntrinsicNestedSetRight), OpEqual, NewStaticInt(2)),
+			},
+			allConditions: true,
+		},
+
+		{
+			query: `{ nestedSetParent = 1 } > { nestedSetLeft < 3 }`,
+			conditions: []Condition{
+				newCondition(NewIntrinsic(IntrinsicStructuralChild), OpNone),
+				newCondition(NewIntrinsic(IntrinsicNestedSetParent), OpEqual, NewStaticInt(1)),
+				newCondition(NewIntrinsic(IntrinsicNestedSetLeft), OpLess, NewStaticInt(3)),
+			},
+			allConditions: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) {
+			expr, err := Parse(tt.query)
+			require.NoError(t, err)
+
+			req := &FetchSpansRequest{
+				Conditions:    []Condition{},
+				AllConditions: true,
+			}
+			expr.Pipeline.extractConditions(req)
+
+			assert.Equal(t, tt.conditions, req.Conditions)
+			assert.Nil(t, req.SecondPassConditions)
+			assert.Equal(t, tt.allConditions, req.AllConditions, "FetchSpansRequest.AllConditions")
+		})
+	}
+}
+
+func TestSelect_extractConditions(t *testing.T) {
+	tests := []struct {
+		query                string
+		conditions           []Condition
+		secondPassConditions []Condition
+		allConditions        bool
+	}{
+		{
+			query: `{ .foo = "a" } | select(resource.service.name)`,
+			conditions: []Condition{
+				newCondition(NewAttribute("foo"), OpEqual, NewStaticString("a")),
+			},
+			secondPassConditions: []Condition{
+				newCondition(NewScopedAttribute(AttributeScopeResource, false, "service.name"), OpNone),
+			},
+			allConditions: true,
+		},
+		{
+			query: `{ } | select(.name,name)`,
+			conditions: []Condition{
+				newCondition(NewIntrinsic(IntrinsicSpanStartTime), OpNone),
+			},
+			secondPassConditions: []Condition{
+				newCondition(NewAttribute("name"), OpNone),
+				newCondition(NewIntrinsic(IntrinsicName), OpNone),
+			},
+			allConditions: true,
+		},
+		{
+			// Pipleline elements after a select are always directed to the second pass
+			query: `{ } | select(span.foo) | { span.foo = "a" && span.bar = "b"}`,
+			conditions: []Condition{
+				newCondition(NewIntrinsic(IntrinsicSpanStartTime), OpNone),
+			},
+			secondPassConditions: []Condition{
+				// span.foo=a has no effect because it's already covered by the select statement
+				newCondition(NewScopedAttribute(AttributeScopeSpan, false, "foo"), OpNone),
+				newCondition(NewScopedAttribute(AttributeScopeSpan, false, "bar"), OpEqual, NewStaticString("b")),
+			},
+			allConditions: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) {
+			expr, err := Parse(tt.query)
+			require.NoError(t, err)
+
+			req := &FetchSpansRequest{
+				Conditions:    []Condition{},
+				AllConditions: true,
+			}
+			expr.Pipeline.extractConditions(req)
+
+			assert.Equal(t, tt.conditions, req.Conditions)
+			assert.Equal(t, tt.secondPassConditions, req.SecondPassConditions)
+			assert.Equal(t, tt.allConditions, req.AllConditions, "FetchSpansRequest.AllConditions")
+		})
+	}
+}
+
+func TestMetricsAggregate_extractConditions(t *testing.T) {
+	tests := map[string]struct {
+		first  []Condition
+		second []Condition
+		all    bool
+	}{
+		`{} | rate() by (name)`: {
+			// Empty spanset implies start time
+			[]Condition{newCondition(IntrinsicSpanStartTimeAttribute, OpNone)},
+			[]Condition{newCondition(IntrinsicNameAttribute, OpNone)},
+			true,
+		},
+		`{name="foo"} | rate() by (name)`: {
+			// by() clause doesn't overwrite existing condition
+			[]Condition{newCondition(IntrinsicNameAttribute, OpEqual, NewStaticString("foo"))},
+			nil,
+			true,
+		},
+	}
+	for q, tt := range tests {
+		t.Run(q, func(t *testing.T) {
+			expr, err := Parse(q)
+			require.NoError(t, err)
+
+			req := &FetchSpansRequest{
+				AllConditions: true,
+			}
+			expr.extractConditions(req)
+
+			require.Equal(t, tt.first, req.Conditions)
+			require.Equal(t, tt.second, req.SecondPassConditions)
+			require.Equal(t, tt.all, req.AllConditions, "FetchSpansRequest.AllConditions")
 		})
 	}
 }

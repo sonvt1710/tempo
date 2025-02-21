@@ -2,6 +2,7 @@ package vparquet2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -9,9 +10,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	tempo_io "github.com/grafana/tempo/pkg/io"
 	pq "github.com/grafana/tempo/pkg/parquetquery"
@@ -38,8 +39,8 @@ const (
 	KindProducer    = "producer"
 	KindConsumer    = "consumer"
 
-	EnvVarSyncIteratorName  = "VPARQUET2_SYNC_ITERATOR"
-	EnvVarSyncIteratorValue = "1"
+	EnvVarAsyncIteratorName  = "VPARQUET_ASYNC_ITERATOR"
+	EnvVarAsyncIteratorValue = "1"
 )
 
 var StatusCodeMapping = map[string]int{
@@ -63,7 +64,7 @@ func (b *backendBlock) openForSearch(ctx context.Context, opts common.SearchOpti
 	defer b.openMtx.Unlock()
 
 	// TODO: ctx is also cached when we cache backendReaderAt, not ideal but leaving it as is for now
-	backendReaderAt := NewBackendReaderAt(ctx, b.r, DataFileName, b.meta.BlockID, b.meta.TenantID)
+	backendReaderAt := NewBackendReaderAt(ctx, b.r, DataFileName, b.meta)
 
 	// no searches currently require bloom filters or the page index. so just add them statically
 	o := []parquet.FileOption{
@@ -79,42 +80,40 @@ func (b *backendBlock) openForSearch(ctx context.Context, opts common.SearchOpti
 	if opts.ReadBufferSize > 0 {
 		//   only use buffered reader at if the block is small, otherwise it's far more effective to use larger
 		//   buffers in the parquet sdk
-		if opts.ReadBufferCount*opts.ReadBufferSize > int(b.meta.Size) {
-			readerAt = tempo_io.NewBufferedReaderAt(readerAt, int64(b.meta.Size), opts.ReadBufferSize, opts.ReadBufferCount)
+		if opts.ReadBufferCount*opts.ReadBufferSize > int(b.meta.Size_) {
+			readerAt = tempo_io.NewBufferedReaderAt(readerAt, int64(b.meta.Size_), opts.ReadBufferSize, opts.ReadBufferCount)
 		} else {
 			o = append(o, parquet.ReadBufferSize(opts.ReadBufferSize))
 		}
 	}
 
 	// optimized reader
-	readerAt = newParquetOptimizedReaderAt(readerAt, int64(b.meta.Size), b.meta.FooterSize)
+	readerAt = newParquetOptimizedReaderAt(readerAt, int64(b.meta.Size_), b.meta.FooterSize)
 
 	// cached reader
-	if opts.CacheControl.ColumnIndex || opts.CacheControl.Footer || opts.CacheControl.OffsetIndex {
-		readerAt = newCachedReaderAt(readerAt, backendReaderAt, opts.CacheControl)
-	}
+	readerAt = newCachedReaderAt(readerAt, backendReaderAt)
 
-	span, _ := opentracing.StartSpanFromContext(ctx, "parquet.OpenFile")
-	defer span.Finish()
-	pf, err := parquet.OpenFile(readerAt, int64(b.meta.Size), o...)
+	_, span := tracer.Start(ctx, "parquet.OpenFile")
+	defer span.End()
+	pf, err := parquet.OpenFile(readerAt, int64(b.meta.Size_), o...)
 
 	return pf, backendReaderAt, err
 }
 
 func (b *backendBlock) Search(ctx context.Context, req *tempopb.SearchRequest, opts common.SearchOptions) (_ *tempopb.SearchResponse, err error) {
-	span, derivedCtx := opentracing.StartSpanFromContext(ctx, "parquet.backendBlock.Search",
-		opentracing.Tags{
-			"blockID":   b.meta.BlockID,
-			"tenantID":  b.meta.TenantID,
-			"blockSize": b.meta.Size,
-		})
-	defer span.Finish()
+	derivedCtx, span := tracer.Start(ctx, "parquet.backendBlock.Search",
+		trace.WithAttributes(
+			attribute.String("blockID", b.meta.BlockID.String()),
+			attribute.String("tenantID", b.meta.TenantID),
+			attribute.Int64("blockSize", int64(b.meta.Size_)),
+		))
+	defer span.End()
 
 	pf, rr, err := b.openForSearch(derivedCtx, opts)
 	if err != nil {
 		return nil, fmt.Errorf("unexpected error opening parquet file: %w", err)
 	}
-	defer func() { span.SetTag("inspectedBytes", rr.BytesRead()) }()
+	defer func() { span.SetAttributes(attribute.Int64("inspectedBytes", int64(rr.BytesRead()))) }()
 
 	// Get list of row groups to inspect. Ideally we use predicate pushdown
 	// here to keep only row groups that can potentially satisfy the request
@@ -264,7 +263,6 @@ func makePipelineWithRowGroups(ctx context.Context, req *tempopb.SearchRequest, 
 }
 
 func searchParquetFile(ctx context.Context, pf *parquet.File, req *tempopb.SearchRequest, rgs []parquet.RowGroup) (*tempopb.SearchResponse, error) {
-
 	// Search happens in 2 phases for an optimization.
 	// Phase 1 is iterate all columns involved in the request.
 	// Only if there are any matches do we enter phase 2, which
@@ -303,7 +301,7 @@ func searchRaw(ctx context.Context, pf *parquet.File, req *tempopb.SearchRequest
 	for {
 		match, err := iter.Next()
 		if err != nil {
-			return nil, errors.Wrap(err, "searchRaw next failed")
+			return nil, fmt.Errorf("searchRaw next failed: %w", err)
 		}
 		if match == nil {
 			break
@@ -334,7 +332,7 @@ func rawToResults(ctx context.Context, pf *parquet.File, rgs []parquet.RowGroup,
 	for {
 		match, err := iter2.Next()
 		if err != nil {
-			return nil, errors.Wrap(err, "rawToResults next failed")
+			return nil, fmt.Errorf("rawToResults next failed: %w", err)
 		}
 		if match == nil {
 			break
@@ -355,7 +353,7 @@ func rawToResults(ctx context.Context, pf *parquet.File, rgs []parquet.RowGroup,
 }
 
 func makeIterFunc(ctx context.Context, rgs []parquet.RowGroup, pf *parquet.File) func(name string, predicate pq.Predicate, selectAs string) pq.Iterator {
-	sync := os.Getenv(EnvVarSyncIteratorName) == EnvVarSyncIteratorValue
+	async := os.Getenv(EnvVarAsyncIteratorName) == EnvVarAsyncIteratorValue
 
 	return func(name string, predicate pq.Predicate, selectAs string) pq.Iterator {
 		index, _ := pq.GetColumnIndexByPath(pf, name)
@@ -364,11 +362,16 @@ func makeIterFunc(ctx context.Context, rgs []parquet.RowGroup, pf *parquet.File)
 			panic("column not found in parquet file:" + name)
 		}
 
-		if sync {
-			return pq.NewSyncIterator(ctx, rgs, index, name, 1000, predicate, selectAs)
+		if async {
+			return pq.NewColumnIterator(ctx, rgs, index, name, 1000, predicate, selectAs)
 		}
 
-		return pq.NewColumnIterator(ctx, rgs, index, name, 1000, predicate, selectAs)
+		var opts []pq.SyncIteratorOpt
+		if name != columnPathSpanID && name != columnPathTraceID {
+			opts = append(opts, pq.SyncIteratorOptIntern())
+		}
+
+		return pq.NewSyncIterator(ctx, rgs, index, name, 1000, predicate, selectAs, opts...)
 	}
 }
 
@@ -406,11 +409,10 @@ func (r *rowNumberIterator) Close() {}
 
 // reportValuesPredicate is a "fake" predicate that uses existing iterator logic to find all values in a given column
 type reportValuesPredicate struct {
-	cb            common.TagCallbackV2
-	inspectedDict bool
+	cb common.TagValuesCallbackV2
 }
 
-func newReportValuesPredicate(cb common.TagCallbackV2) *reportValuesPredicate {
+func newReportValuesPredicate(cb common.TagValuesCallbackV2) *reportValuesPredicate {
 	return &reportValuesPredicate{cb: cb}
 }
 
@@ -418,35 +420,29 @@ func (r *reportValuesPredicate) String() string {
 	return "reportValuesPredicate{}"
 }
 
-// KeepColumnChunk always returns true b/c we always have to dig deeper to find all values
-func (r *reportValuesPredicate) KeepColumnChunk(cc parquet.ColumnChunk) bool {
-	// Reinspect dictionary for each new column chunk
-	r.inspectedDict = false
-	return true
-}
-
-// KeepPage checks to see if the page has a dictionary. if it does then we can report the values contained in it
+// KeepColumnChunk checks to see if the page has a dictionary. if it does then we can report the values contained in it
 // and return false b/c we don't have to go to the actual columns to retrieve values. if there is no dict we return
 // true so the iterator will call KeepValue on all values in the column
-func (r *reportValuesPredicate) KeepPage(pg parquet.Page) bool {
-	if r.inspectedDict {
-		// Already inspected dictionary for this column chunk
-		return false
-	}
-
-	if dict := pg.Dictionary(); dict != nil {
-		for i := 0; i < dict.Len(); i++ {
-			v := dict.Index(int32(i))
+func (r *reportValuesPredicate) KeepColumnChunk(cc *pq.ColumnChunkHelper) bool {
+	if d := cc.Dictionary(); d != nil {
+		for i := 0; i < d.Len(); i++ {
+			v := d.Index(int32(i))
 			if callback(r.cb, v) {
 				break
 			}
 		}
 
-		// Only inspect first dictionary per column chunk.
-		r.inspectedDict = true
+		// No need to check the pages since this was a dictionary
+		// column.
 		return false
 	}
 
+	return true
+}
+
+// KeepPage always returns true because if we get this far we need to
+// inspect each individual value.
+func (r *reportValuesPredicate) KeepPage(parquet.Page) bool {
 	return true
 }
 
@@ -458,7 +454,7 @@ func (r *reportValuesPredicate) KeepValue(v parquet.Value) bool {
 	return false
 }
 
-func callback(cb common.TagCallbackV2, v parquet.Value) (stop bool) {
+func callback(cb common.TagValuesCallbackV2, v parquet.Value) (stop bool) {
 	switch v.Kind() {
 
 	case parquet.Boolean:

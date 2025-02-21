@@ -1,22 +1,13 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package configunmarshaler // import "go.opentelemetry.io/collector/otelcol/internal/configunmarshaler"
 
 import (
+	"errors"
 	"fmt"
-	"reflect"
+
+	"golang.org/x/exp/maps"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/confmap"
@@ -34,18 +25,24 @@ func NewConfigs[F component.Factory](factories map[component.Type]F) *Configs[F]
 
 func (c *Configs[F]) Unmarshal(conf *confmap.Conf) error {
 	rawCfgs := make(map[component.ID]map[string]any)
-	if err := conf.Unmarshal(&rawCfgs, confmap.WithErrorUnused()); err != nil {
+	if err := conf.Unmarshal(&rawCfgs); err != nil {
 		return err
 	}
 
 	// Prepare resulting map.
 	c.cfgs = make(map[component.ID]component.Config)
 	// Iterate over raw configs and create a config for each.
-	for id, value := range rawCfgs {
+	for id := range rawCfgs {
 		// Find factory based on component kind and type that we read from config source.
 		factory, ok := c.factories[id.Type()]
 		if !ok {
-			return errorUnknownType(id, reflect.ValueOf(c.factories).MapKeys())
+			return errorUnknownType(id, maps.Keys(c.factories))
+		}
+
+		// Get the configuration from the confmap.Conf to preserve internal representation.
+		sub, err := conf.Sub(id.String())
+		if err != nil {
+			return errorUnmarshalError(id, err)
 		}
 
 		// Create the default config for this component.
@@ -53,7 +50,7 @@ func (c *Configs[F]) Unmarshal(conf *confmap.Conf) error {
 
 		// Now that the default config struct is created we can Unmarshal into it,
 		// and it will apply user-defined config on top of the default.
-		if err := component.UnmarshalConfig(confmap.NewFromStringMap(value), cfg); err != nil {
+		if err := sub.Unmarshal(&cfg); err != nil {
 			return errorUnmarshalError(id, err)
 		}
 
@@ -67,7 +64,10 @@ func (c *Configs[F]) Configs() map[component.ID]component.Config {
 	return c.cfgs
 }
 
-func errorUnknownType(id component.ID, factories []reflect.Value) error {
+func errorUnknownType(id component.ID, factories []component.Type) error {
+	if id.Type().String() == "logging" {
+		return errors.New("the logging exporter has been deprecated, use the debug exporter instead")
+	}
 	return fmt.Errorf("unknown type: %q for id: %q (valid values: %v)", id.Type(), id, factories)
 }
 

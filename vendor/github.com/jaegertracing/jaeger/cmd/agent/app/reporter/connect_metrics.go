@@ -1,21 +1,11 @@
 // Copyright (c) 2020 The Jaeger Authors.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package reporter
 
 import (
 	"expvar"
+	"sync"
 
 	"github.com/jaegertracing/jaeger/pkg/metrics"
 )
@@ -34,17 +24,21 @@ type ConnectMetrics struct {
 	target  *expvar.String
 }
 
+var (
+	gRPCTarget     *expvar.String
+	gRPCTargetOnce sync.Once
+)
+
 // NewConnectMetrics will be initialize ConnectMetrics
 func NewConnectMetrics(mf metrics.Factory) *ConnectMetrics {
 	cm := &ConnectMetrics{}
 	metrics.MustInit(&cm.metrics, mf.Namespace(metrics.NSOptions{Name: "connection_status"}), nil)
 
-	if r := expvar.Get("gRPCTarget"); r == nil {
-		cm.target = expvar.NewString("gRPCTarget")
-	} else {
-		cm.target = r.(*expvar.String)
-	}
-
+	// expvar.String is not thread-safe, so we need to initialize it only once
+	gRPCTargetOnce.Do(func() {
+		gRPCTarget = expvar.NewString("gRPCTarget")
+	})
+	cm.target = gRPCTarget
 	return cm
 }
 

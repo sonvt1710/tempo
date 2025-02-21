@@ -1,20 +1,10 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package jaegerreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/jaegerreceiver"
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -39,18 +29,18 @@ const (
 
 // RemoteSamplingConfig defines config key for remote sampling fetch endpoint
 type RemoteSamplingConfig struct {
-	HostEndpoint                  string        `mapstructure:"host_endpoint"`
-	StrategyFile                  string        `mapstructure:"strategy_file"`
-	StrategyFileReloadInterval    time.Duration `mapstructure:"strategy_file_reload_interval"`
-	configgrpc.GRPCClientSettings `mapstructure:",squash"`
+	HostEndpoint               string        `mapstructure:"host_endpoint"`
+	StrategyFile               string        `mapstructure:"strategy_file"`
+	StrategyFileReloadInterval time.Duration `mapstructure:"strategy_file_reload_interval"`
+	configgrpc.ClientConfig    `mapstructure:",squash"`
 }
 
 // Protocols is the configuration for the supported protocols.
 type Protocols struct {
-	GRPC          *configgrpc.GRPCServerSettings `mapstructure:"grpc"`
-	ThriftHTTP    *confighttp.HTTPServerSettings `mapstructure:"thrift_http"`
-	ThriftBinary  *ProtocolUDP                   `mapstructure:"thrift_binary"`
-	ThriftCompact *ProtocolUDP                   `mapstructure:"thrift_compact"`
+	GRPC             *configgrpc.ServerConfig `mapstructure:"grpc"`
+	ThriftHTTP       *confighttp.ServerConfig `mapstructure:"thrift_http"`
+	ThriftBinaryUDP  *ProtocolUDP             `mapstructure:"thrift_binary"`
+	ThriftCompactUDP *ProtocolUDP             `mapstructure:"thrift_compact"`
 }
 
 // ProtocolUDP is the configuration for a UDP protocol.
@@ -67,8 +57,8 @@ type ServerConfigUDP struct {
 	SocketBufferSize int `mapstructure:"socket_buffer_size"`
 }
 
-// DefaultServerConfigUDP creates the default ServerConfigUDP.
-func DefaultServerConfigUDP() ServerConfigUDP {
+// defaultServerConfigUDP creates the default ServerConfigUDP.
+func defaultServerConfigUDP() ServerConfigUDP {
 	return ServerConfigUDP{
 		QueueSize:        defaultQueueSize,
 		MaxPacketSize:    defaultMaxPacketSize,
@@ -83,16 +73,18 @@ type Config struct {
 	RemoteSampling *RemoteSamplingConfig `mapstructure:"remote_sampling"`
 }
 
-var _ component.Config = (*Config)(nil)
-var _ confmap.Unmarshaler = (*Config)(nil)
+var (
+	_ component.Config    = (*Config)(nil)
+	_ confmap.Unmarshaler = (*Config)(nil)
+)
 
 // Validate checks the receiver configuration is valid
 func (cfg *Config) Validate() error {
 	if cfg.GRPC == nil &&
 		cfg.ThriftHTTP == nil &&
-		cfg.ThriftBinary == nil &&
-		cfg.ThriftCompact == nil {
-		return fmt.Errorf("must specify at least one protocol when using the Jaeger receiver")
+		cfg.ThriftBinaryUDP == nil &&
+		cfg.ThriftCompactUDP == nil {
+		return errors.New("must specify at least one protocol when using the Jaeger receiver")
 	}
 
 	if cfg.GRPC != nil {
@@ -107,29 +99,21 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
-	if cfg.ThriftBinary != nil {
-		if err := checkPortFromEndpoint(cfg.ThriftBinary.Endpoint); err != nil {
+	if cfg.ThriftBinaryUDP != nil {
+		if err := checkPortFromEndpoint(cfg.ThriftBinaryUDP.Endpoint); err != nil {
 			return fmt.Errorf("invalid port number for the Thrift UDP Binary endpoint: %w", err)
 		}
 	}
 
-	if cfg.ThriftCompact != nil {
-		if err := checkPortFromEndpoint(cfg.ThriftCompact.Endpoint); err != nil {
+	if cfg.ThriftCompactUDP != nil {
+		if err := checkPortFromEndpoint(cfg.ThriftCompactUDP.Endpoint); err != nil {
 			return fmt.Errorf("invalid port number for the Thrift UDP Compact endpoint: %w", err)
 		}
 	}
 
 	if cfg.RemoteSampling != nil {
-		if err := checkPortFromEndpoint(cfg.RemoteSampling.HostEndpoint); err != nil {
-			return fmt.Errorf("invalid port number for the Remote Sampling endpoint: %w", err)
-		}
-
-		if len(cfg.RemoteSampling.StrategyFile) != 0 && cfg.GRPC == nil {
-			return fmt.Errorf("strategy file requires the gRPC protocol to be enabled")
-		}
-
-		if cfg.RemoteSampling.StrategyFileReloadInterval < 0 {
-			return fmt.Errorf("strategy file reload interval should be great or equal zero")
+		if disableJaegerReceiverRemoteSampling.IsEnabled() {
+			return errors.New("remote sampling config detected in the Jaeger receiver; use the `jaegerremotesampling` extension instead")
 		}
 	}
 
@@ -139,12 +123,12 @@ func (cfg *Config) Validate() error {
 // Unmarshal a config.Parser into the config struct.
 func (cfg *Config) Unmarshal(componentParser *confmap.Conf) error {
 	if componentParser == nil || len(componentParser.AllKeys()) == 0 {
-		return fmt.Errorf("empty config for Jaeger receiver")
+		return errors.New("empty config for Jaeger receiver")
 	}
 
 	// UnmarshalExact will not set struct properties to nil even if no key is provided,
 	// so set the protocol structs to nil where the keys were omitted.
-	err := componentParser.Unmarshal(cfg, confmap.WithErrorUnused())
+	err := componentParser.Unmarshal(cfg)
 	if err != nil {
 		return err
 	}
@@ -161,10 +145,10 @@ func (cfg *Config) Unmarshal(componentParser *confmap.Conf) error {
 		cfg.ThriftHTTP = nil
 	}
 	if !protocols.IsSet(protoThriftBinary) {
-		cfg.ThriftBinary = nil
+		cfg.ThriftBinaryUDP = nil
 	}
 	if !protocols.IsSet(protoThriftCompact) {
-		cfg.ThriftCompact = nil
+		cfg.ThriftCompactUDP = nil
 	}
 
 	return nil
@@ -182,7 +166,7 @@ func checkPortFromEndpoint(endpoint string) error {
 		return fmt.Errorf("endpoint port is not a number: %w", err)
 	}
 	if port < 1 || port > 65535 {
-		return fmt.Errorf("port number must be between 1 and 65535")
+		return errors.New("port number must be between 1 and 65535")
 	}
 	return nil
 }

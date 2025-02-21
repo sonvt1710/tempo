@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -20,17 +21,17 @@ import (
 const tenantID = "tenant-id"
 
 func TestForwarder(t *testing.T) {
-	oCfg := overrides.Limits{}
-	oCfg.RegisterFlags(&flag.FlagSet{})
+	oCfg := overrides.Config{}
+	oCfg.RegisterFlagsAndApplyDefaults(&flag.FlagSet{})
 
 	id, err := util.HexStringToTraceID("1234567890abcdef")
 	require.NoError(t, err)
 
 	b := test.MakeBatch(10, id)
-	keys, rebatchedTraces, err := requestsByTraceID([]*v1.ResourceSpans{b}, tenantID, 10)
+	keys, rebatchedTraces, _, err := requestsByTraceID([]*v1.ResourceSpans{b}, tenantID, 10, 1000)
 	require.NoError(t, err)
 
-	o, err := overrides.NewOverrides(oCfg)
+	o, err := overrides.NewOverrides(oCfg, nil, prometheus.DefaultRegisterer)
 	require.NoError(t, err)
 
 	wg := sync.WaitGroup{}
@@ -60,18 +61,18 @@ func TestForwarder(t *testing.T) {
 }
 
 func TestForwarder_shutdown(t *testing.T) {
-	oCfg := overrides.Limits{}
-	oCfg.RegisterFlags(&flag.FlagSet{})
-	oCfg.MetricsGeneratorForwarderQueueSize = 200
+	oCfg := overrides.Config{}
+	oCfg.RegisterFlagsAndApplyDefaults(&flag.FlagSet{})
+	oCfg.Defaults.MetricsGenerator.Forwarder.QueueSize = 200
 
 	id, err := util.HexStringToTraceID("1234567890abcdef")
 	require.NoError(t, err)
 
 	b := test.MakeBatch(10, id)
-	keys, rebatchedTraces, err := requestsByTraceID([]*v1.ResourceSpans{b}, tenantID, 10)
+	keys, rebatchedTraces, _, err := requestsByTraceID([]*v1.ResourceSpans{b}, tenantID, 10, 1000)
 	require.NoError(t, err)
 
-	o, err := overrides.NewOverrides(oCfg)
+	o, err := overrides.NewOverrides(oCfg, nil, prometheus.DefaultRegisterer)
 	require.NoError(t, err)
 
 	signalCh := make(chan struct{})

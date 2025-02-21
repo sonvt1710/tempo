@@ -1,11 +1,13 @@
 package kong
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 )
 
@@ -13,23 +15,29 @@ var (
 	callbackReturnSignature = reflect.TypeOf((*error)(nil)).Elem()
 )
 
-// Error reported by Kong.
-type Error struct{ msg string }
-
-func (e Error) Error() string { return e.msg }
-
-func fail(format string, args ...interface{}) {
-	panic(Error{msg: fmt.Sprintf(format, args...)})
+func failField(parent reflect.Value, field reflect.StructField, format string, args ...any) error {
+	name := parent.Type().Name()
+	if name == "" {
+		name = "<anonymous struct>"
+	}
+	return fmt.Errorf("%s.%s: %s", name, field.Name, fmt.Sprintf(format, args...))
 }
 
 // Must creates a new Parser or panics if there is an error.
-func Must(ast interface{}, options ...Option) *Kong {
+func Must(ast any, options ...Option) *Kong {
 	k, err := New(ast, options...)
 	if err != nil {
 		panic(err)
 	}
 	return k
 }
+
+type usageOnError int
+
+const (
+	shortUsage usageOnError = iota + 1
+	fullUsage
+)
 
 // Kong is the main parser type.
 type Kong struct {
@@ -42,27 +50,33 @@ type Kong struct {
 	Stdout io.Writer
 	Stderr io.Writer
 
-	bindings  bindings
-	loader    ConfigurationLoader
-	resolvers []Resolver
-	registry  *Registry
+	bindings     bindings
+	loader       ConfigurationLoader
+	resolvers    []Resolver
+	registry     *Registry
+	ignoreFields []*regexp.Regexp
 
 	noDefaultHelp bool
-	usageOnError  bool
+	usageOnError  usageOnError
 	help          HelpPrinter
+	shortHelp     HelpPrinter
 	helpFormatter HelpValueFormatter
 	helpOptions   HelpOptions
 	helpFlag      *Flag
+	groups        []Group
 	vars          Vars
+	flagNamer     func(string) string
 
 	// Set temporarily by Options. These are applied after build().
 	postBuildOptions []Option
+	embedded         []embedded
+	dynamicCommands  []*dynamicCommand
 }
 
 // New creates a new Kong parser on grammar.
 //
 // See the README (https://github.com/alecthomas/kong) for usage instructions.
-func New(grammar interface{}, options ...Option) (*Kong, error) {
+func New(grammar any, options ...Option) (*Kong, error) {
 	k := &Kong{
 		Exit:          os.Exit,
 		Stdout:        os.Stdout,
@@ -71,6 +85,10 @@ func New(grammar interface{}, options ...Option) (*Kong, error) {
 		vars:          Vars{},
 		bindings:      bindings{},
 		helpFormatter: DefaultHelpValueFormatter,
+		ignoreFields:  make([]*regexp.Regexp, 0),
+		flagNamer: func(s string) string {
+			return strings.ToLower(dashedString(s))
+		},
 	}
 
 	options = append(options, Bind(k))
@@ -85,6 +103,10 @@ func New(grammar interface{}, options ...Option) (*Kong, error) {
 		k.help = DefaultHelpPrinter
 	}
 
+	if k.shortHelp == nil {
+		k.shortHelp = DefaultShortHelpPrinter
+	}
+
 	model, err := build(k, grammar)
 	if err != nil {
 		return k, err
@@ -92,6 +114,45 @@ func New(grammar interface{}, options ...Option) (*Kong, error) {
 	model.Name = filepath.Base(os.Args[0])
 	k.Model = model
 	k.Model.HelpFlag = k.helpFlag
+
+	// Embed any embedded structs.
+	for _, embed := range k.embedded {
+		tag, err := parseTagString(strings.Join(embed.tags, " "))
+		if err != nil {
+			return nil, err
+		}
+		tag.Embed = true
+		v := reflect.Indirect(reflect.ValueOf(embed.strct))
+		node, err := buildNode(k, v, CommandNode, tag, map[string]bool{})
+		if err != nil {
+			return nil, err
+		}
+		for _, child := range node.Children {
+			child.Parent = k.Model.Node
+			k.Model.Children = append(k.Model.Children, child)
+		}
+		k.Model.Flags = append(k.Model.Flags, node.Flags...)
+	}
+
+	// Synthesise command nodes.
+	for _, dcmd := range k.dynamicCommands {
+		tag, terr := parseTagString(strings.Join(dcmd.tags, " "))
+		if terr != nil {
+			return nil, terr
+		}
+		tag.Name = dcmd.name
+		tag.Help = dcmd.help
+		tag.Group = dcmd.group
+		tag.Cmd = true
+		v := reflect.Indirect(reflect.ValueOf(dcmd.cmd))
+		err = buildChild(k, k.Model.Node, CommandNode, reflect.Value{}, reflect.StructField{
+			Name: dcmd.name,
+			Type: v.Type(),
+		}, v, tag, dcmd.name, map[string]bool{})
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	for _, option := range k.postBuildOptions {
 		if err = option.Apply(k); err != nil {
@@ -106,7 +167,40 @@ func New(grammar interface{}, options ...Option) (*Kong, error) {
 
 	k.bindings.add(k.vars)
 
+	if err = checkOverlappingXorAnd(k); err != nil {
+		return nil, err
+	}
+
 	return k, nil
+}
+
+func checkOverlappingXorAnd(k *Kong) error {
+	xorGroups := map[string][]string{}
+	andGroups := map[string][]string{}
+	for _, flag := range k.Model.Node.Flags {
+		for _, xor := range flag.Xor {
+			xorGroups[xor] = append(xorGroups[xor], flag.Name)
+		}
+		for _, and := range flag.And {
+			andGroups[and] = append(andGroups[and], flag.Name)
+		}
+	}
+	for xor, xorSet := range xorGroups {
+		for and, andSet := range andGroups {
+			overlappingEntries := []string{}
+			for _, xorTag := range xorSet {
+				for _, andTag := range andSet {
+					if xorTag == andTag {
+						overlappingEntries = append(overlappingEntries, xorTag)
+					}
+				}
+			}
+			if len(overlappingEntries) > 1 {
+				return fmt.Errorf("invalid xor and combination, %s and %s overlap with more than one: %s", xor, and, overlappingEntries)
+			}
+		}
+	}
+	return nil
 }
 
 type varStack []Vars
@@ -147,16 +241,37 @@ func (k *Kong) interpolateValue(value *Value, vars Vars) (err error) {
 	if len(value.Tag.Vars) > 0 {
 		vars = vars.CloneWith(value.Tag.Vars)
 	}
+	if varsContributor, ok := value.Mapper.(VarsContributor); ok {
+		vars = vars.CloneWith(varsContributor.Vars(value))
+	}
+
+	if value.Enum, err = interpolate(value.Enum, vars, nil); err != nil {
+		return fmt.Errorf("enum for %s: %s", value.Summary(), err)
+	}
+
 	if value.Default, err = interpolate(value.Default, vars, nil); err != nil {
 		return fmt.Errorf("default value for %s: %s", value.Summary(), err)
 	}
 	if value.Enum, err = interpolate(value.Enum, vars, nil); err != nil {
 		return fmt.Errorf("enum value for %s: %s", value.Summary(), err)
 	}
-	value.Help, err = interpolate(value.Help, vars, map[string]string{
+	updatedVars := map[string]string{
 		"default": value.Default,
 		"enum":    value.Enum,
-	})
+	}
+	if value.Flag != nil {
+		for i, env := range value.Flag.Envs {
+			if value.Flag.Envs[i], err = interpolate(env, vars, updatedVars); err != nil {
+				return fmt.Errorf("env value for %s: %s", value.Summary(), err)
+			}
+		}
+		value.Tag.Envs = value.Flag.Envs
+		updatedVars["env"] = ""
+		if len(value.Flag.Envs) != 0 {
+			updatedVars["env"] = value.Flag.Envs[0]
+		}
+	}
+	value.Help, err = interpolate(value.Help, vars, updatedVars)
 	if err != nil {
 		return fmt.Errorf("help for %s: %s", value.Summary(), err)
 	}
@@ -175,6 +290,7 @@ func (k *Kong) extraFlags() []*Flag {
 		Value: &Value{
 			Name:         "help",
 			Help:         "Show context-sensitive help.",
+			OrigHelp:     "Show context-sensitive help.",
 			Target:       value,
 			Tag:          &Tag{},
 			Mapper:       k.registry.ForValue(value),
@@ -194,13 +310,15 @@ func (k *Kong) extraFlags() []*Flag {
 // Will return a ParseError if a *semantically* invalid command-line is encountered (as opposed to a syntactically
 // invalid one, which will report a normal error).
 func (k *Kong) Parse(args []string) (ctx *Context, err error) {
-	defer catch(&err)
 	ctx, err = Trace(k, args)
 	if err != nil {
 		return nil, err
 	}
 	if ctx.Error != nil {
 		return nil, &ParseError{error: ctx.Error, Context: ctx}
+	}
+	if err = k.applyHook(ctx, "BeforeReset"); err != nil {
+		return nil, &ParseError{error: err, Context: ctx}
 	}
 	if err = ctx.Reset(); err != nil {
 		return nil, &ParseError{error: err, Context: ctx}
@@ -243,16 +361,14 @@ func (k *Kong) applyHook(ctx *Context, name string) error {
 		default:
 			panic("unsupported Path")
 		}
-		method := getMethod(value, name)
-		if !method.IsValid() {
-			continue
-		}
-		binds := k.bindings.clone()
-		binds.add(ctx, trace)
-		binds.add(trace.Node().Vars().CloneWith(k.vars))
-		binds.merge(ctx.bindings)
-		if err := callMethod(name, value, method, binds); err != nil {
-			return err
+		for _, method := range getMethods(value, name) {
+			binds := k.bindings.clone()
+			binds.add(ctx, trace)
+			binds.add(trace.Node().Vars().CloneWith(k.vars))
+			binds.merge(ctx.bindings)
+			if err := callFunction(method, binds); err != nil {
+				return err
+			}
 		}
 	}
 	// Path[0] will always be the app root.
@@ -271,24 +387,22 @@ func (k *Kong) applyHookToDefaultFlags(ctx *Context, node *Node, name string) er
 		}
 		binds := k.bindings.clone().add(ctx).add(node.Vars().CloneWith(k.vars))
 		for _, flag := range node.Flags {
-			if flag.Default == "" || ctx.values[flag.Value].IsValid() || !flag.Target.IsValid() {
+			if !flag.HasDefault || ctx.values[flag.Value].IsValid() || !flag.Target.IsValid() {
 				continue
 			}
-			method := getMethod(flag.Target, name)
-			if !method.IsValid() {
-				continue
-			}
-			path := &Path{Flag: flag}
-			if err := callMethod(name, flag.Target, method, binds.clone().add(path)); err != nil {
-				return next(err)
+			for _, method := range getMethods(flag.Target, name) {
+				path := &Path{Flag: flag}
+				if err := callFunction(method, binds.clone().add(path)); err != nil {
+					return next(err)
+				}
 			}
 		}
 		return next(nil)
 	})
 }
 
-func formatMultilineMessage(w io.Writer, leaders []string, format string, args ...interface{}) {
-	lines := strings.Split(fmt.Sprintf(format, args...), "\n")
+func formatMultilineMessage(w io.Writer, leaders []string, format string, args ...any) {
+	lines := strings.Split(strings.TrimRight(fmt.Sprintf(format, args...), "\n"), "\n")
 	leader := ""
 	for _, l := range leaders {
 		if l == "" {
@@ -303,40 +417,45 @@ func formatMultilineMessage(w io.Writer, leaders []string, format string, args .
 }
 
 // Printf writes a message to Kong.Stdout with the application name prefixed.
-func (k *Kong) Printf(format string, args ...interface{}) *Kong {
+func (k *Kong) Printf(format string, args ...any) *Kong {
 	formatMultilineMessage(k.Stdout, []string{k.Model.Name}, format, args...)
 	return k
 }
 
 // Errorf writes a message to Kong.Stderr with the application name prefixed.
-func (k *Kong) Errorf(format string, args ...interface{}) *Kong {
+func (k *Kong) Errorf(format string, args ...any) *Kong {
 	formatMultilineMessage(k.Stderr, []string{k.Model.Name, "error"}, format, args...)
 	return k
 }
 
 // Fatalf writes a message to Kong.Stderr with the application name prefixed then exits with a non-zero status.
-func (k *Kong) Fatalf(format string, args ...interface{}) {
+func (k *Kong) Fatalf(format string, args ...any) {
 	k.Errorf(format, args...)
 	k.Exit(1)
 }
 
 // FatalIfErrorf terminates with an error message if err != nil.
-func (k *Kong) FatalIfErrorf(err error, args ...interface{}) {
+func (k *Kong) FatalIfErrorf(err error, args ...any) {
 	if err == nil {
 		return
 	}
 	msg := err.Error()
 	if len(args) > 0 {
-		msg = fmt.Sprintf(args[0].(string), args[1:]...) + ": " + err.Error()
+		msg = fmt.Sprintf(args[0].(string), args[1:]...) + ": " + err.Error() //nolint
 	}
 	// Maybe display usage information.
-	if err, ok := err.(*ParseError); ok && k.usageOnError {
-		options := k.helpOptions
-		_ = k.help(options, err.Context)
-		fmt.Fprintln(k.Stdout)
+	var parseErr *ParseError
+	if errors.As(err, &parseErr) {
+		switch k.usageOnError {
+		case fullUsage:
+			_ = k.help(k.helpOptions, parseErr.Context)
+			fmt.Fprintln(k.Stdout)
+		case shortUsage:
+			_ = k.shortHelp(k.helpOptions, parseErr.Context)
+			fmt.Fprintln(k.Stdout)
+		}
 	}
-	k.Errorf("%s", msg)
-	k.Exit(1)
+	k.Fatalf("%s", msg)
 }
 
 // LoadConfig from path using the loader configured via Configuration(loader).
@@ -349,20 +468,11 @@ func (k *Kong) LoadConfig(path string) (Resolver, error) {
 	if err != nil {
 		return nil, err
 	}
-	r, err := os.Open(path) // nolint: gas
+	r, err := os.Open(path) //nolint: gas
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
 
 	return k.loader(r)
-}
-
-func catch(err *error) {
-	msg := recover()
-	if test, ok := msg.(Error); ok {
-		*err = test
-	} else if msg != nil {
-		panic(msg)
-	}
 }

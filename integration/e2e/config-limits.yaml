@@ -4,16 +4,27 @@ server:
   http_listen_port: 3200
 
 distributor:
+  retry_after_on_resource_exhausted: 1s
   receivers:
     jaeger:
       protocols:
         grpc:
+          endpoint: "tempo:14250"
+    otlp:
+      protocols:
+        grpc:
+          endpoint: "tempo:4317"
+        http:
+          endpoint: "tempo:4318"
 
 overrides:
-  max_bytes_per_trace: 100
-  max_traces_per_user: 1
-  ingestion_rate_limit_bytes: 500
-  ingestion_burst_size_bytes: 500
+  defaults:
+    ingestion:
+      max_traces_per_user: 1
+      rate_limit_bytes: 500
+      burst_size_bytes: 500
+    global:
+      max_bytes_per_trace: 130
 
 ingester:
   lifecycler:

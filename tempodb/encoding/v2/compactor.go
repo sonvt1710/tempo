@@ -2,10 +2,10 @@ package v2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"runtime"
-	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -13,7 +13,6 @@ import (
 	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-	"github.com/pkg/errors"
 )
 
 type Compactor struct {
@@ -26,8 +25,7 @@ func NewCompactor(opts common.CompactionOptions) *Compactor {
 	return &Compactor{opts}
 }
 
-func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader, writerCallback func(*backend.BlockMeta, time.Time) backend.Writer, inputs []*backend.BlockMeta) (newCompactedBlocks []*backend.BlockMeta, err error) {
-
+func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader, w backend.Writer, inputs []*backend.BlockMeta) (newCompactedBlocks []*backend.BlockMeta, err error) {
 	tenantID := inputs[0].TenantID
 	dataEncoding := inputs[0].DataEncoding // blocks chosen for compaction always have the same data encoding
 
@@ -40,8 +38,8 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 		}
 	}()
 
-	var compactionLevel uint8
-	var totalRecords int
+	var compactionLevel uint32
+	var totalRecords int64
 	for _, blockMeta := range inputs {
 		totalRecords += blockMeta.TotalObjects
 
@@ -65,7 +63,7 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 
 	nextCompactionLevel := compactionLevel + 1
 
-	recordsPerBlock := (totalRecords / int(c.opts.OutputBlocks))
+	recordsPerBlock := (totalRecords / int64(c.opts.OutputBlocks))
 
 	combiner := c.opts.Combiner
 	if combiner == nil {
@@ -79,21 +77,24 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 	defer iter.Close()
 
 	for {
-
 		id, body, err := iter.NextBytes(ctx)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 
 		if err != nil {
-			return nil, errors.Wrap(err, "error iterating input blocks")
+			return nil, fmt.Errorf("error iterating input blocks: %w", err)
+		}
+
+		if c.opts.DropObject != nil && c.opts.DropObject(id) {
+			continue
 		}
 
 		// make a new block if necessary
 		if currentBlock == nil {
-			currentBlock, err = NewStreamingBlock(&c.opts.BlockConfig, uuid.New(), tenantID, inputs, recordsPerBlock)
+			currentBlock, err = NewStreamingBlock(&c.opts.BlockConfig, uuid.New(), tenantID, inputs, int(recordsPerBlock))
 			if err != nil {
-				return nil, errors.Wrap(err, "error making new compacted block")
+				return nil, fmt.Errorf("error making new compacted block: %w", err)
 			}
 			currentBlock.BlockMeta().CompactionLevel = nextCompactionLevel
 			newCompactedBlocks = append(newCompactedBlocks, currentBlock.BlockMeta())
@@ -107,17 +108,17 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 		// write partial block
 		if currentBlock.CurrentBufferLength() >= int(c.opts.FlushSizeBytes) {
 			runtime.GC()
-			tracker, err = c.appendBlock(ctx, writerCallback, tracker, currentBlock)
+			tracker, err = c.appendBlock(ctx, w, tracker, currentBlock)
 			if err != nil {
-				return nil, errors.Wrap(err, "error writing partial block")
+				return nil, fmt.Errorf("error writing partial block: %w", err)
 			}
 		}
 
 		// ship block to backend if done
-		if currentBlock.Length() >= recordsPerBlock {
-			err = c.finishBlock(ctx, writerCallback, tracker, currentBlock, l)
+		if currentBlock.Length() >= int(recordsPerBlock) {
+			err = c.finishBlock(ctx, w, tracker, currentBlock, l)
 			if err != nil {
-				return nil, errors.Wrap(err, "error shipping block to backend")
+				return nil, fmt.Errorf("error shipping block to backend: %w", err)
 			}
 			currentBlock = nil
 			tracker = nil
@@ -126,23 +127,23 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 
 	// ship final block to backend
 	if currentBlock != nil {
-		err = c.finishBlock(ctx, writerCallback, tracker, currentBlock, l)
+		err = c.finishBlock(ctx, w, tracker, currentBlock, l)
 		if err != nil {
-			return nil, errors.Wrap(err, "error shipping block to backend")
+			return nil, fmt.Errorf("error shipping block to backend: %w", err)
 		}
 	}
 
 	return newCompactedBlocks, nil
 }
 
-func (c *Compactor) appendBlock(ctx context.Context, writerCallback func(*backend.BlockMeta, time.Time) backend.Writer, tracker backend.AppendTracker, block *StreamingBlock) (backend.AppendTracker, error) {
+func (c *Compactor) appendBlock(ctx context.Context, w backend.Writer, tracker backend.AppendTracker, block *StreamingBlock) (backend.AppendTracker, error) {
 	compactionLevel := int(block.BlockMeta().CompactionLevel - 1)
 
 	if c.opts.ObjectsWritten != nil {
 		c.opts.ObjectsWritten(compactionLevel, block.CurrentBufferedObjects())
 	}
 
-	tracker, bytesFlushed, err := block.FlushBuffer(ctx, tracker, writerCallback(block.BlockMeta(), time.Now()))
+	tracker, bytesFlushed, err := block.FlushBuffer(ctx, tracker, w)
 	if err != nil {
 		return nil, err
 	}
@@ -154,10 +155,10 @@ func (c *Compactor) appendBlock(ctx context.Context, writerCallback func(*backen
 	return tracker, nil
 }
 
-func (c *Compactor) finishBlock(ctx context.Context, writerCallback func(*backend.BlockMeta, time.Time) backend.Writer, tracker backend.AppendTracker, block *StreamingBlock, l log.Logger) error {
+func (c *Compactor) finishBlock(ctx context.Context, w backend.Writer, tracker backend.AppendTracker, block *StreamingBlock, l log.Logger) error {
 	level.Info(l).Log("msg", "writing compacted block", "block", fmt.Sprintf("%+v", block.BlockMeta()))
 
-	bytesFlushed, err := block.Complete(ctx, tracker, writerCallback(block.BlockMeta(), time.Now()))
+	bytesFlushed, err := block.Complete(ctx, tracker, w)
 	if err != nil {
 		return err
 	}

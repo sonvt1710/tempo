@@ -2,8 +2,10 @@ package trace
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash"
 	"hash/fnv"
+	"sync"
 
 	"github.com/grafana/tempo/pkg/tempopb"
 )
@@ -31,6 +33,8 @@ func tokenForID(h hash.Hash64, buffer []byte, kind int32, b []byte) token {
 	return token(h.Sum64())
 }
 
+var ErrTraceTooLarge = fmt.Errorf("trace exceeds max size")
+
 // Combiner combines multiple partial traces into one, deduping spans based on
 // ID and kind.  Note that it is destructive. There are design decisions for
 // efficiency:
@@ -38,25 +42,39 @@ func tokenForID(h hash.Hash64, buffer []byte, kind int32, b []byte) token {
 // * Only sort the final result once and if needed.
 // * Don't scan/hash the spans for the last input (final=true).
 type Combiner struct {
-	result   *tempopb.Trace
-	spans    map[token]struct{}
-	combined bool
+	mtx                 sync.Mutex
+	result              *tempopb.Trace
+	spans               map[token]struct{}
+	combined            bool
+	maxSizeBytes        int
+	allowPartialTrace   bool
+	maxTraceSizeReached bool
 }
 
-func NewCombiner() *Combiner {
-	return &Combiner{}
+// It creates a new Trace combiner. If maxSizeBytes is 0, the final trace size is not checked
+// when allowPartialTrace is set to true a partial trace that exceed the max size may be returned
+func NewCombiner(maxSizeBytes int, allowPartialTrace bool) *Combiner {
+	return &Combiner{
+		mtx:               sync.Mutex{},
+		maxSizeBytes:      maxSizeBytes,
+		allowPartialTrace: allowPartialTrace,
+	}
 }
 
 // Consume the given trace and destructively combines its contents.
-func (c *Combiner) Consume(tr *tempopb.Trace) (spanCount int) {
+func (c *Combiner) Consume(tr *tempopb.Trace) (int, error) {
 	return c.ConsumeWithFinal(tr, false)
 }
 
 // ConsumeWithFinal consumes the trace, but allows for performance savings when
 // it is known that this is the last expected input trace.
-func (c *Combiner) ConsumeWithFinal(tr *tempopb.Trace, final bool) (spanCount int) {
-	if tr == nil {
-		return
+func (c *Combiner) ConsumeWithFinal(tr *tempopb.Trace, final bool) (int, error) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
+	var spanCount int
+	if tr == nil || c.IsPartialTrace() {
+		return spanCount, nil
 	}
 
 	h := newHash()
@@ -69,25 +87,30 @@ func (c *Combiner) ConsumeWithFinal(tr *tempopb.Trace, final bool) (spanCount in
 		// Pre-alloc map with input size. This saves having to grow the
 		// map from the small starting size.
 		n := 0
-		for _, b := range c.result.Batches {
+		for _, b := range c.result.ResourceSpans {
 			for _, ils := range b.ScopeSpans {
 				n += len(ils.Spans)
 			}
 		}
 		c.spans = make(map[token]struct{}, n)
 
-		for _, b := range c.result.Batches {
+		for _, b := range c.result.ResourceSpans {
 			for _, ils := range b.ScopeSpans {
 				for _, s := range ils.Spans {
 					c.spans[tokenForID(h, buffer, int32(s.Kind), s.SpanId)] = struct{}{}
 				}
 			}
 		}
-		return
+
+		maxSizeErr := c.sizeError()
+		if c.IsPartialTrace() {
+			return spanCount, nil
+		}
+		return spanCount, maxSizeErr
 	}
 
 	// loop through every span and copy spans in B that don't exist to A
-	for _, b := range tr.Batches {
+	for _, b := range tr.ResourceSpans {
 		notFoundILS := b.ScopeSpans[:0]
 
 		for _, ils := range b.ScopeSpans {
@@ -117,12 +140,30 @@ func (c *Combiner) ConsumeWithFinal(tr *tempopb.Trace, final bool) (spanCount in
 		// if there were some spans not found in A, add everything left in the batch
 		if len(notFoundILS) > 0 {
 			b.ScopeSpans = notFoundILS
-			c.result.Batches = append(c.result.Batches, b)
+			c.result.ResourceSpans = append(c.result.ResourceSpans, b)
 		}
 	}
 
 	c.combined = true
-	return
+	maxSizeErr := c.sizeError()
+	if c.IsPartialTrace() {
+		return spanCount, nil
+	}
+
+	return spanCount, maxSizeErr
+}
+
+func (c *Combiner) sizeError() error {
+	if c.result == nil || c.maxSizeBytes <= 0 {
+		return nil
+	}
+
+	if c.result.Size() > c.maxSizeBytes {
+		c.maxTraceSizeReached = true
+		return fmt.Errorf("%w (max bytes: %d)", ErrTraceTooLarge, c.maxSizeBytes)
+	}
+
+	return nil
 }
 
 // Result returns the final trace and span count.
@@ -136,4 +177,9 @@ func (c *Combiner) Result() (*tempopb.Trace, int) {
 	}
 
 	return c.result, spanCount
+}
+
+// Returns true if the combined trace is a partial one if partal trace is enabled
+func (c *Combiner) IsPartialTrace() bool {
+	return c.maxTraceSizeReached && c.allowPartialTrace
 }
