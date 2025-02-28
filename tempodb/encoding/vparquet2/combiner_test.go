@@ -9,7 +9,6 @@ import (
 )
 
 func TestCombiner(t *testing.T) {
-
 	methods := []func(a, b *Trace) (*Trace, int){
 		func(a, b *Trace) (*Trace, int) {
 			c := NewCombiner()
@@ -135,8 +134,10 @@ func TestCombiner(t *testing.T) {
 							{
 								Spans: []Span{
 									{
-										SpanID:     []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
-										StatusCode: 0,
+										SpanID:         []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+										StatusCode:     0,
+										NestedSetLeft:  1,
+										NestedSetRight: 2,
 									},
 								},
 							},
@@ -179,8 +180,11 @@ func TestCombiner(t *testing.T) {
 							{
 								Spans: []Span{
 									{
-										SpanID:     []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
-										StatusCode: 0,
+										SpanID:         []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+										StatusCode:     0,
+										NestedSetLeft:  1,
+										NestedSetRight: 4,
+										ParentID:       -1,
 									},
 								},
 							},
@@ -194,9 +198,12 @@ func TestCombiner(t *testing.T) {
 							{
 								Spans: []Span{
 									{
-										SpanID:       []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02},
-										ParentSpanID: []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
-										StatusCode:   0,
+										SpanID:         []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02},
+										ParentSpanID:   []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+										StatusCode:     0,
+										ParentID:       1,
+										NestedSetLeft:  2,
+										NestedSetRight: 3,
 									},
 								},
 							},
@@ -224,7 +231,6 @@ func TestCombiner(t *testing.T) {
 }
 
 func BenchmarkCombine(b *testing.B) {
-
 	batchCount := 100
 	spanCounts := []int{
 		100, 1000, 10000,
@@ -251,7 +257,6 @@ func BenchmarkCombine(b *testing.B) {
 }
 
 func BenchmarkSortTrace(b *testing.B) {
-
 	batchCount := 100
 	spanCounts := []int{
 		100, 1000, 10000,
@@ -259,7 +264,6 @@ func BenchmarkSortTrace(b *testing.B) {
 
 	for _, spanCount := range spanCounts {
 		b.Run("SpanCount:"+humanize.SI(float64(batchCount*spanCount), ""), func(b *testing.B) {
-
 			id := test.ValidTraceID(nil)
 			tr := traceToParquet(id, test.MakeTraceWithSpanCount(batchCount, spanCount, id), nil)
 

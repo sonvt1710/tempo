@@ -13,13 +13,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/opentracing/opentracing-go"
 
+	"github.com/grafana/tempo/pkg/dataquality"
 	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/model/decoder"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/traceql"
-	"github.com/grafana/tempo/pkg/warnings"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 )
@@ -36,33 +35,40 @@ type walBlock struct {
 
 	appendFile *os.File
 	appender   Appender
+	encoder    model.SegmentDecoder
 
 	filepath string
 	readFile *os.File
 	once     sync.Once
 }
 
-func createWALBlock(id uuid.UUID, tenantID string, filepath string, e backend.Encoding, dataEncoding string, ingestionSlack time.Duration) (common.WALBlock, error) {
+func createWALBlock(meta *backend.BlockMeta, filepath, dataEncoding string, ingestionSlack time.Duration) (common.WALBlock, error) {
 	if strings.ContainsRune(dataEncoding, ':') || strings.ContainsRune(dataEncoding, '+') ||
 		len([]rune(dataEncoding)) > maxDataEncodingLength {
 		return nil, fmt.Errorf("dataEncoding %s is invalid", dataEncoding)
 	}
 
+	enc, err := model.NewSegmentDecoder(dataEncoding)
+	if err != nil {
+		return nil, err
+	}
+
 	h := &walBlock{
-		meta:           backend.NewBlockMeta(tenantID, id, VersionString, e, dataEncoding),
+		meta:           backend.NewBlockMeta(meta.TenantID, (uuid.UUID)(meta.BlockID), meta.Version, meta.Encoding, dataEncoding),
 		filepath:       filepath,
 		ingestionSlack: ingestionSlack,
+		encoder:        enc,
 	}
 
 	name := h.fullFilename()
 
-	f, err := os.OpenFile(name, os.O_APPEND|os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	f, err := os.OpenFile(name, os.O_APPEND|os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	h.appendFile = f
 
-	dataWriter, err := NewDataWriter(f, e)
+	dataWriter, err := NewDataWriter(f, meta.Encoding)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +80,7 @@ func createWALBlock(id uuid.UUID, tenantID string, filepath string, e backend.En
 
 // openWALBlock returns an AppendBlock that can not be appended to, but can
 // be completed. It can return a warning or a fatal error
-func openWALBlock(filename string, path string, ingestionSlack time.Duration, additionalStartSlack time.Duration) (common.WALBlock, error, error) {
+func openWALBlock(filename, path string, ingestionSlack, additionalStartSlack time.Duration) (common.WALBlock, error, error) {
 	var warning error
 	blockID, tenantID, version, e, dataEncoding, err := ParseFilename(filename)
 	if err != nil {
@@ -103,7 +109,7 @@ func openWALBlock(filename string, path string, ingestionSlack time.Duration, ad
 
 	records, warning, err := ReplayWALAndGetRecords(f, e, func(bytes []byte) error {
 		start, end, err := dec.FastRange(bytes)
-		if err == decoder.ErrUnsupported {
+		if errors.Is(err, decoder.ErrUnsupported) {
 			now := uint32(time.Now().Unix())
 			start = now
 			end = now
@@ -126,7 +132,7 @@ func openWALBlock(filename string, path string, ingestionSlack time.Duration, ad
 	}
 
 	b.appender = NewRecordAppender(records)
-	b.meta.TotalObjects = b.appender.Length()
+	b.meta.TotalObjects = int64(b.appender.Length())
 	b.meta.StartTime = time.Unix(int64(blockStart), 0)
 	b.meta.EndTime = time.Unix(int64(blockEnd), 0)
 
@@ -149,14 +155,32 @@ func ownsWALBlock(entry fs.DirEntry) bool {
 
 // Append adds an id and object to this wal block. start/end should indicate the time range
 // associated with the past object. They are unix epoch seconds.
-func (a *walBlock) Append(id common.ID, b []byte, start, end uint32) error {
+func (a *walBlock) Append(id common.ID, b []byte, start, end uint32, adjustIngestionSlack bool) error {
 	err := a.appender.Append(id, b)
 	if err != nil {
 		return err
 	}
-	start, end = a.adjustTimeRangeForSlack(start, end, 0)
-	a.meta.ObjectAdded(id, start, end)
+
+	if adjustIngestionSlack {
+		start, end = a.adjustTimeRangeForSlack(start, end, 0)
+	}
+
+	a.meta.ObjectAdded(start, end)
 	return nil
+}
+
+func (a *walBlock) AppendTrace(id common.ID, trace *tempopb.Trace, start, end uint32, adjustIngestionSlack bool) error {
+	buff, err := a.encoder.PrepareForWrite(trace, start, end)
+	if err != nil {
+		return err
+	}
+
+	buff2, err := a.encoder.ToObject([][]byte{buff})
+	if err != nil {
+		return err
+	}
+
+	return a.Append(id, buff2, start, end, adjustIngestionSlack)
 }
 
 func (a *walBlock) Flush() error {
@@ -169,6 +193,10 @@ func (a *walBlock) DataLength() uint64 {
 
 func (a *walBlock) BlockMeta() *backend.BlockMeta {
 	return a.meta
+}
+
+func (a *walBlock) IngestionSlack() time.Duration {
+	return a.ingestionSlack
 }
 
 // Iterator returns a common.Iterator that is secretly also a BytesIterator for use internally
@@ -221,10 +249,10 @@ func (a *walBlock) Clear() error {
 	return os.Remove(name)
 }
 
-// Find implements common.Finder
-func (a *walBlock) FindTraceByID(ctx context.Context, id common.ID, opts common.SearchOptions) (*tempopb.Trace, error) {
-	span, _ := opentracing.StartSpanFromContext(ctx, "v2WalBlock.FindTraceByID")
-	defer span.Finish()
+// FindTraceByID Find implements common.Finder
+func (a *walBlock) FindTraceByID(ctx context.Context, id common.ID, _ common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
+	_, span := tracer.Start(ctx, "v2WalBlock.FindTraceByID")
+	defer span.End()
 
 	combiner := model.StaticCombiner
 
@@ -258,31 +286,49 @@ func (a *walBlock) FindTraceByID(ctx context.Context, id common.ID, opts common.
 		return nil, err
 	}
 
-	return dec.PrepareForRead(bytes)
+	trace, err := dec.PrepareForRead(bytes)
+	return &tempopb.TraceByIDResponse{
+		Trace:   trace,
+		Metrics: &tempopb.TraceByIDMetrics{},
+	}, err
 }
 
 // Search implements common.Searcher
-func (a *walBlock) Search(ctx context.Context, req *tempopb.SearchRequest, opts common.SearchOptions) (*tempopb.SearchResponse, error) {
+func (a *walBlock) Search(context.Context, *tempopb.SearchRequest, common.SearchOptions) (*tempopb.SearchResponse, error) {
 	return nil, common.ErrUnsupported
 }
 
-// Search implements common.Searcher
-func (a *walBlock) SearchTags(ctx context.Context, scope traceql.AttributeScope, cb common.TagCallback, opts common.SearchOptions) error {
+// SearchTags implements common.Searcher
+func (a *walBlock) SearchTags(context.Context, traceql.AttributeScope, common.TagsCallback, common.MetricsCallback, common.SearchOptions) error {
 	return common.ErrUnsupported
 }
 
 // SearchTagValues implements common.Searcher
-func (a *walBlock) SearchTagValues(ctx context.Context, tag string, cb common.TagCallback, opts common.SearchOptions) error {
+func (a *walBlock) SearchTagValues(context.Context, string, common.TagValuesCallback, common.MetricsCallback, common.SearchOptions) error {
 	return common.ErrUnsupported
 }
 
-func (a *walBlock) SearchTagValuesV2(context.Context, traceql.Attribute, common.TagCallbackV2, common.SearchOptions) error {
+func (a *walBlock) SearchTagValuesV2(context.Context, traceql.Attribute, common.TagValuesCallbackV2, common.MetricsCallback, common.SearchOptions) error {
 	return common.ErrUnsupported
 }
 
 // Fetch implements traceql.SpansetFetcher
 func (a *walBlock) Fetch(context.Context, traceql.FetchSpansRequest, common.SearchOptions) (traceql.FetchSpansResponse, error) {
 	return traceql.FetchSpansResponse{}, common.ErrUnsupported
+}
+
+// FetchTagValues implements common.Searcher
+func (a *walBlock) FetchTagValues(context.Context, traceql.FetchTagValuesRequest, traceql.FetchTagValuesCallback, common.MetricsCallback, common.SearchOptions) error {
+	return common.ErrUnsupported
+}
+
+// FetchTagNames implements common.Searcher
+func (a *walBlock) FetchTagNames(context.Context, traceql.FetchTagsRequest, traceql.FetchTagsCallback, common.MetricsCallback, common.SearchOptions) error {
+	return common.ErrUnsupported
+}
+
+func (a *walBlock) Validate(context.Context) error {
+	return common.ErrUnsupported
 }
 
 func (a *walBlock) fullFilename() string {
@@ -320,14 +366,14 @@ func (a *walBlock) file() (*os.File, error) {
 		if a.readFile == nil {
 			name := a.fullFilename()
 
-			a.readFile, err = os.OpenFile(name, os.O_RDONLY, 0644)
+			a.readFile, err = os.OpenFile(name, os.O_RDONLY, 0o600)
 		}
 	})
 
 	return a.readFile, err
 }
 
-func (a *walBlock) adjustTimeRangeForSlack(start uint32, end uint32, additionalStartSlack time.Duration) (uint32, uint32) {
+func (a *walBlock) adjustTimeRangeForSlack(start, end uint32, additionalStartSlack time.Duration) (uint32, uint32) {
 	now := time.Now()
 	startOfRange := uint32(now.Add(-a.ingestionSlack).Add(-additionalStartSlack).Unix())
 	endOfRange := uint32(now.Add(a.ingestionSlack).Unix())
@@ -337,13 +383,13 @@ func (a *walBlock) adjustTimeRangeForSlack(start uint32, end uint32, additionalS
 		warn = true
 		start = uint32(now.Unix())
 	}
-	if end > endOfRange {
+	if end > endOfRange || end < start {
 		warn = true
 		end = uint32(now.Unix())
 	}
 
 	if warn {
-		warnings.Metric.WithLabelValues(a.meta.TenantID, warnings.ReasonOutsideIngestionSlack).Inc()
+		dataquality.WarnOutsideIngestionSlack(a.meta.TenantID)
 	}
 
 	return start, end

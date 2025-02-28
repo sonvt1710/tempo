@@ -1,22 +1,34 @@
 package traceql
 
-import "fmt"
+import (
+	"fmt"
+	"regexp"
+)
 
 // unsupportedError is returned for traceql features that are not yet supported.
 type unsupportedError struct {
 	feature string
 }
 
-func newUnsupportedError(feature string) unsupportedError {
-	return unsupportedError{feature: feature}
+func newUnsupportedError(feature string) *unsupportedError {
+	return &unsupportedError{feature: feature}
 }
 
-func (e unsupportedError) Error() string {
+func (e *unsupportedError) Error() string {
 	return e.feature + " not yet supported"
 }
 
 func (r RootExpr) validate() error {
-	return r.Pipeline.validate()
+	err := r.Pipeline.validate()
+	if err != nil {
+		return err
+	}
+
+	if r.MetricsPipeline != nil {
+		return r.MetricsPipeline.validate()
+	}
+
+	return nil
 }
 
 func (p Pipeline) validate() error {
@@ -30,18 +42,26 @@ func (p Pipeline) validate() error {
 }
 
 func (o GroupOperation) validate() error {
-	return newUnsupportedError("by()")
-
 	// todo: once grouping is supported the below validation will apply
-	// if !o.Expression.referencesSpan() {
-	// 	return fmt.Errorf("grouping field expressions must reference the span: %s", o.String())
-	// }
+	if !o.Expression.referencesSpan() {
+		return fmt.Errorf("grouping field expressions must reference the span: %s", o.String())
+	}
 
-	// return o.Expression.validate()
+	return o.Expression.validate()
 }
 
 func (o CoalesceOperation) validate() error {
-	return newUnsupportedError("coalesce()")
+	return nil
+}
+
+func (o SelectOperation) validate() error {
+	for _, e := range o.attrs {
+		if err := e.validate(); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (o ScalarOperation) validate() error {
@@ -94,21 +114,11 @@ func (a Aggregate) validate() error {
 }
 
 func (o SpansetOperation) validate() error {
-	// TODO validate operator is a SpanSetOperator
 	if err := o.LHS.validate(); err != nil {
 		return err
 	}
-	if err := o.RHS.validate(); err != nil {
-		return err
-	}
 
-	// supported spanset operations
-	switch o.Op {
-	case OpSpansetChild, OpSpansetDescendant, OpSpansetSibling:
-		return newUnsupportedError(fmt.Sprintf("spanset operation (%v)", o.Op))
-	}
-
-	return nil
+	return o.RHS.validate()
 }
 
 func (f SpansetFilter) validate() error {
@@ -158,7 +168,7 @@ func (f ScalarFilter) validate() error {
 	return nil
 }
 
-func (o BinaryOperation) validate() error {
+func (o *BinaryOperation) validate() error {
 	if err := o.LHS.validate(); err != nil {
 		return err
 	}
@@ -173,14 +183,41 @@ func (o BinaryOperation) validate() error {
 		return fmt.Errorf("binary operations must operate on the same type: %s", o.String())
 	}
 
+	if rhsT == TypeNil && o.Op == OpEqual {
+		return newUnsupportedError("{.a = nil}")
+	}
+
 	if !o.Op.binaryTypesValid(lhsT, rhsT) {
 		return fmt.Errorf("illegal operation for the given types: %s", o.String())
 	}
 
+	// if this is a regex operator confirm the RHS is a valid regex
+	if o.Op == OpRegex || o.Op == OpNotRegex {
+		_, err := regexp.Compile(o.RHS.String())
+		if err != nil {
+			return fmt.Errorf("invalid regex: %s", o.RHS.String())
+		}
+	}
+
+	// this condition may not be possible to hit since it's not parseable.
+	// however, if we did somehow end up this situation, it would be good to return
+	// a reasonable error
 	switch o.Op {
 	case OpSpansetChild,
+		OpSpansetParent,
 		OpSpansetDescendant,
-		OpSpansetSibling:
+		OpSpansetAncestor,
+		OpSpansetSibling,
+		OpSpansetNotChild,
+		OpSpansetNotParent,
+		OpSpansetNotSibling,
+		OpSpansetNotAncestor,
+		OpSpansetNotDescendant,
+		OpSpansetUnionChild,
+		OpSpansetUnionParent,
+		OpSpansetUnionSibling,
+		OpSpansetUnionAncestor,
+		OpSpansetUnionDescendant:
 		return newUnsupportedError(fmt.Sprintf("binary operation (%v)", o.Op))
 	}
 
@@ -204,11 +241,7 @@ func (o UnaryOperation) validate() error {
 	return nil
 }
 
-func (n Static) validate() error {
-	if n.Type == TypeNil {
-		return newUnsupportedError("nil")
-	}
-
+func (s Static) validate() error {
 	return nil
 }
 
@@ -217,10 +250,13 @@ func (a Attribute) validate() error {
 		return newUnsupportedError("parent")
 	}
 	switch a.Intrinsic {
-	case IntrinsicParent,
-		IntrinsicChildCount:
+	case IntrinsicParent, IntrinsicChildCount:
 		return newUnsupportedError(fmt.Sprintf("intrinsic (%v)", a.Intrinsic))
 	}
 
+	return nil
+}
+
+func (h *Hints) validate() error {
 	return nil
 }

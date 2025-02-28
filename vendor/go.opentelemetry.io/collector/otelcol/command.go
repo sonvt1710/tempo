@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package otelcol // import "go.opentelemetry.io/collector/otelcol"
 
@@ -24,37 +13,53 @@ import (
 )
 
 // NewCommand constructs a new cobra.Command using the given CollectorSettings.
+// Any URIs specified in CollectorSettings.ConfigProviderSettings.ResolverSettings.URIs
+// are considered defaults and will be overwritten by config flags passed as
+// command-line arguments to the executable.
+// At least one Provider must be set.
 func NewCommand(set CollectorSettings) *cobra.Command {
 	flagSet := flags(featuregate.GlobalRegistry())
 	rootCmd := &cobra.Command{
 		Use:          set.BuildInfo.Command,
 		Version:      set.BuildInfo.Version,
 		SilenceUsage: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			col, err := newCollectorWithFlags(set, flagSet)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			err := updateSettingsUsingFlags(&set, flagSet)
+			if err != nil {
+				return err
+			}
+
+			col, err := NewCollector(set)
 			if err != nil {
 				return err
 			}
 			return col.Run(cmd.Context())
 		},
 	}
-	rootCmd.AddCommand(newBuildSubCommand(set))
+	rootCmd.AddCommand(newComponentsCommand(set))
+	rootCmd.AddCommand(newValidateSubCommand(set, flagSet))
 	rootCmd.Flags().AddGoFlagSet(flagSet)
 	return rootCmd
 }
 
-func newCollectorWithFlags(set CollectorSettings, flags *flag.FlagSet) (*Collector, error) {
-	if set.ConfigProvider == nil {
-		configFlags := getConfigFlag(flags)
-		if len(configFlags) == 0 {
-			return nil, errors.New("at least one config flag must be provided")
-		}
+// Puts command line flags from flags into the CollectorSettings, to be used during config resolution.
+func updateSettingsUsingFlags(set *CollectorSettings, flags *flag.FlagSet) error {
+	resolverSet := &set.ConfigProviderSettings.ResolverSettings
+	configFlags := getConfigFlag(flags)
 
-		var err error
-		set.ConfigProvider, err = NewConfigProvider(newDefaultConfigProviderSettings(configFlags))
-		if err != nil {
-			return nil, err
-		}
+	if len(configFlags) > 0 {
+		resolverSet.URIs = configFlags
 	}
-	return NewCollector(set)
+	if len(resolverSet.URIs) == 0 {
+		return errors.New("at least one config flag must be provided")
+	}
+
+	if set.ConfigProviderSettings.ResolverSettings.DefaultScheme == "" {
+		set.ConfigProviderSettings.ResolverSettings.DefaultScheme = "env"
+	}
+
+	if len(resolverSet.ProviderFactories) == 0 {
+		return errors.New("at least one Provider must be supplied")
+	}
+	return nil
 }

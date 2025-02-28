@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/weaveworks/common/user"
 )
 
 var (
@@ -154,7 +154,7 @@ func (m *Queue[T]) worker() {
 			// This is important during shutdown to ensure that the queue is drained
 			select {
 			case req, ok := <-m.reqChan:
-				if !ok { //closed
+				if !ok { // closed
 					return
 				}
 

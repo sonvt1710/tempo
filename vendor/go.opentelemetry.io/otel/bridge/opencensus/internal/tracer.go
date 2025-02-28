@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package internal // import "go.opentelemetry.io/otel/bridge/opencensus/internal"
 
@@ -48,7 +37,7 @@ func (o *Tracer) StartSpan(ctx context.Context, name string, s ...octrace.StartO
 // StartSpanWithRemoteParent starts a new child span of the span from the
 // given parent.
 func (o *Tracer) StartSpanWithRemoteParent(ctx context.Context, name string, parent octrace.SpanContext, s ...octrace.StartOption) (context.Context, *octrace.Span) {
-	// make sure span context is zero'd out so we use the remote parent
+	// make sure span context is zeroed out so we use the remote parent
 	ctx = trace.ContextWithSpan(ctx, nil)
 	ctx = trace.ContextWithRemoteSpanContext(ctx, oc2otel.SpanContext(parent))
 	return o.StartSpan(ctx, name, s...)

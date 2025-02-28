@@ -1,25 +1,14 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package component // import "go.opentelemetry.io/collector/component"
 
 import (
+	"errors"
+	"fmt"
 	"reflect"
-
-	"go.uber.org/multierr"
-
-	"go.opentelemetry.io/collector/confmap"
+	"strconv"
+	"strings"
 )
 
 // Config defines the configuration for a component.Component.
@@ -35,17 +24,6 @@ type Config any
 // for an interface type Foo is to use a *Foo value.
 var configValidatorType = reflect.TypeOf((*ConfigValidator)(nil)).Elem()
 
-// UnmarshalConfig helper function to UnmarshalConfig a Config.
-// It checks if the config implements confmap.Unmarshaler and uses that if available,
-// otherwise uses Map.UnmarshalExact, erroring if a field is nonexistent.
-func UnmarshalConfig(conf *confmap.Conf, intoCfg Config) error {
-	if cu, ok := intoCfg.(confmap.Unmarshaler); ok {
-		return cu.Unmarshal(conf)
-	}
-
-	return conf.Unmarshal(intoCfg, confmap.WithErrorUnused())
-}
-
 // ConfigValidator defines an optional interface for configurations to implement to do validation.
 type ConfigValidator interface {
 	// Validate the configuration and returns an error if invalid.
@@ -55,46 +33,119 @@ type ConfigValidator interface {
 // ValidateConfig validates a config, by doing this:
 //   - Call Validate on the config itself if the config implements ConfigValidator.
 func ValidateConfig(cfg Config) error {
-	return validate(reflect.ValueOf(cfg))
+	var err error
+
+	for _, validationErr := range validate(reflect.ValueOf(cfg)) {
+		err = errors.Join(err, validationErr)
+	}
+
+	return err
 }
 
-func validate(v reflect.Value) error {
+type pathError struct {
+	err  error
+	path []string
+}
+
+func (pe pathError) Error() string {
+	if len(pe.path) > 0 {
+		var path string
+		sb := strings.Builder{}
+
+		_, _ = sb.WriteString(pe.path[len(pe.path)-1])
+		for i := len(pe.path) - 2; i >= 0; i-- {
+			_, _ = sb.WriteString("::")
+			_, _ = sb.WriteString(pe.path[i])
+		}
+		path = sb.String()
+
+		return fmt.Sprintf("%s: %s", path, pe.err)
+	}
+
+	return pe.err.Error()
+}
+
+func (pe pathError) Unwrap() error {
+	return pe.err
+}
+
+func validate(v reflect.Value) []pathError {
+	errs := []pathError{}
 	// Validate the value itself.
 	switch v.Kind() {
 	case reflect.Invalid:
 		return nil
-	case reflect.Ptr:
+	case reflect.Ptr, reflect.Interface:
 		return validate(v.Elem())
 	case reflect.Struct:
-		var errs error
-		errs = multierr.Append(errs, callValidateIfPossible(v))
+		err := callValidateIfPossible(v)
+		if err != nil {
+			errs = append(errs, pathError{err: err})
+		}
+
 		// Reflect on the pointed data and check each of its fields.
 		for i := 0; i < v.NumField(); i++ {
 			if !v.Type().Field(i).IsExported() {
 				continue
 			}
-			errs = multierr.Append(errs, validate(v.Field(i)))
+			field := v.Type().Field(i)
+			path := fieldName(field)
+
+			subpathErrs := validate(v.Field(i))
+			for _, err := range subpathErrs {
+				errs = append(errs, pathError{
+					err:  err.err,
+					path: append(err.path, path),
+				})
+			}
 		}
 		return errs
 	case reflect.Slice, reflect.Array:
-		var errs error
-		errs = multierr.Append(errs, callValidateIfPossible(v))
+		err := callValidateIfPossible(v)
+		if err != nil {
+			errs = append(errs, pathError{err: err})
+		}
+
 		// Reflect on the pointed data and check each of its fields.
 		for i := 0; i < v.Len(); i++ {
-			errs = multierr.Append(errs, validate(v.Index(i)))
+			subPathErrs := validate(v.Index(i))
+
+			for _, err := range subPathErrs {
+				errs = append(errs, pathError{
+					err:  err.err,
+					path: append(err.path, strconv.Itoa(i)),
+				})
+			}
 		}
 		return errs
 	case reflect.Map:
-		var errs error
-		errs = multierr.Append(errs, callValidateIfPossible(v))
+		err := callValidateIfPossible(v)
+		if err != nil {
+			errs = append(errs, pathError{err: err})
+		}
+
 		iter := v.MapRange()
 		for iter.Next() {
-			errs = multierr.Append(errs, validate(iter.Key()))
-			errs = multierr.Append(errs, validate(iter.Value()))
+			keyErrs := validate(iter.Key())
+			valueErrs := validate(iter.Value())
+			key := stringifyMapKey(iter.Key())
+
+			for _, err := range keyErrs {
+				errs = append(errs, pathError{err: err.err, path: append(err.path, key)})
+			}
+
+			for _, err := range valueErrs {
+				errs = append(errs, pathError{err: err.err, path: append(err.path, key)})
+			}
 		}
 		return errs
 	default:
-		return callValidateIfPossible(v)
+		err := callValidateIfPossible(v)
+		if err != nil {
+			return []pathError{{err: err}}
+		}
+
+		return nil
 	}
 }
 
@@ -105,10 +156,10 @@ func callValidateIfPossible(v reflect.Value) error {
 	}
 
 	// If the pointer type implements ConfigValidator call Validate on the pointer to the current value.
-	if reflect.PtrTo(v.Type()).Implements(configValidatorType) {
+	if reflect.PointerTo(v.Type()).Implements(configValidatorType) {
 		// If not addressable, then create a new *V pointer and set the value to current v.
 		if !v.CanAddr() {
-			pv := reflect.New(reflect.PtrTo(v.Type()).Elem())
+			pv := reflect.New(reflect.PointerTo(v.Type()).Elem())
 			pv.Elem().Set(v)
 			v = pv.Elem()
 		}
@@ -118,21 +169,38 @@ func callValidateIfPossible(v reflect.Value) error {
 	return nil
 }
 
-// Type is the component type as it is used in the config.
-type Type string
+func fieldName(field reflect.StructField) string {
+	var fieldName string
+	if tag, ok := field.Tag.Lookup("mapstructure"); ok {
+		tags := strings.Split(tag, ",")
+		if len(tags) > 0 {
+			fieldName = tags[0]
+		}
+	}
+	// Even if the mapstructure tag exists, the field name may not
+	// be available, so set it if it is still blank.
+	if len(fieldName) == 0 {
+		fieldName = strings.ToLower(field.Name)
+	}
 
-// DataType is a special Type that represents the data types supported by the collector. We currently support
-// collecting metrics, traces and logs, this can expand in the future.
-type DataType = Type
+	return fieldName
+}
 
-// Currently supported data types. Add new data types here when new types are supported in the future.
-const (
-	// DataTypeTraces is the data type tag for traces.
-	DataTypeTraces DataType = "traces"
+func stringifyMapKey(val reflect.Value) string {
+	var key string
 
-	// DataTypeMetrics is the data type tag for metrics.
-	DataTypeMetrics DataType = "metrics"
+	if str, ok := val.Interface().(string); ok {
+		key = str
+	} else if stringer, ok := val.Interface().(fmt.Stringer); ok {
+		key = stringer.String()
+	} else {
+		switch val.Kind() {
+		case reflect.Ptr, reflect.Interface, reflect.Struct, reflect.Slice, reflect.Array, reflect.Map:
+			key = fmt.Sprintf("[%T key]", val.Interface())
+		default:
+			key = fmt.Sprintf("%v", val.Interface())
+		}
+	}
 
-	// DataTypeLogs is the data type tag for logs.
-	DataTypeLogs DataType = "logs"
-)
+	return key
+}

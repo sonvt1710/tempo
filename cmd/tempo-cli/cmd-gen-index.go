@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -23,7 +24,7 @@ type indexCmd struct {
 func ReplayBlockAndGetRecords(meta *backend.BlockMeta, filepath string) ([]v2.Record, error, error) {
 	var replayError error
 	// replay file to extract records
-	f, err := os.OpenFile(filepath, os.O_RDONLY, 0644)
+	f, err := os.OpenFile(filepath, os.O_RDONLY, 0o600)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -40,7 +41,7 @@ func ReplayBlockAndGetRecords(meta *backend.BlockMeta, filepath string) ([]v2.Re
 	currentOffset := uint64(0)
 	for {
 		buffer, pageLen, err := dataReader.NextPage(buffer)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -60,7 +61,7 @@ func ReplayBlockAndGetRecords(meta *backend.BlockMeta, filepath string) ([]v2.Re
 			lastID = id
 		}
 
-		if iterErr != io.EOF {
+		if !errors.Is(iterErr, io.EOF) {
 			replayError = iterErr
 			break
 		}
@@ -139,7 +140,7 @@ func (cmd *indexCmd) Run(ctx *globalOptions) error {
 	}
 
 	// write to the local backend
-	err = w.Write(context.TODO(), "index", blockID, cmd.TenantID, indexBytes, false)
+	err = w.Write(context.TODO(), "index", blockID, cmd.TenantID, indexBytes, nil)
 	if err != nil {
 		fmt.Println("error writing index to backend", err)
 		return err
@@ -151,7 +152,7 @@ func (cmd *indexCmd) Run(ctx *globalOptions) error {
 
 	// get index file with records
 	indexFilePath := cmd.backendOptions.Bucket + cmd.TenantID + "/" + cmd.BlockID + "/" + indexFilename
-	indexFile, err := os.OpenFile(indexFilePath, os.O_RDONLY, 0644)
+	indexFile, err := os.OpenFile(indexFilePath, os.O_RDONLY, 0o600)
 	if err != nil {
 		fmt.Println("error opening index file")
 		return err
@@ -165,7 +166,7 @@ func (cmd *indexCmd) Run(ctx *globalOptions) error {
 
 	// data reader
 	dataFilePath := cmd.backendOptions.Bucket + cmd.TenantID + "/" + cmd.BlockID + "/" + dataFilename
-	dataFile, err := os.OpenFile(dataFilePath, os.O_RDONLY, 0644)
+	dataFile, err := os.OpenFile(dataFilePath, os.O_RDONLY, 0o600)
 	if err != nil {
 		fmt.Println("error opening data file")
 		return err

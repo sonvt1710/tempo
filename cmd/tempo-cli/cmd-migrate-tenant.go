@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/dustin/go-humanize"
-	"github.com/pkg/errors"
+	"github.com/google/uuid"
 
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding"
@@ -23,7 +23,7 @@ func (cmd *migrateTenantCmd) Run(opts *globalOptions) error {
 
 	readerSource, readerDest, writerDest, err := cmd.setupBackends(opts)
 	if err != nil {
-		return errors.Wrap(err, "setting up backends")
+		return fmt.Errorf("setting up backends: %w", err)
 	}
 	defer func() {
 		readerSource.Shutdown()
@@ -32,13 +32,13 @@ func (cmd *migrateTenantCmd) Run(opts *globalOptions) error {
 
 	sourceTenantIndex, err := readerSource.TenantIndex(ctx, cmd.SourceTenantID)
 	if err != nil {
-		return errors.Wrap(err, "reading source tenant index")
+		return fmt.Errorf("reading source tenant index: %w", err)
 	}
 	fmt.Printf("Blocks in source: %d, compacted: %d\n", len(sourceTenantIndex.Meta), len(sourceTenantIndex.CompactedMeta))
 
 	// TODO create dest directory if it doesn't exist yet?
 
-	blocksDest, err := readerDest.Blocks(ctx, cmd.DestTenantID)
+	blocksDest, _, err := readerDest.Blocks(ctx, cmd.DestTenantID)
 	if err != nil {
 		return err
 	}
@@ -50,7 +50,7 @@ blocks:
 	for _, sourceBlockMeta := range sourceTenantIndex.Meta {
 		// check for collisions
 		for _, uuidDest := range blocksDest {
-			if sourceBlockMeta.BlockID == uuidDest {
+			if (uuid.UUID)(sourceBlockMeta.BlockID) == uuidDest {
 				fmt.Printf("UUID %s exists in source and destination, skipping block\n", sourceBlockMeta.BlockID)
 				continue blocks
 			}
@@ -62,16 +62,16 @@ blocks:
 
 		encoder, err := encoding.FromVersion(sourceBlockMeta.Version)
 		if err != nil {
-			return errors.Wrap(err, "creating encoder from version")
+			return fmt.Errorf("creating encoder from version: %w", err)
 		}
 
 		err = encoder.MigrateBlock(ctx, sourceBlockMeta, &destBlockMeta, readerSource, writerDest)
 		if err != nil {
-			return errors.Wrap(err, "copying block")
+			return fmt.Errorf("copying block: %w", err)
 		}
 
 		copiedBlocks++
-		copiedSize += sourceBlockMeta.Size
+		copiedSize += sourceBlockMeta.Size_
 	}
 
 	fmt.Printf("Finished migrating data. Copied %d blocks, %s\n", copiedBlocks, humanize.Bytes(copiedSize))

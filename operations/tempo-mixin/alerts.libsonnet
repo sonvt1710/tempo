@@ -5,22 +5,6 @@
         name: 'tempo_alerts',
         rules: [
           {
-            alert: 'TempoRequestLatency',
-            expr: |||
-              %s_route:tempo_request_duration_seconds:99quantile{route!~"%s"} > %s
-            ||| % [$._config.group_prefix_jobs, $._config.alerts.p99_request_exclude_regex, $._config.alerts.p99_request_threshold_seconds],
-            'for': '15m',
-            labels: {
-              severity: 'critical',
-            },
-            annotations: {
-              message: |||
-                {{ $labels.job }} {{ $labels.route }} is experiencing {{ printf "%.2f" $value }}s 99th percentile latency.
-              |||,
-              runbook_url: 'https://github.com/grafana/tempo/tree/main/operations/tempo-mixin/runbook.md#TempoRequestLatency',
-            },
-          },
-          {
             alert: 'TempoCompactorUnhealthy',
             expr: |||
               max by (%s) (tempo_ring_members{state="Unhealthy", name="%s", namespace=~"%s"}) > 0
@@ -49,8 +33,36 @@
             },
           },
           {
+            alert: 'TempoIngesterUnhealthy',
+            'for': '15m',
+            expr: |||
+              max by (%s) (tempo_ring_members{state="Unhealthy", name="%s", namespace=~"%s"}) > 0
+            ||| % [$._config.group_by_cluster, $._config.jobs.ingester, $._config.namespace],
+            labels: {
+              severity: 'critical',
+            },
+            annotations: {
+              message: 'There are {{ printf "%f" $value }} unhealthy ingester(s).',
+              runbook_url: 'https://github.com/grafana/tempo/tree/main/operations/tempo-mixin/runbook.md#TempoIngesterUnhealthy',
+            },
+          },
+          {
+            alert: 'TempoMetricsGeneratorUnhealthy',
+            'for': '15m',
+            expr: |||
+              max by (%s) (tempo_ring_members{state="Unhealthy", name="%s", namespace=~"%s"}) > 0
+            ||| % [$._config.group_by_cluster, $._config.jobs.metrics_generator, $._config.namespace],
+            labels: {
+              severity: 'critical',
+            },
+            annotations: {
+              message: 'There are {{ printf "%f" $value }} unhealthy metric-generator(s).',
+              runbook_url: 'https://github.com/grafana/tempo/tree/main/operations/tempo-mixin/runbook.md#TempoMetricsGeneratorUnhealthy',
+            },
+          },
+          {
             alert: 'TempoCompactionsFailing',
-            'for': '5m',
+            'for': '1h',
             expr: |||
               sum by (%s) (increase(tempodb_compaction_errors_total{}[1h])) > %s and
               sum by (%s) (increase(tempodb_compaction_errors_total{}[5m])) > 0
@@ -153,6 +165,20 @@
             },
           },
           {
+            alert: 'TempoBlockListRisingQuickly',
+            expr: |||
+              avg(tempodb_blocklist_length{namespace=~"%(namespace)s", container="compactor"}) / avg(tempodb_blocklist_length{namespace=~"%(namespace)s", container="compactor"} offset 7d) > 1.4
+            ||| % { namespace: $._config.namespace },
+            'for': '15m',
+            labels: {
+              severity: 'critical',
+            },
+            annotations: {
+              message: 'Tempo block list length is up 40 percent over the last 7 days.  Consider scaling compactors.',
+              runbook_url: 'https://github.com/grafana/tempo/tree/main/operations/tempo-mixin/runbook.md#TempoBlockListRisingQuickly',
+            },
+          },
+          {
             alert: 'TempoBadOverrides',
             expr: |||
               sum(tempo_runtime_config_last_reload_successful{namespace=~"%s"} == 0) by (%s)
@@ -166,12 +192,26 @@
               runbook_url: 'https://github.com/grafana/tempo/tree/main/operations/tempo-mixin/runbook.md#TempoBadOverrides',
             },
           },
+          {
+            alert: 'TempoUserConfigurableOverridesReloadFailing',
+            expr: |||
+              sum by (%s) (increase(tempo_overrides_user_configurable_overrides_reload_failed_total{}[1h])) > %s and
+              sum by (%s) (increase(tempo_overrides_user_configurable_overrides_reload_failed_total{}[5m])) > 0
+            ||| % [$._config.group_by_cluster, $._config.alerts.user_configurable_overrides_polls_per_hour_failed, $._config.group_by_cluster],
+            labels: {
+              severity: 'critical',
+            },
+            annotations: {
+              message: 'Greater than %s user-configurable overides reloads failed in the past hour.' % $._config.alerts.user_configurable_overrides_polls_per_hour_failed,
+              runbook_url: 'https://github.com/grafana/tempo/tree/main/operations/tempo-mixin/runbook.md#TempoTenantIndexFailures',
+            },
+          },
           // ingesters
           {
             alert: 'TempoProvisioningTooManyWrites',
             // 30MB/s written to the WAL per ingester max
             expr: |||
-              avg by (%s) (rate(tempo_ingester_bytes_received_total{job=~".+/ingester"}[1m])) / 1024 / 1024 > 30
+              avg by (%s) (rate(tempo_ingester_bytes_received_total{job=~".+/ingester"}[5m])) / 1024 / 1024 > 30
             ||| % $._config.group_by_cluster,
             'for': '15m',
             labels: {

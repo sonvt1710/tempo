@@ -5,7 +5,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cespare/xxhash"
+	"github.com/cespare/xxhash/v2"
 	"github.com/facette/natsort"
 	"github.com/grafana/gomemcache/memcache"
 )
@@ -88,7 +88,6 @@ func (s *MemcachedJumpHashSelector) SetServers(servers ...string) error {
 //
 // Copied from github.com/dgryski/go-jump/blob/master/jump.go
 func jumpHash(key uint64, numBuckets int) int32 {
-
 	var b int64 = -1
 	var j int64
 

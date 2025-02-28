@@ -1,16 +1,16 @@
 ## OpenTelemetry Collector Multitenant
 This example highlights setting up the OpenTelemetry Collector in a multitenant tracing pipeline.
 
-1. First start up the stack.
+1. Start up the stack.
 
 ```console
-docker-compose up -d
+docker compose up -d
 ```
 
-At this point, the following containers should be spun up -
+At this point, the following containers should be spun up:
 
 ```console
-docker-compose ps
+docker compose ps
 ```
 ```
                    Name                                  Command               State                          Ports                        
@@ -35,8 +35,8 @@ ls tempo-data/
 tab to find traces. Also notice that you can query Tempo metrics from the Prometheus data source setup in
 Grafana.
 
-4. To stop the setup use -
+4. To stop the setup use:
 
 ```console
-docker-compose down -v
+docker compose down -v
 ```

@@ -3,11 +3,11 @@ package parquetquery
 import (
 	"context"
 	"math"
-	"math/rand"
 	"os"
+	"strconv"
 	"testing"
 
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -18,49 +18,63 @@ var iterTestCases = []struct {
 	makeIter makeTestIterFn
 }{
 	{"async", func(pf *parquet.File, idx int, filter Predicate, selectAs string) Iterator {
-		return NewColumnIterator(context.TODO(), pf.RowGroups(), idx, selectAs, 1000, filter, selectAs)
+		return NewColumnIterator(context.TODO(), pf.RowGroups(), idx, selectAs, 1000, filter, selectAs, MaxDefinitionLevel)
 	}},
 	{"sync", func(pf *parquet.File, idx int, filter Predicate, selectAs string) Iterator {
-		return NewSyncIterator(context.TODO(), pf.RowGroups(), idx, selectAs, 1000, filter, selectAs)
+		return NewSyncIterator(context.TODO(), pf.RowGroups(), idx, selectAs, 1000, filter, selectAs, MaxDefinitionLevel)
 	}},
 }
 
-// TestNext compares the unrolled Next() with the original nextSlow() to
+// TestTruncate compares the unrolled TruncateRowNumber() with the original truncateRowNumberSlow() to
 // prevent drift
-func TestNext(t *testing.T) {
-	rn1 := RowNumber{0, 0, 0, 0, 0, 0}
-	rn2 := RowNumber{0, 0, 0, 0, 0, 0}
+func TestTruncateRowNumber(t *testing.T) {
+	for i := 0; i <= MaxDefinitionLevel; i++ {
+		rn := RowNumber{1, 2, 3, 4, 5, 6, 7, 8}
 
-	for i := 0; i < 1000; i++ {
-		r := rand.Intn(6)
-		d := rand.Intn(6)
+		newR := TruncateRowNumber(i, rn)
+		oldR := truncateRowNumberSlow(i, rn)
 
-		rn1.Next(r, d)
-		rn2.nextSlow(r, d)
-
-		require.Equal(t, rn1, rn2)
+		require.Equal(t, newR, oldR)
 	}
 }
 
-func TestRowNumber(t *testing.T) {
+func TestInvalidDefinitionLevelTruncate(t *testing.T) {
+	t.Run("TruncateRowNumber -1", func(t *testing.T) {
+		assertPanic(t, func() {
+			rn := RowNumber{1, 2, 3, 4, 5, 6, 7, 8}
+			d := -1
+			TruncateRowNumber(d, rn)
+		})
+	})
+	t.Run("TruncateRowNumber Max+1", func(t *testing.T) {
+		assertPanic(t, func() {
+			rn := RowNumber{1, 2, 3, 4, 5, 6, 7, 8}
+			d := MaxDefinitionLevel + 1
+			TruncateRowNumber(d, rn)
+		})
+	})
+}
+
+func TestRowNumberNext(t *testing.T) {
 	tr := EmptyRowNumber()
-	require.Equal(t, RowNumber{-1, -1, -1, -1, -1, -1}, tr)
+	require.Equal(t, RowNumber{-1, -1, -1, -1, -1, -1, -1, -1}, tr)
 
 	steps := []struct {
-		repetitionLevel int
-		definitionLevel int
-		expected        RowNumber
+		repetitionLevel    int
+		definitionLevel    int
+		maxDefinitionLevel int
+		expected           RowNumber
 	}{
 		// Name.Language.Country examples from the Dremel whitepaper
-		{0, 3, RowNumber{0, 0, 0, 0, -1, -1}},
-		{2, 2, RowNumber{0, 0, 1, -1, -1, -1}},
-		{1, 1, RowNumber{0, 1, -1, -1, -1, -1}},
-		{1, 3, RowNumber{0, 2, 0, 0, -1, -1}},
-		{0, 1, RowNumber{1, 0, -1, -1, -1, -1}},
+		{0, 3, 3, RowNumber{0, 0, 0, 0, -1, -1, -1, -1}},
+		{2, 2, 3, RowNumber{0, 0, 1, -1, -1, -1, -1, -1}},
+		{1, 1, 3, RowNumber{0, 1, -1, -1, -1, -1, -1, -1}},
+		{1, 3, 3, RowNumber{0, 2, 0, 0, -1, -1, -1, -1}},
+		{0, 1, 3, RowNumber{1, 0, -1, -1, -1, -1, -1, -1}},
 	}
 
 	for _, step := range steps {
-		tr.Next(step.repetitionLevel, step.definitionLevel)
+		tr.Next(step.repetitionLevel, step.definitionLevel, step.maxDefinitionLevel)
 		require.Equal(t, step.expected, tr)
 	}
 }
@@ -87,8 +101,8 @@ func TestRowNumberPreceding(t *testing.T) {
 	testCases := []struct {
 		start, preceding RowNumber
 	}{
-		{RowNumber{1000, -1, -1, -1, -1, -1}, RowNumber{999, -1, -1, -1, -1, -1}},
-		{RowNumber{1000, 0, 0, 0, 0, 0}, RowNumber{999, math.MaxInt64, math.MaxInt64, math.MaxInt64, math.MaxInt64, math.MaxInt64}},
+		{RowNumber{1000, -1, -1, -1, -1, -1, -1, -1}, RowNumber{999, -1, -1, -1, -1, -1, -1, -1}},
+		{RowNumber{1000, 0, 0, 0, 0, 0, 0, 0}, RowNumber{999, math.MaxInt32, math.MaxInt32, math.MaxInt32, math.MaxInt32, math.MaxInt32, math.MaxInt32, math.MaxInt32}},
 	}
 
 	for _, tc := range testCases {
@@ -108,7 +122,7 @@ func testColumnIterator(t *testing.T, makeIter makeTestIterFn) {
 	count := 100_000
 	pf := createTestFile(t, count)
 
-	idx, _ := GetColumnIndexByPath(pf, "A")
+	idx, _, _ := GetColumnIndexByPath(pf, "A")
 	iter := makeIter(pf, idx, nil, "A")
 	defer iter.Close()
 
@@ -116,7 +130,7 @@ func testColumnIterator(t *testing.T, makeIter makeTestIterFn) {
 		res, err := iter.Next()
 		require.NoError(t, err)
 		require.NotNil(t, res, "i=%d", i)
-		require.Equal(t, RowNumber{int64(i), -1, -1, -1, -1, -1}, res.RowNumber)
+		require.Equal(t, RowNumber{int32(i), -1, -1, -1, -1, -1, -1, -1}, res.RowNumber)
 		require.Equal(t, int64(i), res.ToMap()["A"][0].Int64())
 	}
 
@@ -137,11 +151,11 @@ func testColumnIteratorSeek(t *testing.T, makeIter makeTestIterFn) {
 	count := 10_000
 	pf := createTestFile(t, count)
 
-	idx, _ := GetColumnIndexByPath(pf, "A")
+	idx, _, _ := GetColumnIndexByPath(pf, "A")
 	iter := makeIter(pf, idx, nil, "A")
 	defer iter.Close()
 
-	seekTos := []int64{
+	seekTos := []int32{
 		100,
 		1234,
 		4567,
@@ -155,8 +169,8 @@ func testColumnIteratorSeek(t *testing.T, makeIter makeTestIterFn) {
 		res, err := iter.SeekTo(rn, 0)
 		require.NoError(t, err)
 		require.NotNil(t, res, "seekTo=%v", seekTo)
-		require.Equal(t, RowNumber{seekTo, -1, -1, -1, -1, -1}, res.RowNumber)
-		require.Equal(t, seekTo, res.ToMap()["A"][0].Int64())
+		require.Equal(t, RowNumber{seekTo, -1, -1, -1, -1, -1, -1, -1}, res.RowNumber)
+		require.Equal(t, seekTo, res.ToMap()["A"][0].Int32())
 	}
 }
 
@@ -174,11 +188,11 @@ func testColumnIteratorPredicate(t *testing.T, makeIter makeTestIterFn) {
 
 	pred := NewIntBetweenPredicate(7001, 7003)
 
-	idx, _ := GetColumnIndexByPath(pf, "A")
+	idx, _, _ := GetColumnIndexByPath(pf, "A")
 	iter := makeIter(pf, idx, pred, "A")
 	defer iter.Close()
 
-	expectedResults := []int64{
+	expectedResults := []int32{
 		7001,
 		7002,
 		7003,
@@ -188,8 +202,8 @@ func testColumnIteratorPredicate(t *testing.T, makeIter makeTestIterFn) {
 		res, err := iter.Next()
 		require.NoError(t, err)
 		require.NotNil(t, res)
-		require.Equal(t, RowNumber{expectedResult, -1, -1, -1, -1, -1}, res.RowNumber)
-		require.Equal(t, expectedResult, res.ToMap()["A"][0].Int64())
+		require.Equal(t, RowNumber{expectedResult, -1, -1, -1, -1, -1, -1, -1}, res.RowNumber)
+		require.Equal(t, expectedResult, res.ToMap()["A"][0].Int32())
 	}
 }
 
@@ -203,7 +217,7 @@ func TestColumnIteratorExitEarly(t *testing.T) {
 	}
 
 	pf := createFileWith(t, rows)
-	idx, _ := GetColumnIndexByPath(pf, "A")
+	idx, _, _ := GetColumnIndexByPath(pf, "A")
 	readSize := 1000
 
 	readIter := func(iter Iterator) (int, error) {
@@ -225,7 +239,7 @@ func TestColumnIteratorExitEarly(t *testing.T) {
 		// Cancel before iterating
 		ctx, cancel := context.WithCancel(context.TODO())
 		cancel()
-		iter := NewColumnIterator(ctx, pf.RowGroups(), idx, "", readSize, nil, "A")
+		iter := NewColumnIterator(ctx, pf.RowGroups(), idx, "", readSize, nil, "A", MaxDefinitionLevel)
 		count, err := readIter(iter)
 		require.ErrorContains(t, err, "context canceled")
 		require.Equal(t, 0, count)
@@ -233,7 +247,7 @@ func TestColumnIteratorExitEarly(t *testing.T) {
 
 	t.Run("cancelledPartial", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.TODO())
-		iter := NewColumnIterator(ctx, pf.RowGroups(), idx, "", readSize, nil, "A")
+		iter := NewColumnIterator(ctx, pf.RowGroups(), idx, "", readSize, nil, "A", MaxDefinitionLevel)
 
 		// Read some results
 		_, err := iter.Next()
@@ -249,7 +263,7 @@ func TestColumnIteratorExitEarly(t *testing.T) {
 
 	t.Run("closedEarly", func(t *testing.T) {
 		// Close before iterating
-		iter := NewColumnIterator(context.TODO(), pf.RowGroups(), idx, "", readSize, nil, "A")
+		iter := NewColumnIterator(context.TODO(), pf.RowGroups(), idx, "", readSize, nil, "A", MaxDefinitionLevel)
 		iter.Close()
 		count, err := readIter(iter)
 		require.NoError(t, err)
@@ -257,7 +271,7 @@ func TestColumnIteratorExitEarly(t *testing.T) {
 	})
 
 	t.Run("closedPartial", func(t *testing.T) {
-		iter := NewColumnIterator(context.TODO(), pf.RowGroups(), idx, "", readSize, nil, "A")
+		iter := NewColumnIterator(context.TODO(), pf.RowGroups(), idx, "", readSize, nil, "A", MaxDefinitionLevel)
 
 		// Read some results
 		_, err := iter.Next()
@@ -285,7 +299,7 @@ func benchmarkColumnIterator(b *testing.B, makeIter makeTestIterFn) {
 	count := 100_000
 	pf := createTestFile(b, count)
 
-	idx, _ := GetColumnIndexByPath(pf, "A")
+	idx, _, _ := GetColumnIndexByPath(pf, "A")
 
 	b.ResetTimer()
 
@@ -302,7 +316,6 @@ func benchmarkColumnIterator(b *testing.B, makeIter makeTestIterFn) {
 		}
 		iter.Close()
 		require.Equal(b, count, actualCount)
-		//fmt.Println(actualCount)
 	}
 }
 
@@ -342,4 +355,38 @@ func createFileWith[T any](t testing.TB, rows []T) *parquet.File {
 	require.NoError(t, err)
 
 	return pf
+}
+
+func TestEqualRowNumber(t *testing.T) {
+	r1 := RowNumber{1, 2, 3, 4, 5, 6}
+	r2 := RowNumber{1, 2, 3, 5, 7, 9}
+
+	require.True(t, EqualRowNumber(0, r1, r2))
+	require.True(t, EqualRowNumber(1, r1, r2))
+	require.True(t, EqualRowNumber(2, r1, r2))
+	require.False(t, EqualRowNumber(3, r1, r2))
+	require.False(t, EqualRowNumber(4, r1, r2))
+	require.False(t, EqualRowNumber(5, r1, r2))
+}
+
+func BenchmarkEqualRowNumber(b *testing.B) {
+	r1 := RowNumber{1, 2, 3, 4, 5, 6, 7, 8}
+	r2 := RowNumber{1, 2, 3, 5, 7, 9, 11, 13}
+
+	for d := 0; d <= MaxDefinitionLevel; d++ {
+		b.Run(strconv.Itoa(d), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				EqualRowNumber(d, r1, r2)
+			}
+		})
+	}
+}
+
+func assertPanic(t *testing.T, f func()) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Errorf("no panic")
+		}
+	}()
+	f()
 }

@@ -8,11 +8,13 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	dslog "github.com/grafana/dskit/log"
 	"github.com/grafana/dskit/services"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/multierr"
 
 	"github.com/grafana/tempo/modules/distributor/queue"
+	"github.com/grafana/tempo/modules/overrides"
 )
 
 const (
@@ -21,9 +23,10 @@ const (
 )
 
 type Overrides interface {
-	TenantIDs() []string
 	Forwarders(tenantID string) []string
 }
+
+var _ Overrides = (overrides.Interface)(nil)
 
 type Manager struct {
 	services.Service
@@ -37,14 +40,14 @@ type Manager struct {
 	tenantToQueueListMu *sync.RWMutex
 }
 
-func NewManager(cfgs ConfigList, logger log.Logger, overrides Overrides) (*Manager, error) {
+func NewManager(cfgs ConfigList, logger log.Logger, overrides Overrides, logLevel dslog.Level) (*Manager, error) {
 	if err := cfgs.Validate(); err != nil {
 		return nil, fmt.Errorf("failed to validate config list: %w", err)
 	}
 
 	forwarderNameToForwarder := make(map[string]Forwarder, len(cfgs))
 	for i, cfg := range cfgs {
-		forwarder, err := New(cfg, logger)
+		forwarder, err := New(cfg, logger, logLevel)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create forwarder for cfg at index=%d: %w", i, err)
 		}

@@ -10,13 +10,12 @@ import (
 	"github.com/grafana/dskit/kv"
 	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/services"
-	tempoUtil "github.com/grafana/tempo/pkg/util"
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/grafana/tempo/modules/overrides"
 	"github.com/grafana/tempo/modules/storage"
 	"github.com/grafana/tempo/pkg/model"
+	tempoUtil "github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/pkg/util/log"
 )
 
@@ -34,16 +33,14 @@ const (
 	reasonCompactorDiscardedSpans = "trace_too_large_to_compact"
 )
 
-var (
-	ringOp = ring.NewOp([]ring.InstanceState{ring.ACTIVE}, nil)
-)
+var ringOp = ring.NewOp([]ring.InstanceState{ring.ACTIVE}, nil)
 
 type Compactor struct {
 	services.Service
 
 	cfg       *Config
 	store     storage.Store
-	overrides *overrides.Overrides
+	overrides overrides.Interface
 
 	// Ring used for sharding compactions.
 	ringLifecycler *ring.BasicLifecycler
@@ -54,7 +51,7 @@ type Compactor struct {
 }
 
 // New makes a new Compactor.
-func New(cfg Config, store storage.Store, overrides *overrides.Overrides, reg prometheus.Registerer) (*Compactor, error) {
+func New(cfg Config, store storage.Store, overrides overrides.Interface, reg prometheus.Registerer) (*Compactor, error) {
 	c := &Compactor{
 		cfg:       &cfg,
 		store:     store,
@@ -85,12 +82,12 @@ func New(cfg Config, store storage.Store, overrides *overrides.Overrides, reg pr
 
 		c.ringLifecycler, err = ring.NewBasicLifecycler(bcfg, compactorRingKey, cfg.OverrideRingKey, lifecyclerStore, delegate, log.Logger, reg)
 		if err != nil {
-			return nil, errors.Wrap(err, "unable to initialize compactor ring lifecycler")
+			return nil, fmt.Errorf("unable to initialize compactor ring lifecycler: %w", err)
 		}
 
 		c.Ring, err = ring.New(c.cfg.ShardingRing.ToLifecyclerConfig().RingConfig, compactorRingKey, cfg.OverrideRingKey, log.Logger, reg)
 		if err != nil {
-			return nil, errors.Wrap(err, "unable to initialize compactor ring")
+			return nil, fmt.Errorf("unable to initialize compactor ring: %w", err)
 		}
 	}
 
@@ -116,7 +113,7 @@ func (c *Compactor) starting(ctx context.Context) (err error) {
 	if c.isSharded() {
 		c.subservices, err = services.NewManager(c.ringLifecycler, c.Ring)
 		if err != nil {
-			return fmt.Errorf("failed to create subservices %w", err)
+			return fmt.Errorf("failed to create subservices: %w", err)
 		}
 		c.subservicesWatcher = services.NewFailureWatcher()
 		c.subservicesWatcher.WatchManager(c.subservices)
@@ -152,7 +149,7 @@ func (c *Compactor) starting(ctx context.Context) (err error) {
 	}
 
 	// this will block until one poll cycle is complete
-	c.store.EnablePolling(c)
+	c.store.EnablePolling(ctx, c)
 
 	return nil
 }
@@ -246,8 +243,9 @@ func (c *Compactor) Combine(dataEncoding string, tenantID string, objs ...[]byte
 }
 
 // RecordDiscardedSpans implements tempodb.CompactorSharder
-func (c *Compactor) RecordDiscardedSpans(count int, tenantID string, traceID string) {
-	level.Warn(log.Logger).Log("msg", "max size of trace exceeded", "tenant", tenantID, "traceId", traceID, "discarded_span_count", count)
+func (c *Compactor) RecordDiscardedSpans(count int, tenantID string, traceID string, rootSpanName string, rootServiceName string) {
+	level.Warn(log.Logger).Log("msg", "max size of trace exceeded", "tenant", tenantID, "traceId", traceID,
+		"rootSpanName", rootSpanName, "rootServiceName", rootServiceName, "discarded_span_count", count)
 	overrides.RecordDiscardedSpans(count, reasonCompactorDiscardedSpans, tenantID)
 }
 
@@ -256,8 +254,17 @@ func (c *Compactor) BlockRetentionForTenant(tenantID string) time.Duration {
 	return c.overrides.BlockRetention(tenantID)
 }
 
+// CompactionDisabledForTenant implements CompactorOverrides
+func (c *Compactor) CompactionDisabledForTenant(tenantID string) bool {
+	return c.overrides.CompactionDisabled(tenantID)
+}
+
 func (c *Compactor) MaxBytesPerTraceForTenant(tenantID string) int {
 	return c.overrides.MaxBytesPerTrace(tenantID)
+}
+
+func (c *Compactor) MaxCompactionRangeForTenant(tenantID string) time.Duration {
+	return c.overrides.MaxCompactionRange(tenantID)
 }
 
 func (c *Compactor) isSharded() bool {
@@ -267,7 +274,7 @@ func (c *Compactor) isSharded() bool {
 // OnRingInstanceRegister is called while the lifecycler is registering the
 // instance within the ring and should return the state and set of tokens to
 // use for the instance itself.
-func (c *Compactor) OnRingInstanceRegister(lifecycler *ring.BasicLifecycler, ringDesc ring.Desc, instanceExists bool, instanceID string, instanceDesc ring.InstanceDesc) (ring.InstanceState, ring.Tokens) {
+func (c *Compactor) OnRingInstanceRegister(_ *ring.BasicLifecycler, ringDesc ring.Desc, instanceExists bool, _ string, instanceDesc ring.InstanceDesc) (ring.InstanceState, ring.Tokens) {
 	// When we initialize the compactor instance in the ring we want to start from
 	// a clean situation, so whatever is the state we set it ACTIVE, while we keep existing
 	// tokens (if any) or the ones loaded from file.
@@ -277,7 +284,8 @@ func (c *Compactor) OnRingInstanceRegister(lifecycler *ring.BasicLifecycler, rin
 	}
 
 	takenTokens := ringDesc.GetTokens()
-	newTokens := ring.GenerateTokens(ringNumTokens-len(tokens), takenTokens)
+	gen := ring.NewRandomTokenGenerator()
+	newTokens := gen.GenerateTokens(ringNumTokens-len(tokens), takenTokens)
 
 	// Tokens sorting will be enforced by the parent caller.
 	tokens = append(tokens, newTokens...)
@@ -287,16 +295,16 @@ func (c *Compactor) OnRingInstanceRegister(lifecycler *ring.BasicLifecycler, rin
 
 // OnRingInstanceTokens is called once the instance tokens are set and are
 // stable within the ring (honoring the observe period, if set).
-func (c *Compactor) OnRingInstanceTokens(lifecycler *ring.BasicLifecycler, tokens ring.Tokens) {}
+func (c *Compactor) OnRingInstanceTokens(*ring.BasicLifecycler, ring.Tokens) {}
 
 // OnRingInstanceStopping is called while the lifecycler is stopping. The lifecycler
 // will continue to hearbeat the ring the this function is executing and will proceed
 // to unregister the instance from the ring only after this function has returned.
-func (c *Compactor) OnRingInstanceStopping(lifecycler *ring.BasicLifecycler) {}
+func (c *Compactor) OnRingInstanceStopping(*ring.BasicLifecycler) {}
 
 // OnRingInstanceHeartbeat is called while the instance is updating its heartbeat
 // in the ring.
-func (c *Compactor) OnRingInstanceHeartbeat(lifecycler *ring.BasicLifecycler, ringDesc *ring.Desc, instanceDesc *ring.InstanceDesc) {
+func (c *Compactor) OnRingInstanceHeartbeat(*ring.BasicLifecycler, *ring.Desc, *ring.InstanceDesc) {
 }
 
 func countSpans(dataEncoding string, objs ...[]byte) (total int) {
@@ -312,7 +320,7 @@ func countSpans(dataEncoding string, objs ...[]byte) (total int) {
 			continue
 		}
 
-		for _, b := range t.Batches {
+		for _, b := range t.ResourceSpans {
 			for _, ilm := range b.ScopeSpans {
 				if len(ilm.Spans) > 0 && traceID == "" {
 					traceID = tempoUtil.TraceIDToHexString(ilm.Spans[0].TraceId)

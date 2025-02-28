@@ -1,7 +1,6 @@
 package registry
 
 import (
-	"fmt"
 	"sync"
 	"time"
 
@@ -11,8 +10,9 @@ import (
 )
 
 type counter struct {
+	//nolint unused
+	metric
 	metricName string
-	labels     []string
 
 	// seriesMtx is used to sync modifications to the map, not to the data in series
 	seriesMtx sync.RWMutex
@@ -20,11 +20,12 @@ type counter struct {
 
 	onAddSeries    func(count uint32) bool
 	onRemoveSeries func(count uint32)
+
+	externalLabels map[string]string
 }
 
 type counterSeries struct {
-	// labelValues should not be modified after creation
-	labelValues []string
+	labels      labels.Labels
 	value       *atomic.Float64
 	lastUpdated *atomic.Int64
 	// firstSeries is used to track if this series is new to the counter.  This
@@ -34,10 +35,10 @@ type counterSeries struct {
 	firstSeries *atomic.Bool
 }
 
-var _ Counter = (*counter)(nil)
-var _ metric = (*counter)(nil)
-
-const insertOffsetDuration = 1 * time.Second
+var (
+	_ Counter = (*counter)(nil)
+	_ metric  = (*counter)(nil)
+)
 
 func (co *counterSeries) isNew() bool {
 	return co.firstSeries.Load()
@@ -47,7 +48,7 @@ func (co *counterSeries) registerSeenSeries() {
 	co.firstSeries.Store(false)
 }
 
-func newCounter(name string, labels []string, onAddSeries func(uint32) bool, onRemoveSeries func(count uint32)) *counter {
+func newCounter(name string, onAddSeries func(uint32) bool, onRemoveSeries func(count uint32), externalLabels map[string]string) *counter {
 	if onAddSeries == nil {
 		onAddSeries = func(uint32) bool {
 			return true
@@ -59,22 +60,19 @@ func newCounter(name string, labels []string, onAddSeries func(uint32) bool, onR
 
 	return &counter{
 		metricName:     name,
-		labels:         labels,
 		series:         make(map[uint64]*counterSeries),
 		onAddSeries:    onAddSeries,
 		onRemoveSeries: onRemoveSeries,
+		externalLabels: externalLabels,
 	}
 }
 
-func (c *counter) Inc(labelValues *LabelValues, value float64) {
+func (c *counter) Inc(labelValueCombo *LabelValueCombo, value float64) {
 	if value < 0 {
 		panic("counter can only increase")
 	}
-	if len(c.labels) != len(labelValues.getValues()) {
-		panic(fmt.Sprintf("length of given label values does not match with labels, labels: %v, label values: %v", c.labels, labelValues))
-	}
 
-	hash := labelValues.getHash()
+	hash := labelValueCombo.getHash()
 
 	c.seriesMtx.RLock()
 	s, ok := c.series[hash]
@@ -89,7 +87,7 @@ func (c *counter) Inc(labelValues *LabelValues, value float64) {
 		return
 	}
 
-	newSeries := c.newSeries(labelValues, value)
+	newSeries := c.newSeries(labelValueCombo, value)
 
 	c.seriesMtx.Lock()
 	defer c.seriesMtx.Unlock()
@@ -102,9 +100,22 @@ func (c *counter) Inc(labelValues *LabelValues, value float64) {
 	c.series[hash] = newSeries
 }
 
-func (c *counter) newSeries(labelValues *LabelValues, value float64) *counterSeries {
+func (c *counter) newSeries(labelValueCombo *LabelValueCombo, value float64) *counterSeries {
+	lbls := labelValueCombo.getLabelPair()
+	lb := labels.NewBuilder(make(labels.Labels, 1+len(lbls.names)+len(c.externalLabels)))
+
+	for i, name := range lbls.names {
+		lb.Set(name, lbls.values[i])
+	}
+
+	for name, value := range c.externalLabels {
+		lb.Set(name, value)
+	}
+
+	lb.Set(labels.MetricName, c.metricName)
+
 	return &counterSeries{
-		labelValues: labelValues.getValuesCopy(),
+		labels:      lb.Labels(),
 		value:       atomic.NewFloat64(value),
 		lastUpdated: atomic.NewInt64(time.Now().UnixMilli()),
 		firstSeries: atomic.NewBool(true),
@@ -120,48 +131,33 @@ func (c *counter) name() string {
 	return c.metricName
 }
 
-func (c *counter) collectMetrics(appender storage.Appender, timeMs int64, externalLabels map[string]string) (activeSeries int, err error) {
+func (c *counter) collectMetrics(appender storage.Appender, timeMs int64) (activeSeries int, err error) {
 	c.seriesMtx.RLock()
 	defer c.seriesMtx.RUnlock()
 
 	activeSeries = len(c.series)
 
-	lbls := make(labels.Labels, 1+len(externalLabels)+len(c.labels))
-	lb := labels.NewBuilder(lbls)
-
-	// set metric name
-	lb.Set(labels.MetricName, c.metricName)
-	// set external labels
-	for name, value := range externalLabels {
-		lb.Set(name, value)
-	}
-
 	for _, s := range c.series {
-		t := time.UnixMilli(timeMs)
-		// set series-specific labels
-		for i, name := range c.labels {
-			lb.Set(name, s.labelValues[i])
-		}
-
 		// If we are about to call Append for the first time on a series, we need
 		// to first insert a 0 value to allow Prometheus to start from a non-null
 		// value.
 		if s.isNew() {
-			_, err = appender.Append(0, lb.Labels(nil), timeMs, 0)
+			// We set the timestamp of the init serie at the end of the previous minute, that way we ensure it ends in a
+			// different aggregation interval to avoid be downsampled.
+			endOfLastMinuteMs := getEndOfLastMinuteMs(timeMs)
+			_, err = appender.Append(0, s.labels, endOfLastMinuteMs, 0)
 			if err != nil {
 				return
 			}
-			// Increment timeMs to ensure that the next value is not at the same time.
-			t = t.Add(insertOffsetDuration)
 			s.registerSeenSeries()
 		}
 
-		_, err = appender.Append(0, lb.Labels(nil), t.UnixMilli(), s.value.Load())
+		_, err = appender.Append(0, s.labels, timeMs, s.value.Load())
 		if err != nil {
 			return
 		}
 
-		// TODO support exemplars
+		// TODO: support exemplars
 	}
 
 	return

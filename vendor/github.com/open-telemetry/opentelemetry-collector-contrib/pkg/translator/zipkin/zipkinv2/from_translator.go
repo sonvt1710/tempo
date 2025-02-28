@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package zipkinv2 // import "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/zipkin/zipkinv2"
 
@@ -27,9 +16,9 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	conventions "go.opentelemetry.io/collector/semconv/v1.6.1"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/idutils"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/tracetranslator"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/traceutil"
+	idutils "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/core/xidutils"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/zipkin/internal/zipkin"
 )
 
@@ -38,9 +27,7 @@ const (
 	spanLinkDataFormat  = "%s|%s|%s|%s|%d"
 )
 
-var (
-	sampled = true
-)
+var sampled = true
 
 // FromTranslator converts from pdata to Zipkin data model.
 type FromTranslator struct{}
@@ -109,7 +96,6 @@ func spanToZipkinSpan(
 	localServiceName string,
 	zTags map[string]string,
 ) (*zipkinmodel.SpanModel, error) {
-
 	tags := aggregateSpanTags(span, zTags)
 
 	zs := &zipkinmodel.SpanModel{}
@@ -329,7 +315,6 @@ func zipkinEndpointFromTags(
 	remoteEndpoint bool,
 	redundantKeys map[string]bool,
 ) (endpoint *zipkinmodel.Endpoint) {
-
 	serviceName := localServiceName
 	if peerSvc, ok := zTags[conventions.AttributePeerService]; ok && remoteEndpoint {
 		serviceName = peerSvc

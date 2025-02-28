@@ -3,18 +3,21 @@ package ingester
 import (
 	"context"
 	"crypto/rand"
+	"flag"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/gogo/protobuf/proto"
+	"github.com/google/uuid"
 	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/kv/consul"
 	"github.com/grafana/dskit/ring"
+	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/weaveworks/common/user"
 
 	"github.com/grafana/tempo/modules/overrides"
 	"github.com/grafana/tempo/modules/storage"
@@ -30,6 +33,7 @@ import (
 	"github.com/grafana/tempo/tempodb/backend/local"
 	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	"github.com/grafana/tempo/tempodb/encoding/vparquet4"
 	"github.com/grafana/tempo/tempodb/wal"
 )
 
@@ -91,7 +95,7 @@ func TestFullTraceReturned(t *testing.T) {
 	trace.SortTrace(testTrace)
 
 	// push the first batch
-	pushBatchV2(t, ingester, testTrace.Batches[0], traceID)
+	pushBatchV2(t, ingester, testTrace.ResourceSpans[0], traceID)
 
 	// force cut all traces
 	for _, instance := range ingester.instances {
@@ -100,7 +104,7 @@ func TestFullTraceReturned(t *testing.T) {
 	}
 
 	// push the 2nd batch
-	pushBatchV2(t, ingester, testTrace.Batches[1], traceID)
+	pushBatchV2(t, ingester, testTrace.ResourceSpans[1], traceID)
 
 	// make sure the trace comes back whole
 	foundTrace, err := ingester.FindTraceByID(ctx, &tempopb.TraceByIDRequest{
@@ -191,7 +195,7 @@ func TestWalDropsZeroLength(t *testing.T) {
 		blockID, err := instance.CutBlockIfReady(0, 0, true)
 		require.NoError(t, err)
 
-		err = instance.CompleteBlock(blockID)
+		err = instance.CompleteBlock(context.Background(), blockID)
 		require.NoError(t, err)
 
 		err = instance.ClearCompletingBlock(blockID)
@@ -233,12 +237,10 @@ func TestSearchWAL(t *testing.T) {
 
 	// search WAL
 	ctx := user.InjectOrgID(context.Background(), "test")
-	searchReq := &tempopb.SearchRequest{Tags: map[string]string{
-		"foo": "bar",
-	}}
+	searchReq := &tempopb.SearchRequest{Query: "{ }"}
 	results, err := inst.Search(ctx, searchReq)
 	require.NoError(t, err)
-	require.Equal(t, uint32(1), results.Metrics.InspectedTraces)
+	require.Equal(t, 1, len(results.Traces))
 
 	// Shutdown
 	require.NoError(t, i.stopping(nil))
@@ -254,7 +256,97 @@ func TestSearchWAL(t *testing.T) {
 
 	results, err = inst.Search(ctx, searchReq)
 	require.NoError(t, err)
-	require.Equal(t, uint32(1), results.Metrics.InspectedTraces)
+	require.Equal(t, 1, len(results.Traces))
+}
+
+func TestRediscoverLocalBlocks(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	ctx := user.InjectOrgID(context.Background(), "test")
+	ingester, traces, traceIDs := defaultIngester(t, tmpDir)
+
+	// force cut all traces
+	for _, instance := range ingester.instances {
+		err := instance.CutCompleteTraces(0, true)
+		require.NoError(t, err, "unexpected error cutting traces")
+	}
+
+	// force complete all blocks
+	for _, instance := range ingester.instances {
+		blockID, err := instance.CutBlockIfReady(0, 0, true)
+		require.NoError(t, err)
+
+		err = instance.CompleteBlock(context.Background(), blockID)
+		require.NoError(t, err)
+
+		err = instance.ClearCompletingBlock(blockID)
+		require.NoError(t, err)
+	}
+
+	// create new ingester.  this should rediscover local blocks
+	ingester, _, _ = defaultIngester(t, tmpDir)
+
+	// should be able to find old traces that were replayed
+	for i, traceID := range traceIDs {
+		foundTrace, err := ingester.FindTraceByID(ctx, &tempopb.TraceByIDRequest{
+			TraceID: traceID,
+		})
+		require.NoError(t, err, "unexpected error querying")
+		require.NotNil(t, foundTrace.Trace)
+		trace.SortTrace(foundTrace.Trace)
+		equal := proto.Equal(traces[i], foundTrace.Trace)
+		require.True(t, equal)
+	}
+}
+
+func TestRediscoverDropsInvalidBlocks(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	ctx := user.InjectOrgID(context.Background(), "test")
+	ingester, _, _ := defaultIngester(t, tmpDir)
+
+	// force cut all traces
+	for _, instance := range ingester.instances {
+		err := instance.CutCompleteTraces(0, true)
+		require.NoError(t, err, "unexpected error cutting traces")
+	}
+
+	// force complete all blocks
+	for _, instance := range ingester.instances {
+		blockID, err := instance.CutBlockIfReady(0, 0, true)
+		require.NoError(t, err)
+
+		err = instance.CompleteBlock(context.Background(), blockID)
+		require.NoError(t, err)
+
+		err = instance.ClearCompletingBlock(blockID)
+		require.NoError(t, err)
+	}
+
+	// create new ingester. this should rediscover local blocks. there should be 1 block
+	ingester, _, _ = defaultIngester(t, tmpDir)
+
+	instance, ok := ingester.instances["test"]
+	require.True(t, ok)
+	require.Len(t, instance.completeBlocks, 1)
+
+	// now mangle a complete block
+	instance, ok = ingester.instances["test"]
+	require.True(t, ok)
+	require.Len(t, instance.completeBlocks, 1)
+
+	// this cheats by reaching into the internals of the block and overwriting the parquet file directly. if this test starts failing
+	// it could be b/c the block internals changed and this no longer breaks a block
+	block := instance.completeBlocks[0]
+	err := block.writer.Write(ctx, vparquet4.DataFileName, uuid.UUID(block.BlockMeta().BlockID), "test", []byte("mangled"), nil)
+	require.NoError(t, err)
+
+	// create new ingester. this should rediscover local blocks. there should be 0 blocks
+	ingester, _, _ = defaultIngester(t, tmpDir)
+
+	instance, ok = ingester.instances["test"]
+	require.True(t, ok)
+	require.Len(t, instance.completeBlocks, 0)
 }
 
 // TODO - This test is flaky and commented out until it's fixed
@@ -307,6 +399,25 @@ func TestSearchWAL(t *testing.T) {
 }
 */
 
+func TestIngesterStartingReadOnly(t *testing.T) {
+	ctx := user.InjectOrgID(context.Background(), "test")
+
+	limits, err := overrides.NewOverrides(defaultOverridesConfig(), nil, prometheus.DefaultRegisterer)
+	require.NoError(t, err)
+
+	// Create ingester but without starting it
+	ingester, err := New(
+		defaultIngesterTestConfig(),
+		defaultIngesterStore(t, t.TempDir()),
+		limits,
+		prometheus.NewPedanticRegistry(),
+		false)
+	require.NoError(t, err)
+
+	_, err = ingester.PushBytesV2(ctx, &tempopb.PushBytesRequest{})
+	require.ErrorIs(t, err, ErrStarting)
+}
+
 func TestFlush(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -339,14 +450,74 @@ func TestFlush(t *testing.T) {
 	}
 }
 
-func defaultIngesterModule(t testing.TB, tmpDir string) *Ingester {
-	ingesterConfig := defaultIngesterTestConfig()
-	limits, err := overrides.NewOverrides(defaultLimitsTestConfig())
-	require.NoError(t, err, "unexpected error creating overrides")
+func TestDedicatedColumns(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("/tmp", "")
+	require.NoError(t, err, "unexpected error getting tempdir")
+	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
 
+	cfg := overrides.Config{}
+	cfg.RegisterFlagsAndApplyDefaults(&flag.FlagSet{})
+	cfg.Defaults.Storage.DedicatedColumns = backend.DedicatedColumns{{Scope: "span", Name: "foo", Type: "string"}}
+
+	i := defaultIngesterWithOverrides(t, tmpDir, cfg)
+	inst, _ := i.getOrCreateInstance("test")
+	require.NotNil(t, inst)
+
+	dec := model.MustNewSegmentDecoder(model.CurrentEncoding)
+
+	// create some search data
+	id := make([]byte, 16)
+	_, err = rand.Read(id)
+	require.NoError(t, err)
+	trace := test.MakeTrace(10, id)
+	b1, err := dec.PrepareForWrite(trace, 0, 0)
+	require.NoError(t, err)
+
+	// push to instance
+	require.NoError(t, inst.PushBytes(context.Background(), id, b1))
+
+	// Write wal
+	require.NoError(t, inst.CutCompleteTraces(0, true))
+
+	assert.Equal(t, cfg.Defaults.Storage.DedicatedColumns, inst.headBlock.BlockMeta().DedicatedColumns)
+
+	// TODO: This search should find a match once the read path is supported
+	ctx := user.InjectOrgID(context.Background(), "test")
+	searchReq := &tempopb.SearchRequest{Query: "{span.foo=\"bar\"}"}
+	results, err := inst.Search(ctx, searchReq)
+	require.NoError(t, err)
+	assert.Len(t, results.Traces, 0)
+
+	blockID, err := inst.CutBlockIfReady(0, 0, true)
+	require.NoError(t, err)
+
+	// TODO: This check should be included as part of the read path
+	inst.blocksMtx.RLock()
+	for _, b := range inst.completingBlocks {
+		assert.Equal(t, cfg.Defaults.Storage.DedicatedColumns, b.BlockMeta().DedicatedColumns)
+	}
+	inst.blocksMtx.RUnlock()
+
+	// Complete block
+	err = inst.CompleteBlock(context.Background(), blockID)
+	require.NoError(t, err)
+
+	// TODO: This check should be included as part of the read path
+	inst.blocksMtx.RLock()
+	for _, b := range inst.completeBlocks {
+		assert.Equal(t, cfg.Defaults.Storage.DedicatedColumns, b.BlockMeta().DedicatedColumns)
+	}
+	inst.blocksMtx.RUnlock()
+}
+
+func defaultIngesterModule(t testing.TB, tmpDir string) *Ingester {
+	return defaultIngesterWithOverrides(t, tmpDir, defaultOverridesConfig())
+}
+
+func defaultIngesterStore(t testing.TB, tmpDir string) storage.Store {
 	s, err := storage.NewStore(storage.Config{
 		Trace: tempodb.Config{
-			Backend: "local",
+			Backend: backend.Local,
 			Local: &local.Config{
 				Path: tmpDir,
 			},
@@ -354,7 +525,7 @@ func defaultIngesterModule(t testing.TB, tmpDir string) *Ingester {
 				IndexDownsampleBytes: 2,
 				BloomFP:              0.01,
 				BloomShardSizeBytes:  100_000,
-				Version:              encoding.DefaultEncoding().Version(),
+				Version:              encoding.LatestEncoding().Version(),
 				Encoding:             backend.EncLZ4_1M,
 				IndexPageSizeBytes:   1000,
 			},
@@ -362,10 +533,20 @@ func defaultIngesterModule(t testing.TB, tmpDir string) *Ingester {
 				Filepath: tmpDir,
 			},
 		},
-	}, log.NewNopLogger())
+	}, nil, log.NewNopLogger())
 	require.NoError(t, err, "unexpected error store")
 
-	ingester, err := New(ingesterConfig, s, limits, prometheus.NewPedanticRegistry())
+	return s
+}
+
+func defaultIngesterWithOverrides(t testing.TB, tmpDir string, o overrides.Config) *Ingester {
+	ingesterConfig := defaultIngesterTestConfig()
+	limits, err := overrides.NewOverrides(o, nil, prometheus.DefaultRegisterer)
+	require.NoError(t, err, "unexpected error creating overrides")
+
+	s := defaultIngesterStore(t, tmpDir)
+
+	ingester, err := New(ingesterConfig, s, limits, prometheus.NewPedanticRegistry(), false)
 	require.NoError(t, err, "unexpected error creating ingester")
 	ingester.replayJitter = false
 
@@ -399,7 +580,7 @@ func defaultIngesterWithPush(t testing.TB, tmpDir string, push func(testing.TB, 
 	}
 
 	for i, trace := range traces {
-		for _, batch := range trace.Batches {
+		for _, batch := range trace.ResourceSpans {
 			push(t, ingester, batch, traceIDs[i])
 		}
 	}
@@ -417,6 +598,7 @@ func defaultIngesterTestConfig() Config {
 		nil,
 	)
 
+	cfg.FlushOpTimeout = 99999 * time.Hour
 	cfg.FlushCheckPeriod = 99999 * time.Hour
 	cfg.MaxTraceIdle = 99999 * time.Hour
 	cfg.ConcurrentFlushes = 1
@@ -430,35 +612,16 @@ func defaultIngesterTestConfig() Config {
 	return cfg
 }
 
-func defaultLimitsTestConfig() overrides.Limits {
-	limits := overrides.Limits{}
-	flagext.DefaultValues(&limits)
-	return limits
+func defaultOverridesConfig() overrides.Config {
+	config := overrides.Config{}
+	config.RegisterFlagsAndApplyDefaults(&flag.FlagSet{})
+	return config
 }
 
 func pushBatchV2(t testing.TB, i *Ingester, batch *v1.ResourceSpans, id []byte) {
 	ctx := user.InjectOrgID(context.Background(), "test")
-	batchDecoder := model.MustNewSegmentDecoder(model_v2.Encoding)
 
-	pbTrace := &tempopb.Trace{
-		Batches: []*v1.ResourceSpans{batch},
-	}
-
-	buffer, err := batchDecoder.PrepareForWrite(pbTrace, 0, 0)
-	require.NoError(t, err)
-
-	_, err = i.PushBytesV2(ctx, &tempopb.PushBytesRequest{
-		Traces: []tempopb.PreallocBytes{
-			{
-				Slice: buffer,
-			},
-		},
-		Ids: []tempopb.PreallocBytes{
-			{
-				Slice: id,
-			},
-		},
-	})
+	_, err := i.PushBytesV2(ctx, makePushBytesRequest(id, batch))
 	require.NoError(t, err)
 }
 
@@ -468,7 +631,7 @@ func pushBatchV1(t testing.TB, i *Ingester, batch *v1.ResourceSpans, id []byte) 
 	batchDecoder := model.MustNewSegmentDecoder(model_v1.Encoding)
 
 	pbTrace := &tempopb.Trace{
-		Batches: []*v1.ResourceSpans{batch},
+		ResourceSpans: []*v1.ResourceSpans{batch},
 	}
 
 	buffer, err := batchDecoder.PrepareForWrite(pbTrace, 0, 0)
@@ -480,10 +643,8 @@ func pushBatchV1(t testing.TB, i *Ingester, batch *v1.ResourceSpans, id []byte) 
 				Slice: buffer,
 			},
 		},
-		Ids: []tempopb.PreallocBytes{
-			{
-				Slice: id,
-			},
+		Ids: [][]byte{
+			id,
 		},
 	})
 	require.NoError(t, err)

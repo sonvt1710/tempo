@@ -40,12 +40,12 @@ type timeWindowBlockEntry struct {
 	meta  *backend.BlockMeta
 	group string // Blocks in the same group will be compacted together. Sort order also determines group priority.
 	order string // Individual block priority within the group.
-	hash  string // Hash string used for sharding ownership, preserves backwards compatibility
+	hash  string // hash string used for sharding ownership, preserves backwards compatibility
 }
 
 var _ (CompactionBlockSelector) = (*timeWindowBlockSelector)(nil)
 
-func newTimeWindowBlockSelector(blocklist []*backend.BlockMeta, maxCompactionRange time.Duration, maxCompactionObjects int, maxBlockBytes uint64, minInputBlocks int, maxInputBlocks int) CompactionBlockSelector {
+func newTimeWindowBlockSelector(blocklist []*backend.BlockMeta, maxCompactionRange time.Duration, maxCompactionObjects int, maxBlockBytes uint64, minInputBlocks, maxInputBlocks int) CompactionBlockSelector {
 	twbs := &timeWindowBlockSelector{
 		MinInputBlocks:       minInputBlocks,
 		MaxInputBlocks:       maxInputBlocks,
@@ -78,23 +78,25 @@ func newTimeWindowBlockSelector(blocklist []*backend.BlockMeta, maxCompactionRan
 			// inside active window.
 			// Group by compaction level and window.
 			// Choose lowest compaction level and most recent windows first.
-			entry.group = fmt.Sprintf("A-%v-%016X", b.CompactionLevel, age)
+			entry.group = fmt.Sprintf("A-%v-%016X-%v", b.CompactionLevel, age, b.ReplicationFactor)
 
 			// Within group choose smallest blocks first.
 			// update after parquet: we want to make sure blocks of the same version end up together
-			entry.order = fmt.Sprintf("%016X-%v", entry.meta.TotalObjects, entry.meta.Version)
+			// update afert vParquet3: we want to make sure blocks of the same dedicated columns end up together
+			entry.order = fmt.Sprintf("%016X-%v-%016X", entry.meta.TotalObjects, entry.meta.Version, entry.meta.DedicatedColumnsHash())
 
-			entry.hash = fmt.Sprintf("%v-%v-%v", b.TenantID, b.CompactionLevel, w)
+			entry.hash = fmt.Sprintf("%v-%v-%v-%v", b.TenantID, b.CompactionLevel, w, b.ReplicationFactor)
 		} else {
 			// outside active window.
 			// Group by window only.  Choose most recent windows first.
-			entry.group = fmt.Sprintf("B-%016X", age)
+			entry.group = fmt.Sprintf("B-%016X-%v", age, b.ReplicationFactor)
 
 			// Within group chose lowest compaction lvl and smallest blocks first.
 			// update after parquet: we want to make sure blocks of the same version end up together
-			entry.order = fmt.Sprintf("%v-%016X-%v", b.CompactionLevel, entry.meta.TotalObjects, entry.meta.Version)
+			// update afert vParquet3: we want to make sure blocks of the same dedicated columns end up together
+			entry.order = fmt.Sprintf("%v-%016X-%v-%016X", b.CompactionLevel, entry.meta.TotalObjects, entry.meta.Version, entry.meta.DedicatedColumnsHash())
 
-			entry.hash = fmt.Sprintf("%v-%v", b.TenantID, w)
+			entry.hash = fmt.Sprintf("%v-%v-%v", b.TenantID, w, b.ReplicationFactor)
 		}
 
 		twbs.entries = append(twbs.entries, entry)
@@ -127,6 +129,7 @@ func (twbs *timeWindowBlockSelector) BlocksToCompact() ([]*backend.BlockMeta, st
 				if twbs.entries[i].group == twbs.entries[j].group &&
 					twbs.entries[i].meta.DataEncoding == twbs.entries[j].meta.DataEncoding &&
 					twbs.entries[i].meta.Version == twbs.entries[j].meta.Version && // update after parquet: only compact blocks of the same version
+					twbs.entries[i].meta.DedicatedColumnsHash() == twbs.entries[j].meta.DedicatedColumnsHash() && // update after vParquet3: only compact blocks of the same dedicated columns
 					len(stripe) <= twbs.MaxInputBlocks &&
 					totalObjects(stripe) <= twbs.MaxCompactionObjects &&
 					totalSize(stripe) <= twbs.MaxBlockBytes {
@@ -161,7 +164,7 @@ func (twbs *timeWindowBlockSelector) BlocksToCompact() ([]*backend.BlockMeta, st
 func totalObjects(entries []timeWindowBlockEntry) int {
 	totalObjects := 0
 	for _, b := range entries {
-		totalObjects += b.meta.TotalObjects
+		totalObjects += int(b.meta.TotalObjects)
 	}
 	return totalObjects
 }
@@ -169,7 +172,7 @@ func totalObjects(entries []timeWindowBlockEntry) int {
 func totalSize(entries []timeWindowBlockEntry) uint64 {
 	sz := uint64(0)
 	for _, b := range entries {
-		sz += b.meta.Size
+		sz += b.meta.Size_
 	}
 	return sz
 }

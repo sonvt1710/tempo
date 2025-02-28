@@ -37,8 +37,9 @@ that can be used by code that is oblivious to the usage of `Providers` and `Conv
 or an individual value (partial configuration) when the `configURI` is embedded into the `Conf` as a values using
 the syntax `${configURI}`.
 
-**Limitation:** when embed a `${configURI}` the uri cannot contain dollar sign ("$") character. This is to allow the
-current implementation to evolve in the future to support embedded uri within uri, e.g. `${http://my.domain.com?os=${OS}}`.
+**Limitation:**
+- When embedding a `${configURI}` the uri cannot contain dollar sign ("$") character unless it embeds another uri.
+- The number of URIs is limited to 100.
 
 ```terminal
               Resolver                   Provider
@@ -86,7 +87,7 @@ The `Resolve` method proceeds in the following steps:
 After the configuration was processed, the `Resolver` can be used as a single point to watch for updates in the
 configuration retrieved via the `Provider` used to retrieve the “initial” configuration and to generate the “effective” one.
 
-```terminal      
+```terminal
          Resolver              Provider
             │                     │
    Watch    │                     │
@@ -98,6 +99,91 @@ configuration retrieved via the `Provider` used to retrieve the “initial” co
             │      onChange       │
             │◄────────────────────┤
 ◄───────────┤                     │
+
 ```
 
-The `Resolver` does that by passing an `onChange` func to each `Provider.Retrieve` call and capturing all watch events. 
+The `Resolver` does that by passing an `onChange` func to each `Provider.Retrieve` call and capturing all watch events.
+
+Calling the `onChange` func from a provider triggers the collector to re-resolve new configuration:
+
+```terminal
+         Resolver              Provider
+            │                     │
+   Watch    │                     │
+───────────►│                     │
+            │                     │
+            .                     .
+            .                     .
+            .                     .
+            │      onChange       │
+            │◄────────────────────┤
+◄───────────┤                     │
+            |                     |
+  Resolve   │                     │
+───────────►│                     │
+            │                     │
+            │      Retrieve       │
+            ├────────────────────►│
+            │        Conf         │
+            │◄────────────────────┤
+◄───────────┤                     │
+```
+
+An example of a `Provider` with an `onChange` func that periodically gets notified can be found in provider_test.go as UpdatingProvider
+
+## Troubleshooting
+
+### Null Maps
+
+Due to how our underlying merge library, [koanf](https://github.com/knadh/koanf), behaves, configuration resolution
+will treat configuration such as
+
+```yaml
+processors:
+```
+
+as null, which is a valid value. As a result if you have configuration `A`:
+
+```yaml
+receivers:
+    nop:
+
+processors:
+    nop:
+
+exporters:
+    nop:
+
+extensions:
+    nop:
+
+service:
+    extensions: [nop]
+    pipelines:
+        traces:
+            receivers: [nop]
+            processors: [nop]
+            exporters: [nop]
+```
+
+and configuration `B`:
+
+```yaml
+processors:
+```
+
+and do `./otelcorecol --config A.yaml --config B.yaml`
+
+The result will be an error:
+
+```
+Error: invalid configuration: service::pipelines::traces: references processor "nop" which is not configured
+2024/06/10 14:37:14 collector server run finished with error: invalid configuration: service::pipelines::traces: references processor "nop" which is not configured
+```
+
+This happens because configuration `B` sets `processors` to null, removing the `nop` processor defined in configuration `A`,
+so the `nop` processor referenced in configuration `A`'s pipeline no longer exists.
+
+This situation can be remedied 2 ways:
+1. Use `{}` when you want to represent an empty map, such as `processors: {}` instead of `processors:`.
+2. Omit configuration like `processors:` from your configuration.

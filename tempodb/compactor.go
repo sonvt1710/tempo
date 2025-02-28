@@ -2,19 +2,24 @@ package tempodb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log/level"
-	"github.com/grafana/tempo/pkg/util"
+	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"go.opentelemetry.io/otel"
+
+	"github.com/grafana/tempo/pkg/dataquality"
+	"github.com/grafana/tempo/pkg/util/tracing"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-	"github.com/opentracing/opentracing-go"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 const (
@@ -27,6 +32,8 @@ const (
 	DefaultFlushSizeBytes     uint32 = 20 * 1024 * 1024 // 20 MiB
 	DefaultIteratorBufferSize        = 1000
 )
+
+var tracer = otel.Tracer("tempodb/compactor")
 
 var (
 	metricCompactionBlocks = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -59,6 +66,13 @@ var (
 		Name:      "compaction_outstanding_blocks",
 		Help:      "Number of blocks remaining to be compacted before next maintenance cycle",
 	}, []string{"tenant"})
+	metricDedupedSpans = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "tempodb",
+		Name:      "compaction_spans_combined_total",
+		Help:      "Number of spans that are deduped per replication factor.",
+	}, []string{"replication_factor"})
+
+	errCompactionJobNoLongerOwned = fmt.Errorf("compaction job no longer owned")
 )
 
 func (rw *readerWriter) compactionLoop(ctx context.Context) {
@@ -67,25 +81,20 @@ func (rw *readerWriter) compactionLoop(ctx context.Context) {
 		compactionCycle = rw.compactorCfg.CompactionCycle
 	}
 
-	ticker := time.NewTicker(compactionCycle)
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
+		// if the context is cancelled, we're shutting down and need to stop compacting
+		if ctx.Err() != nil {
+			break
 		}
 
-		select {
-		case <-ticker.C:
-			rw.doCompaction(ctx)
-		case <-ctx.Done():
-			return
-		}
+		doForAtLeast(ctx, compactionCycle, func() {
+			rw.compactOneTenant(ctx)
+		})
 	}
 }
 
-// doCompaction runs a compaction cycle every 30s
-func (rw *readerWriter) doCompaction(ctx context.Context) {
+// compactOneTenant runs a compaction cycle every 30s
+func (rw *readerWriter) compactOneTenant(ctx context.Context) {
 	// List of all tenants in the block list
 	// The block list is updated by constant polling the storage for tenant indexes and/or tenant blocks (and building the index)
 	tenants := rw.blocklist.Tenants()
@@ -100,8 +109,19 @@ func (rw *readerWriter) doCompaction(ctx context.Context) {
 
 	// Select the next tenant to run compaction for
 	tenantID := tenants[rw.compactorTenantOffset]
+
+	// Skip compaction for tenants which have it disabled.
+	if rw.compactorOverrides.CompactionDisabledForTenant(tenantID) {
+		return
+	}
+
 	// Get the meta file of all non-compacted blocks for the given tenant
 	blocklist := rw.blocklist.Metas(tenantID)
+
+	window := rw.compactorOverrides.MaxCompactionRangeForTenant(tenantID)
+	if window == 0 {
+		window = rw.compactorCfg.MaxCompactionRange
+	}
 
 	// Select which blocks to compact.
 	//
@@ -111,7 +131,7 @@ func (rw *readerWriter) doCompaction(ctx context.Context) {
 	//  2. If blocks are outside the active window, they're grouped only by windows, ignoring compaction level.
 	//   It picks more recent windows first, and compacting blocks only from the same tenant.
 	blockSelector := newTimeWindowBlockSelector(blocklist,
-		rw.compactorCfg.MaxCompactionRange,
+		window,
 		rw.compactorCfg.MaxCompactionObjects,
 		rw.compactorCfg.MaxBlockBytes,
 		defaultMinInputBlocks,
@@ -121,52 +141,107 @@ func (rw *readerWriter) doCompaction(ctx context.Context) {
 
 	level.Info(rw.logger).Log("msg", "starting compaction cycle", "tenantID", tenantID, "offset", rw.compactorTenantOffset)
 	for {
-		select {
-		case <-ctx.Done():
+		// this context is controlled by the service manager. it being cancelled means that the process is shutting down
+		if ctx.Err() != nil {
+			level.Info(rw.logger).Log("msg", "caught context cancelled at the top of the compaction loop. bailing.", "err", ctx.Err(), "cause", context.Cause(ctx))
 			return
-		default:
-			// Pick up to defaultMaxInputBlocks (4) blocks to compact into a single one
-			toBeCompacted, hashString := blockSelector.BlocksToCompact()
-			if len(toBeCompacted) == 0 {
-				measureOutstandingBlocks(tenantID, blockSelector, rw.compactorSharder.Owns)
+		}
 
-				level.Info(rw.logger).Log("msg", "compaction cycle complete. No more blocks to compact", "tenantID", tenantID)
-				return
-			}
-			if !rw.compactorSharder.Owns(hashString) {
-				// continue on this tenant until we find something we own
-				continue
-			}
-			level.Info(rw.logger).Log("msg", "Compacting hash", "hashString", hashString)
-			// Compact selected blocks into a larger one
-			err := rw.compact(ctx, toBeCompacted, tenantID)
+		// Pick up to defaultMaxInputBlocks (4) blocks to compact into a single one
+		toBeCompacted, hashString := blockSelector.BlocksToCompact()
+		if len(toBeCompacted) == 0 {
+			measureOutstandingBlocks(tenantID, blockSelector, rw.compactorSharder.Owns)
 
-			if err == backend.ErrDoesNotExist {
-				level.Warn(rw.logger).Log("msg", "unable to find meta during compaction.  trying again on this block list", "err", err)
-			} else if err != nil {
-				level.Error(rw.logger).Log("msg", "error during compaction cycle", "err", err)
-				metricCompactionErrors.Inc()
-			}
+			level.Info(rw.logger).Log("msg", "compaction cycle complete. No more blocks to compact", "tenantID", tenantID)
+			return
+		}
 
-			// after a maintenance cycle bail out
-			if start.Add(rw.compactorCfg.MaxTimePerTenant).Before(time.Now()) {
-				measureOutstandingBlocks(tenantID, blockSelector, rw.compactorSharder.Owns)
+		owns := func() bool {
+			return rw.compactorSharder.Owns(hashString)
+		}
+		if !owns() {
+			// continue on this tenant until we find something we own
+			continue
+		}
 
-				level.Info(rw.logger).Log("msg", "compacted blocks for a maintenance cycle, bailing out", "tenantID", tenantID)
-				return
-			}
+		level.Info(rw.logger).Log("msg", "Compacting hash", "hashString", hashString)
+		err := rw.compactWhileOwns(ctx, toBeCompacted, tenantID, owns)
+
+		if errors.Is(err, backend.ErrDoesNotExist) {
+			level.Warn(rw.logger).Log("msg", "unable to find meta during compaction. trying again on this block list", "err", err)
+		} else if err != nil {
+			level.Error(rw.logger).Log("msg", "error during compaction cycle", "err", err)
+			metricCompactionErrors.Inc()
+		}
+
+		// after a maintenance cycle bail out
+		if start.Add(rw.compactorCfg.MaxTimePerTenant).Before(time.Now()) {
+			measureOutstandingBlocks(tenantID, blockSelector, rw.compactorSharder.Owns)
+
+			level.Info(rw.logger).Log("msg", "compacted blocks for a maintenance cycle, bailing out", "tenantID", tenantID)
+			return
 		}
 	}
 }
 
-func (rw *readerWriter) compact(ctx context.Context, blockMetas []*backend.BlockMeta, tenantID string) error {
+func (rw *readerWriter) compactWhileOwns(ctx context.Context, blockMetas []*backend.BlockMeta, tenantID string, owns func() bool) error {
+	ownsCtx, cancel := context.WithCancelCause(ctx)
+
+	done := make(chan struct{})
+	defer close(done)
+
+	// every second test if we still own the job. if we don't then cancel the context with a cause
+	// that we can then test for
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			if !owns() {
+				cancel(errCompactionJobNoLongerOwned)
+				return
+			}
+
+			select {
+			case <-ticker.C:
+			case <-done:
+				return
+			case <-ownsCtx.Done():
+				return
+			}
+		}
+	}()
+
+	err := rw.compactOneJob(ownsCtx, blockMetas, tenantID)
+	if errors.Is(err, context.Canceled) && errors.Is(context.Cause(ownsCtx), errCompactionJobNoLongerOwned) {
+		level.Warn(rw.logger).Log("msg", "lost ownership of this job. abandoning job and trying again on this block list", "err", err)
+		return nil
+	}
+
+	// test to see if we still own this job. it would be exceptional to log this message, but would be nice to know. a more likely bad case is that
+	// job ownership changes but that change has not yet propagated to this compactor, so it duplicated data w/o realizing it.
+	if !owns() {
+		// format a string with all input metas
+		sb := &strings.Builder{}
+		for _, meta := range blockMetas {
+			sb.WriteString(meta.BlockID.String())
+			sb.WriteString(", ")
+		}
+
+		level.Error(rw.logger).Log("msg", "lost ownership of this job after compaction. possible data duplication", "tenant", tenantID, "input_blocks", sb.String())
+	}
+
+	return err
+}
+
+func (rw *readerWriter) compactOneJob(ctx context.Context, blockMetas []*backend.BlockMeta, tenantID string) error {
 	level.Debug(rw.logger).Log("msg", "beginning compaction", "num blocks compacting", len(blockMetas))
 
 	// todo - add timeout?
-	span, ctx := opentracing.StartSpanFromContext(ctx, "rw.compact")
-	defer span.Finish()
+	ctx, span := tracer.Start(ctx, "rw.compact")
+	defer span.End()
 
-	traceID, _ := util.ExtractTraceID(ctx)
+	traceID, _ := tracing.ExtractTraceID(ctx)
 	if traceID != "" {
 		level.Info(rw.logger).Log("msg", "beginning compaction", "traceID", traceID)
 	}
@@ -180,11 +255,26 @@ func (rw *readerWriter) compact(ctx context.Context, blockMetas []*backend.Block
 
 	var totalRecords int
 	for _, blockMeta := range blockMetas {
-		level.Info(rw.logger).Log("msg", "compacting block", "block", fmt.Sprintf("%+v", blockMeta))
-		totalRecords += blockMeta.TotalObjects
+		level.Info(rw.logger).Log(
+			"msg", "compacting block",
+			"version", blockMeta.Version,
+			"tenantID", blockMeta.TenantID,
+			"blockID", blockMeta.BlockID.String(),
+			"startTime", blockMeta.StartTime.String(),
+			"endTime", blockMeta.EndTime.String(),
+			"totalObjects", blockMeta.TotalObjects,
+			"size", blockMeta.Size_,
+			"compactionLevel", blockMeta.CompactionLevel,
+			"encoding", blockMeta.Encoding.String(),
+			"totalRecords", blockMeta.TotalObjects,
+			"bloomShardCount", blockMeta.BloomShardCount,
+			"footerSize", blockMeta.FooterSize,
+			"replicationFactor", blockMeta.ReplicationFactor,
+		)
+		totalRecords += int(blockMeta.TotalObjects)
 
 		// Make sure block still exists
-		_, err = rw.r.BlockMeta(ctx, blockMeta.BlockID, tenantID)
+		_, err = rw.r.BlockMeta(ctx, (uuid.UUID)(blockMeta.BlockID), tenantID)
 		if err != nil {
 			return err
 		}
@@ -221,15 +311,24 @@ func (rw *readerWriter) compact(ctx context.Context, blockMetas []*backend.Block
 		ObjectsWritten: func(compactionLevel, objs int) {
 			metricCompactionObjectsWritten.WithLabelValues(strconv.Itoa(compactionLevel)).Add(float64(objs))
 		},
-		SpansDiscarded: func(traceId string, spans int) {
-			rw.compactorSharder.RecordDiscardedSpans(spans, tenantID, traceId)
+		SpansDiscarded: func(traceId, rootSpanName, rootServiceName string, spans int) {
+			rw.compactorSharder.RecordDiscardedSpans(spans, tenantID, traceId, rootSpanName, rootServiceName)
+		},
+		DisconnectedTrace: func() {
+			dataquality.WarnDisconnectedTrace(tenantID, dataquality.PhaseTraceCompactorCombine)
+		},
+		RootlessTrace: func() {
+			dataquality.WarnRootlessTrace(tenantID, dataquality.PhaseTraceCompactorCombine)
+		},
+		DedupedSpans: func(replFactor, dedupedSpans int) {
+			metricDedupedSpans.WithLabelValues(strconv.Itoa(replFactor)).Add(float64(dedupedSpans))
 		},
 	}
 
 	compactor := enc.NewCompactor(opts)
 
 	// Compact selected blocks into a larger one
-	newCompactedBlocks, err := compactor.Compact(ctx, rw.logger, rw.r, rw.getWriterForBlock, blockMetas)
+	newCompactedBlocks, err := compactor.Compact(ctx, rw.logger, rw.r, rw.w, blockMetas)
 	if err != nil {
 		return err
 	}
@@ -248,19 +347,19 @@ func (rw *readerWriter) compact(ctx context.Context, blockMetas []*backend.Block
 		time.Since(startTime),
 	}
 	for _, meta := range newCompactedBlocks {
-		logArgs = append(logArgs, "block", fmt.Sprintf("%+v", meta))
+		logArgs = append(logArgs, "blockID", meta.BlockID.String())
 	}
 	level.Info(rw.logger).Log(logArgs...)
 
 	return nil
 }
 
-func markCompacted(rw *readerWriter, tenantID string, oldBlocks []*backend.BlockMeta, newBlocks []*backend.BlockMeta) error {
+func markCompacted(rw *readerWriter, tenantID string, oldBlocks, newBlocks []*backend.BlockMeta) error {
 	// Check if we have any errors, but continue marking the blocks as compacted
 	var errCount int
 	for _, meta := range oldBlocks {
 		// Mark in the backend
-		if err := rw.c.MarkBlockCompacted(meta.BlockID, tenantID); err != nil {
+		if err := rw.c.MarkBlockCompacted((uuid.UUID)(meta.BlockID), tenantID); err != nil {
 			errCount++
 			level.Error(rw.logger).Log("msg", "unable to mark block compacted", "blockID", meta.BlockID, "tenantID", tenantID, "err", err)
 			metricCompactionErrors.Inc()
@@ -307,8 +406,8 @@ func compactionLevelForBlocks(blockMetas []*backend.BlockMeta) uint8 {
 	level := uint8(0)
 
 	for _, m := range blockMetas {
-		if m.CompactionLevel > level {
-			level = m.CompactionLevel
+		if m.CompactionLevel > uint32(level) {
+			level = uint8(m.CompactionLevel)
 		}
 	}
 
@@ -328,4 +427,23 @@ func (i instrumentedObjectCombiner) Combine(dataEncoding string, objs ...[]byte)
 		metricCompactionObjectsCombined.WithLabelValues(i.compactionLevelLabel).Inc()
 	}
 	return b, wasCombined, err
+}
+
+// doForAtLeast executes the function f. It blocks for at least the passed duration but can go longer. if context is cancelled after
+// the function is done we will bail immediately. in the current use case this means that the process is shutting down
+// we don't force f() to cancel, we assume it also responds to the cancelled context
+func doForAtLeast(ctx context.Context, dur time.Duration, f func()) {
+	startTime := time.Now()
+	f()
+	elapsed := time.Since(startTime)
+
+	if elapsed < dur {
+		ticker := time.NewTicker(dur - elapsed)
+		defer ticker.Stop()
+
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+		}
+	}
 }

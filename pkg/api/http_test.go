@@ -1,11 +1,14 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,16 +34,25 @@ func TestQuerierParseSearchRequest(t *testing.T) {
 		{
 			name: "empty query",
 			expected: &tempopb.SearchRequest{
-				Tags:  map[string]string{},
-				Limit: defaultLimit,
+				Tags:            map[string]string{},
+				SpansPerSpanSet: defaultSpansPerSpanSet,
+			},
+		},
+		{
+			name:     "zero ranges",
+			urlQuery: "start=0&end=0",
+			expected: &tempopb.SearchRequest{
+				Tags:            map[string]string{},
+				SpansPerSpanSet: defaultSpansPerSpanSet,
 			},
 		},
 		{
 			name:     "limit set",
 			urlQuery: "limit=10",
 			expected: &tempopb.SearchRequest{
-				Tags:  map[string]string{},
-				Limit: 10,
+				Tags:            map[string]string{},
+				Limit:           10,
+				SpansPerSpanSet: defaultSpansPerSpanSet,
 			},
 		},
 		{
@@ -62,10 +74,10 @@ func TestQuerierParseSearchRequest(t *testing.T) {
 			name:     "minDuration and maxDuration",
 			urlQuery: "minDuration=10s&maxDuration=20s",
 			expected: &tempopb.SearchRequest{
-				Tags:          map[string]string{},
-				MinDurationMs: 10000,
-				MaxDurationMs: 20000,
-				Limit:         defaultLimit,
+				Tags:            map[string]string{},
+				MinDurationMs:   10000,
+				MaxDurationMs:   20000,
+				SpansPerSpanSet: defaultSpansPerSpanSet,
 			},
 		},
 		{
@@ -87,15 +99,10 @@ func TestQuerierParseSearchRequest(t *testing.T) {
 			name:     "traceql query",
 			urlQuery: "q=" + url.QueryEscape(`{ .foo="bar" }`),
 			expected: &tempopb.SearchRequest{
-				Query: `{ .foo="bar" }`,
-				Tags:  map[string]string{},
-				Limit: defaultLimit,
+				Query:           `{ .foo="bar" }`,
+				Tags:            map[string]string{},
+				SpansPerSpanSet: defaultSpansPerSpanSet,
 			},
-		},
-		{
-			name:     "invalid traceql query",
-			urlQuery: "q=" + url.QueryEscape(`{ .foo="bar" `),
-			err:      "invalid TraceQL query: parse error at line 1, col 14: syntax error: unexpected $end",
 		},
 		{
 			name:     "traceql query and tags",
@@ -109,7 +116,8 @@ func TestQuerierParseSearchRequest(t *testing.T) {
 				Tags: map[string]string{
 					"limit": "five",
 				},
-				Limit: 5,
+				Limit:           5,
+				SpansPerSpanSet: defaultSpansPerSpanSet,
 			},
 		},
 		{
@@ -124,7 +132,7 @@ func TestQuerierParseSearchRequest(t *testing.T) {
 				Tags: map[string]string{
 					"service.name": "foo",
 				},
-				Limit: defaultLimit,
+				SpansPerSpanSet: defaultSpansPerSpanSet,
 			},
 		},
 		{
@@ -134,9 +142,9 @@ func TestQuerierParseSearchRequest(t *testing.T) {
 				Tags: map[string]string{
 					"service.name": "foo",
 				},
-				Start: 10,
-				End:   20,
-				Limit: defaultLimit,
+				Start:           10,
+				End:             20,
+				SpansPerSpanSet: defaultSpansPerSpanSet,
 			},
 		},
 		{
@@ -151,17 +159,50 @@ func TestQuerierParseSearchRequest(t *testing.T) {
 				Tags: map[string]string{
 					"service.name": "bar",
 				},
-				Limit: defaultLimit,
+				SpansPerSpanSet: defaultSpansPerSpanSet,
 			},
 		},
 		{
 			name:     "top-level tags with range specified are ignored",
 			urlQuery: "service.name=bar&start=10&end=20",
 			expected: &tempopb.SearchRequest{
-				Tags:  map[string]string{},
-				Start: 10,
-				End:   20,
-				Limit: defaultLimit,
+				Tags:            map[string]string{},
+				Start:           10,
+				End:             20,
+				SpansPerSpanSet: defaultSpansPerSpanSet,
+			},
+		},
+		{
+			name:     "zero spss",
+			urlQuery: "spss=0",
+			err:      "invalid spss: must be a positive number",
+		},
+		{
+			name:     "negative spss",
+			urlQuery: "spss=-2",
+			err:      "invalid spss: must be a positive number",
+		},
+		{
+			name:     "non-numeric spss",
+			urlQuery: "spss=four",
+			err:      "invalid spss: strconv.Atoi: parsing \"four\": invalid syntax",
+		},
+		{
+			name:     "only spss",
+			urlQuery: "spss=2",
+			expected: &tempopb.SearchRequest{
+				Tags:            map[string]string{},
+				SpansPerSpanSet: 2,
+			},
+		},
+		{
+			name:     "tags with spss",
+			urlQuery: "tags=" + url.QueryEscape("service.name=foo") + "&spss=7",
+			expected: &tempopb.SearchRequest{
+				Tags: map[string]string{
+					"service.name": "foo",
+				},
+				SpansPerSpanSet: 7,
 			},
 		},
 	}
@@ -296,9 +337,10 @@ func TestParseSearchBlockRequest(t *testing.T) {
 					Tags: map[string]string{
 						"foo": "bar",
 					},
-					Start: 10,
-					End:   20,
-					Limit: defaultLimit,
+					Start:           10,
+					End:             20,
+					Limit:           defaultLimit,
+					SpansPerSpanSet: defaultSpansPerSpanSet,
 				},
 				StartPage:     0,
 				PagesToSearch: 10,
@@ -310,6 +352,32 @@ func TestParseSearchBlockRequest(t *testing.T) {
 				Version:       "v2",
 				Size_:         1000,
 				FooterSize:    2000,
+			},
+		},
+		{
+			url: "/?tags=foo%3Dbar&start=10&end=20&blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&dataEncoding=&dc=%5B%7B%22type%22%3A0%2C%22name%22%3A%22net.sock.host.addr%22%2C%22scope%22%3A0%7D%5D&encoding=none&footerSize=2000&indexPageSize=0&pagesToSearch=10&size=1000&startPage=0&totalRecords=2&version=vParquet3",
+			expected: &tempopb.SearchBlockRequest{
+				SearchReq: &tempopb.SearchRequest{
+					Tags: map[string]string{
+						"foo": "bar",
+					},
+					Start:           10,
+					End:             20,
+					Limit:           defaultLimit,
+					SpansPerSpanSet: defaultSpansPerSpanSet,
+				},
+				StartPage:     0,
+				PagesToSearch: 10,
+				BlockID:       "b92ec614-3fd7-4299-b6db-f657e7025a9b",
+				Encoding:      "none",
+				IndexPageSize: 0,
+				TotalRecords:  2,
+				Version:       "vParquet3",
+				Size_:         1000,
+				FooterSize:    2000,
+				DedicatedColumns: []*tempopb.DedicatedColumn{
+					{Scope: tempopb.DedicatedColumn_SPAN, Name: "net.sock.host.addr", Type: tempopb.DedicatedColumn_STRING},
+				},
 			},
 		},
 	}
@@ -346,7 +414,7 @@ func TestBuildSearchBlockRequest(t *testing.T) {
 				Size_:         1000,
 				FooterSize:    2000,
 			},
-			query: "?blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&dataEncoding=v1&encoding=s2&footerSize=2000&indexPageSize=10&pagesToSearch=10&size=1000&startPage=0&totalRecords=11&version=v2",
+			query: "?blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&pagesToSearch=10&size=1000&startPage=0&encoding=s2&indexPageSize=10&totalRecords=11&dataEncoding=v1&version=v2&footerSize=2000",
 		},
 		{
 			req: &tempopb.SearchBlockRequest{
@@ -362,7 +430,7 @@ func TestBuildSearchBlockRequest(t *testing.T) {
 				FooterSize:    2000,
 			},
 			httpReq: httptest.NewRequest("GET", "/test/path", nil),
-			query:   "/test/path?blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&dataEncoding=v1&encoding=s2&footerSize=2000&indexPageSize=10&pagesToSearch=10&size=1000&startPage=0&totalRecords=11&version=v2",
+			query:   "/test/path?blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&pagesToSearch=10&size=1000&startPage=0&encoding=s2&indexPageSize=10&totalRecords=11&dataEncoding=v1&version=v2&footerSize=2000",
 		},
 		{
 			req: &tempopb.SearchBlockRequest{
@@ -387,12 +455,33 @@ func TestBuildSearchBlockRequest(t *testing.T) {
 				Size_:         1000,
 				FooterSize:    2000,
 			},
-			query: "?blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&dataEncoding=v1&encoding=s2&end=20&footerSize=2000&indexPageSize=10&limit=50&maxDuration=40ms&minDuration=30ms&pagesToSearch=10&size=1000&start=10&startPage=0&tags=foo%3Dbar&totalRecords=11&version=v2",
+			query: "?start=10&end=20&limit=50&maxDuration=40ms&minDuration=30ms&tags=foo%3Dbar&blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&pagesToSearch=10&size=1000&startPage=0&encoding=s2&indexPageSize=10&totalRecords=11&dataEncoding=v1&version=v2&footerSize=2000",
+		},
+		{
+			req: &tempopb.SearchBlockRequest{
+				StartPage:     0,
+				PagesToSearch: 10,
+				BlockID:       "b92ec614-3fd7-4299-b6db-f657e7025a9b",
+				Encoding:      "none",
+				IndexPageSize: 0,
+				TotalRecords:  2,
+				Version:       "vParquet3",
+				Size_:         1000,
+				FooterSize:    2000,
+				DedicatedColumns: []*tempopb.DedicatedColumn{
+					{Scope: tempopb.DedicatedColumn_RESOURCE, Name: "net.sock.host.addr", Type: tempopb.DedicatedColumn_STRING},
+				},
+			},
+			httpReq: httptest.NewRequest("GET", "/test/path", nil),
+			query:   "/test/path?blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&pagesToSearch=10&size=1000&startPage=0&encoding=none&indexPageSize=0&totalRecords=2&dataEncoding=&version=vParquet3&footerSize=2000&dc=%5B%7B%22scope%22%3A1%2C%22name%22%3A%22net.sock.host.addr%22%7D%5D",
 		},
 	}
 
 	for _, tc := range tests {
-		actualURL, err := BuildSearchBlockRequest(tc.httpReq, tc.req)
+		jsonBytes, err := json.Marshal(tc.req.DedicatedColumns)
+		require.NoError(t, err)
+
+		actualURL, err := BuildSearchBlockRequest(tc.httpReq, tc.req, string(jsonBytes))
 		assert.NoError(t, err)
 		assert.Equal(t, tc.query, actualURL.URL.String())
 	}
@@ -464,7 +553,6 @@ func TestValidateAndSanitizeRequest(t *testing.T) {
 		assert.Equal(t, tc.startTime, startTime)
 		assert.Equal(t, tc.endTime, endTime)
 	}
-
 }
 
 func TestBuildSearchRequest(t *testing.T) {
@@ -478,13 +566,14 @@ func TestBuildSearchRequest(t *testing.T) {
 				Tags: map[string]string{
 					"foo": "bar",
 				},
-				Start:         10,
-				End:           20,
-				MinDurationMs: 30,
-				MaxDurationMs: 40,
-				Limit:         50,
+				Start:           10,
+				End:             20,
+				MinDurationMs:   30,
+				MaxDurationMs:   40,
+				Limit:           50,
+				SpansPerSpanSet: 60,
 			},
-			query: "?end=20&limit=50&maxDuration=40ms&minDuration=30ms&start=10&tags=foo%3Dbar",
+			query: "?start=10&end=20&limit=50&maxDuration=40ms&minDuration=30ms&spss=60&tags=foo%3Dbar",
 		},
 		{
 			req: &tempopb.SearchRequest{
@@ -496,7 +585,7 @@ func TestBuildSearchRequest(t *testing.T) {
 				MaxDurationMs: 30,
 				Limit:         50,
 			},
-			query: "?end=20&limit=50&maxDuration=30ms&start=10&tags=foo%3Dbar",
+			query: "?start=10&end=20&limit=50&maxDuration=30ms&tags=foo%3Dbar",
 		},
 		{
 			req: &tempopb.SearchRequest{
@@ -508,7 +597,7 @@ func TestBuildSearchRequest(t *testing.T) {
 				MinDurationMs: 30,
 				Limit:         50,
 			},
-			query: "?end=20&limit=50&minDuration=30ms&start=10&tags=foo%3Dbar",
+			query: "?start=10&end=20&limit=50&minDuration=30ms&tags=foo%3Dbar",
 		},
 		{
 			req: &tempopb.SearchRequest{
@@ -520,7 +609,7 @@ func TestBuildSearchRequest(t *testing.T) {
 				MinDurationMs: 30,
 				MaxDurationMs: 40,
 			},
-			query: "?end=20&maxDuration=40ms&minDuration=30ms&start=10&tags=foo%3Dbar",
+			query: "?start=10&end=20&maxDuration=40ms&minDuration=30ms&tags=foo%3Dbar",
 		},
 		{
 			req: &tempopb.SearchRequest{
@@ -530,7 +619,15 @@ func TestBuildSearchRequest(t *testing.T) {
 				MinDurationMs: 30,
 				MaxDurationMs: 40,
 			},
-			query: "?end=20&maxDuration=40ms&minDuration=30ms&start=10",
+			query: "?start=10&end=20&maxDuration=40ms&minDuration=30ms",
+		},
+		{
+			req: &tempopb.SearchRequest{
+				Query: "{ foo = `bar` }",
+				Start: 10,
+				End:   20,
+			},
+			query: "?start=10&end=20&q=%7B+foo+%3D+%60bar%60+%7D",
 		},
 	}
 
@@ -541,29 +638,211 @@ func TestBuildSearchRequest(t *testing.T) {
 	}
 }
 
-func TestAddServerlessParams(t *testing.T) {
-	actualURL := AddServerlessParams(nil, 10)
-	assert.Equal(t, "?maxBytes=10", actualURL.URL.String())
+func Test_parseTimestamp(t *testing.T) {
+	now := time.Now()
 
-	req, err := http.NewRequest("GET", "http://example.com", nil)
-	require.NoError(t, err)
-
-	actualURL = AddServerlessParams(req, 10)
-	assert.Equal(t, "http://example.com?maxBytes=10", actualURL.URL.String())
+	tests := []struct {
+		name    string
+		value   string
+		def     time.Time
+		want    time.Time
+		wantErr bool
+	}{
+		{"default", "", now, now, false},
+		{"unix timestamp", "1571332130", now, time.Unix(1571332130, 0), false},
+		{"unix nano timestamp", "1571334162051000000", now, time.Unix(0, 1571334162051000000), false},
+		{"unix timestamp with subseconds", "1571332130.934", now, time.Unix(1571332130, 934*1e6), false},
+		{"RFC3339 format", "2002-10-02T15:00:00Z", now, time.Date(2002, 10, 0o2, 15, 0, 0, 0, time.UTC), false},
+		{"RFC3339nano format", "2009-11-10T23:00:00.000000001Z", now, time.Date(2009, 11, 10, 23, 0, 0, 1, time.UTC), false},
+		{"invalid", "we", now, time.Time{}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseTimestamp(tt.value, tt.def)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseTimestamp() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseTimestamp() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }
 
-func TestExtractServerlessParam(t *testing.T) {
-	r := httptest.NewRequest("GET", "http://example.com", nil)
-	maxBytes, err := ExtractServerlessParams(r)
-	require.NoError(t, err)
-	assert.Equal(t, 0, maxBytes)
+func TestQueryRangeRoundtrip(t *testing.T) {
+	tcs := []struct {
+		name string
+		req  *tempopb.QueryRangeRequest
+	}{
+		{
+			name: "empty",
+			req: &tempopb.QueryRangeRequest{
+				Step: uint64(time.Second), // you can't actually roundtrip an empty query b/c Build/Parse will force a default step
+			},
+		},
+		{
+			name: "not empty!",
+			req: &tempopb.QueryRangeRequest{
+				Query:     "{ foo = `bar` }",
+				Start:     uint64(24 * time.Hour),
+				End:       uint64(25 * time.Hour),
+				Step:      uint64(30 * time.Second),
+				QueryMode: "foo",
+			},
+		},
+	}
 
-	r = httptest.NewRequest("GET", "http://example.com?maxBytes=13", nil)
-	maxBytes, err = ExtractServerlessParams(r)
-	require.NoError(t, err)
-	assert.Equal(t, 13, maxBytes)
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			jsonBytes, err := json.Marshal(tc.req.DedicatedColumns)
+			require.NoError(t, err)
 
-	r = httptest.NewRequest("GET", "http://example.com?maxBytes=blerg", nil)
-	_, err = ExtractServerlessParams(r)
-	assert.Error(t, err)
+			httpReq := BuildQueryRangeRequest(nil, tc.req, string(jsonBytes))
+			actualReq, err := ParseQueryRangeRequest(httpReq)
+			require.NoError(t, err)
+			assert.Equal(t, tc.req, actualReq)
+		})
+	}
+}
+
+func Test_determineBounds(t *testing.T) {
+	type args struct {
+		now         time.Time
+		startString string
+		endString   string
+		sinceString string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		start   time.Time
+		end     time.Time
+		wantErr assert.ErrorAssertionFunc
+	}{
+		{
+			name: "no start, end, since",
+			args: args{
+				now:         time.Unix(3600, 0),
+				startString: "",
+				endString:   "",
+				sinceString: "",
+			},
+			start:   time.Unix(0, 0),    // Default start is one hour before 'now' if nothing is provided
+			end:     time.Unix(3600, 0), // Default end is 'now' if nothing is provided
+			wantErr: assert.NoError,
+		},
+		{
+			name: "no since or no start with end in the future",
+			args: args{
+				now:         time.Unix(3600, 0),
+				startString: "",
+				endString:   "2022-12-18T00:00:00Z",
+				sinceString: "",
+			},
+			start:   time.Unix(0, 0), // Default should be one hour before now
+			end:     time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+		{
+			name: "no since, valid start and end",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "2022-12-17T00:00:00Z",
+				endString:   "2022-12-18T00:00:00Z",
+				sinceString: "",
+			},
+			start:   time.Date(2022, 12, 17, 0, 0, 0, 0, time.UTC),
+			end:     time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+		{
+			name: "invalid end",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "2022-12-17T00:00:00Z",
+				endString:   "WHAT TIME IS IT?",
+				sinceString: "",
+			},
+			start: time.Time{},
+			end:   time.Time{},
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				return assert.ErrorContains(t, err, "could not parse 'end' parameter:", i...)
+			},
+		},
+		{
+			name: "invalid start",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "LET'S GOOO",
+				endString:   "2022-12-18T00:00:00Z",
+				sinceString: "",
+			},
+			start: time.Time{},
+			end:   time.Time{},
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				return assert.ErrorContains(t, err, "could not parse 'start' parameter:", i...)
+			},
+		},
+		{
+			name: "invalid since",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "2022-12-17T00:00:00Z",
+				endString:   "2022-12-18T00:00:00Z",
+				sinceString: "HI!",
+			},
+			start: time.Time{},
+			end:   time.Time{},
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				return assert.ErrorContains(t, err, "could not parse 'since' parameter:", i...)
+			},
+		},
+		{
+			name: "since 1h with no start or end",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "",
+				endString:   "",
+				sinceString: "1h",
+			},
+			start:   time.Date(2022, 12, 17, 23, 0, 0, 0, time.UTC),
+			end:     time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+		{
+			name: "since 1d with no start or end",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "",
+				endString:   "",
+				sinceString: "1d",
+			},
+			start:   time.Date(2022, 12, 17, 0, 0, 0, 0, time.UTC),
+			end:     time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+		{
+			name: "since 1h with no start and end time in the past",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "",
+				endString:   "2022-12-17T00:00:00Z",
+				sinceString: "1h",
+			},
+			start:   time.Date(2022, 12, 16, 23, 0, 0, 0, time.UTC), // start should be calculated relative to end when end is specified
+			end:     time.Date(2022, 12, 17, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1, err := determineBounds(tt.args.now, tt.args.startString, tt.args.endString, tt.args.sinceString)
+			if !tt.wantErr(t, err, fmt.Sprintf("determineBounds(%v, %v, %v, %v)", tt.args.now, tt.args.startString, tt.args.endString, tt.args.sinceString)) {
+				return
+			}
+			assert.Equalf(t, tt.start, got, "determineBounds(%v, %v, %v, %v)", tt.args.now, tt.args.startString, tt.args.endString, tt.args.sinceString)
+			assert.Equalf(t, tt.end, got1, "determineBounds(%v, %v, %v, %v)", tt.args.now, tt.args.startString, tt.args.endString, tt.args.sinceString)
+		})
+	}
 }

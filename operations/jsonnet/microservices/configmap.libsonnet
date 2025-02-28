@@ -52,7 +52,7 @@
     memberlist: {
       abort_if_cluster_join_fails: false,
       bind_port: $._config.gossip_ring_port,
-      join_members: ['gossip-ring.%s.svc.cluster.local.:%d' % [$._config.namespace, $._config.gossip_ring_port]],
+      join_members: ['dns+gossip-ring.%s.svc.cluster.local.:%d' % [$._config.namespace, $._config.gossip_ring_port]],
     },
   },
 
@@ -111,6 +111,7 @@
   },
 
   tempo_query_frontend_config:: $.tempo_config {},
+  tempo_block_builder_config:: $.tempo_config {},
 
   // This will be the single configmap that stores `overrides.yaml`.
   overrides_config:
@@ -151,13 +152,19 @@
       'tempo.yaml': $.util.manifestYaml($.tempo_querier_config),
     }),
 
+  tempo_block_builder_configmap:
+    configMap.new('tempo-block-builder') +
+    configMap.withData({
+      'tempo.yaml': $.util.manifestYaml($.tempo_block_builder_config),
+    }),
+
   tempo_query_frontend_configmap:
     configMap.new('tempo-query-frontend') +
     configMap.withData({
       'tempo.yaml': $.util.manifestYaml($.tempo_query_frontend_config),
     }),
 
-  tempo_query_configmap:
+  tempo_query_configmap: if $._config.tempo_query.enabled then
     configMap.new('tempo-query') +
     configMap.withData({
       'tempo-query.yaml': $.util.manifestYaml({

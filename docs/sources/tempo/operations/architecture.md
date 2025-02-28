@@ -1,37 +1,32 @@
 ---
-title: Tempo Architecture
+title: Tempo architecture
+description: Learn about Tempo architectural decisions and operational implications.
 aliases:
- - /docs/tempo/latest/architecture/architecture
- - /docs/tempo/latest/architecture
- - /docs/tempo/operations/architecture
-weight: 10
+ - ../architecture/architecture # https://grafana.com/docs/tempo/<TEMPO_VERSION>/architecture/architecture/
+ - ../architecture # https://grafana.com/docs/tempo/<TEMPO_VERSION>/architecture/
+weight: 100
 ---
-
-A collection of documents that detail Tempo architectural decisions and operational implications.
 
 # Tempo architecture
 
-This topic provides an overview of the major components of Tempo. Refer to the [example setups]({{< relref "../getting-started/example-demo-app" >}})
-or [deployment options]({{< relref "../setup/deployment" >}}) for help deploying.
+This topic provides an overview of the major components of Tempo. Refer to the [example setups](https://grafana.com/docs/tempo/<TEMPO_VERSION>/getting-started/example-demo-app/)
+or [deployment options](https://grafana.com/docs/tempo/<TEMPO_VERSION>/setup/deployment/) for help deploying.
 
 <p align="center"><img src="../tempo_arch.png" alt="Tempo Architecture"></p>
 
-## Tempo
-
 Tempo comprises of the following top-level components.
 
-### Distributor
+## Distributor
 
-The distributor accepts spans in multiple formats including Jaeger, OpenTelemetry, Zipkin. It routes spans to ingesters by hashing the `traceID` and using a [distributed consistent hash ring]({{< relref "consistent_hash_ring" >}}).
-
+The distributor accepts spans in multiple formats including Jaeger, OpenTelemetry, Zipkin. It routes spans to ingesters by hashing the `traceID` and using a [distributed consistent hash ring](http://grafana.com/docs/tempo/<TEMPO_VERSION>/operations/manage-advanced-systems/consistent_hash_ring/).
 The distributor uses the receiver layer from the [OpenTelemetry Collector](https://github.com/open-telemetry/opentelemetry-collector).
-For best performance it is recommended to ingest [OTel Proto](https://github.com/open-telemetry/opentelemetry-proto). For this reason
-the [Grafana Agent](https://github.com/grafana/agent) uses the otlp exporter/receiver to send spans to Tempo.
+For best performance, it's recommended to ingest [OTel Proto](https://github.com/open-telemetry/opentelemetry-proto).
+For this reason, [Grafana Alloy](https://github.com/grafana/alloy/) uses the OTLP exporter/receiver to send spans to Tempo.
 
-### Ingester
+## Ingester
 
-The Ingester batches trace into blocks, creates bloom filters and indexes, and then flushes it all to the backend.
-Blocks in the backend are generated in the following layout.
+The [Ingester](https://grafana.com/docs/tempo/<TEMPO_VERSION>/configuration/#ingester) batches trace into blocks, creates bloom filters and indexes, and then flushes it all to the backend.
+Blocks in the backend are generated in the following layout:
 
 ```
 <bucketname> / <tenantID> / <blockID> / <meta.json>
@@ -43,31 +38,30 @@ Blocks in the backend are generated in the following layout.
                                       / <bloom_n>
 ```
 
-### Query Frontend
+## Query Frontend
 
 The Query Frontend is responsible for sharding the search space for an incoming query.
 
-Traces are exposed via a simple HTTP endpoint:
+A simple HTTP endpoint exposes traces:
 `GET /api/traces/<traceID>`
 
 Internally, the Query Frontend splits the blockID space into a configurable number of shards and queues these requests.
 Queriers connect to the Query Frontend via a streaming gRPC connection to process these sharded queries.
 
-### Querier
+## Querier
 
-The querier is responsible for finding the requested trace id in either the ingesters or the backend storage. Depending on
-parameters it will query both the ingesters and pull bloom/indexes from the backend to search blocks in object
-storage.
+The querier finds the requested trace ID in either the ingesters or the backend storage. Depending on
+parameters, the querier queries the ingesters for recently ingested traces and pulls the bloom filters and indexes from the backend storage to efficiently locate the traces within object storage blocks.
 
 The querier exposes an HTTP endpoint at:
-`GET /querier/api/traces/<traceID>`, but its not expected to be used directly.
+`GET /querier/api/traces/<traceID>`, but it's not intended for direct use.
 
 Queries should be sent to the Query Frontend.
 
-### Compactor
+## Compactor
 
 The Compactors stream blocks to and from the backend storage to reduce the total number of blocks.
 
-### Metrics generator
+## Metrics generator
 
-This is an **optional** component that derives metrics from ingested traces and writes them to a metrics storage. Refer to the [metrics-generator documentation]({{< relref "../metrics-generator" >}}) to learn more.
+This is an **optional** component that derives metrics from ingested traces and writes them to a metrics storage. Refer to the [metrics-generator documentation](https://grafana.com/docs/tempo/<TEMPO_VERSION>/metrics-generator/) to learn more.

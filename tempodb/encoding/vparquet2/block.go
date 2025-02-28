@@ -1,7 +1,11 @@
 package vparquet2
 
 import (
+	"context"
 	"sync"
+
+	"github.com/grafana/tempo/pkg/traceql"
+	"go.opentelemetry.io/otel"
 
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
@@ -10,6 +14,8 @@ import (
 const (
 	DataFileName = "data.parquet"
 )
+
+var tracer = otel.Tracer("tempodb/encoding/vparquet2")
 
 type backendBlock struct {
 	meta *backend.BlockMeta
@@ -29,4 +35,16 @@ func newBackendBlock(meta *backend.BlockMeta, r backend.Reader) *backendBlock {
 
 func (b *backendBlock) BlockMeta() *backend.BlockMeta {
 	return b.meta
+}
+
+func (b *backendBlock) FetchTagValues(context.Context, traceql.FetchTagValuesRequest, traceql.FetchTagValuesCallback, common.MetricsCallback, common.SearchOptions) error {
+	return common.ErrUnsupported
+}
+
+func (b *backendBlock) FetchTagNames(context.Context, traceql.FetchTagsRequest, traceql.FetchTagsCallback, common.MetricsCallback, common.SearchOptions) error {
+	return common.ErrUnsupported
+}
+
+func (b *backendBlock) Validate(context.Context) error {
+	return common.ErrUnsupported
 }

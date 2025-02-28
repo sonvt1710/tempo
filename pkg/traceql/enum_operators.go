@@ -24,10 +24,22 @@ const (
 	OpOr
 	OpNot
 	OpSpansetChild
+	OpSpansetParent
 	OpSpansetDescendant
+	OpSpansetAncestor
 	OpSpansetAnd
 	OpSpansetUnion
 	OpSpansetSibling
+	OpSpansetNotChild
+	OpSpansetNotParent
+	OpSpansetNotSibling
+	OpSpansetNotAncestor
+	OpSpansetNotDescendant
+	OpSpansetUnionChild
+	OpSpansetUnionParent
+	OpSpansetUnionSibling
+	OpSpansetUnionAncestor
+	OpSpansetUnionDescendant
 )
 
 func (op Operator) isBoolean() bool {
@@ -54,16 +66,12 @@ func binaryTypeValid(op Operator, t StaticType) bool {
 	}
 
 	switch t {
-	case TypeBoolean:
+	case TypeBoolean, TypeBooleanArray:
 		return op == OpAnd ||
 			op == OpOr ||
 			op == OpEqual ||
 			op == OpNotEqual
-	case TypeFloat:
-		fallthrough
-	case TypeInt:
-		fallthrough
-	case TypeDuration:
+	case TypeFloat, TypeFloatArray, TypeInt, TypeIntArray, TypeDuration:
 		return op == OpAdd ||
 			op == OpSub ||
 			op == OpMult ||
@@ -76,7 +84,7 @@ func binaryTypeValid(op Operator, t StaticType) bool {
 			op == OpGreaterEqual ||
 			op == OpLess ||
 			op == OpLessEqual
-	case TypeString:
+	case TypeString, TypeStringArray:
 		return op == OpEqual ||
 			op == OpNotEqual ||
 			op == OpRegex ||
@@ -85,11 +93,7 @@ func binaryTypeValid(op Operator, t StaticType) bool {
 			op == OpGreaterEqual ||
 			op == OpLess ||
 			op == OpLessEqual
-	case TypeNil:
-		fallthrough
-	case TypeStatus:
-		return op == OpEqual || op == OpNotEqual
-	case TypeKind:
+	case TypeNil, TypeStatus, TypeKind:
 		return op == OpEqual || op == OpNotEqual
 	}
 
@@ -112,7 +116,6 @@ func (op Operator) unaryTypesValid(t StaticType) bool {
 }
 
 func (op Operator) String() string {
-
 	switch op {
 	case OpAdd:
 		return "+"
@@ -150,14 +153,38 @@ func (op Operator) String() string {
 		return "!"
 	case OpSpansetChild:
 		return ">"
+	case OpSpansetParent:
+		return "<"
 	case OpSpansetDescendant:
 		return ">>"
+	case OpSpansetAncestor:
+		return "<<"
 	case OpSpansetAnd:
 		return "&&"
 	case OpSpansetSibling:
 		return "~"
 	case OpSpansetUnion:
 		return "||"
+	case OpSpansetNotChild:
+		return "!>"
+	case OpSpansetNotParent:
+		return "!<"
+	case OpSpansetNotSibling:
+		return "!~"
+	case OpSpansetNotAncestor:
+		return "!<<"
+	case OpSpansetNotDescendant:
+		return "!>>"
+	case OpSpansetUnionChild:
+		return "&>"
+	case OpSpansetUnionParent:
+		return "&<"
+	case OpSpansetUnionSibling:
+		return "&~"
+	case OpSpansetUnionAncestor:
+		return "&<<"
+	case OpSpansetUnionDescendant:
+		return "&>>"
 	}
 
 	return fmt.Sprintf("operator(%d)", op)

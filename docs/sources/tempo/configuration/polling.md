@@ -1,6 +1,7 @@
 ---
 title: Polling
-weight: 80
+description: Learn about polling cycle configuration options in Tempo.
+weight: 700
 aliases:
 - /docs/tempo/configuration/polling
 ---
@@ -23,7 +24,7 @@ storage:
         [blocklist_poll_fallback: <bool>]
 
         # Maximum number of compactors that should build the tenant index. All other components will download
-        # the index.  Default 2.
+        # the index. Default 2.
         [blocklist_poll_tenant_index_builders: <int>]
 
         # The oldest allowable tenant index. If an index is pulled that is older than this duration,
@@ -34,7 +35,7 @@ storage:
         [blocklist_poll_stale_tenant_index: <duration>]
 ```
 
-Due to the mechanics of the [tenant index]({{< relref "../operations/polling" >}}), the blocklist will be stale by
+Due to the mechanics of the [tenant index]({{< relref "../operations/monitor/polling" >}}), the blocklist will be stale by
 at most 2 times the configured `blocklist_poll` duration. There are two configuration options that need to be balanced
 against the `blockist_poll` to handle this:
 
@@ -43,7 +44,7 @@ it has been flushed. This allows the ingester to return traces to the queriers w
 of the newly flushed blocks.
 ```
 ingester:
-  # How long to hold a complete block in the ingester after it has been flushed to the backend.  Default is 15m
+  # How long to hold a complete block in the ingester after it has been flushed to the backend. Default is 15m
   [complete_block_timeout: <duration>]
 ```
 
@@ -55,7 +56,7 @@ these blocks successfully until they complete their polling cycles and have up t
 ```
 compactor:
   compaction:
-    # How long to leave a block in the backend after it has been compacted successfully.  Default is 1h
+    # How long to leave a block in the backend after it has been compacted successfully. Default is 1h
     [compacted_block_retention: <duration>]
 ```
 

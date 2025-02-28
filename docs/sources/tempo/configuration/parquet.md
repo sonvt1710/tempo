@@ -1,53 +1,59 @@
 ---
-title: Parquet
+title: Apache Parquet block format
 menuTitle: Apache Parquet
-weight: 75
+description: Learn about Parquet block format in Tempo.
+weight: 300
 ---
 
 # Apache Parquet block format
 
+Tempo has a default columnar block format based on Apache Parquet.
+This format is required for tags-based search as well as [TraceQL]({{< relref "../traceql" >}}), the query language for traces.
+The columnar block format improves search performance and enables an ecosystem of tools, including [Tempo CLI](https://grafana.com/docs/tempo/<TEMPO_VERSION>/operations/tempo_cli/#analyse-blocks), to access the underlying trace data.
 
-Tempo has a default columnar block format based on Apache Parquet. Parquet is required for tags-based search as well as [TraceQL]({{< relref "../traceql" >}}), the query language for traces.
-
-A columnar block format may result in improved search performance and also enables a large ecosystem of tools access to the underlying trace data.
-
-For more information, refer to the [Parquet schema]({{< relref "../operations/schema" >}}) and the [Parquet design document](https://github.com/mdisibio/tempo/blob/design-proposal-parquet/docs/design-proposals/2022-04%20Parquet.md).
-
-If you install using the new Helm charts, then Parquet is enabled by default.
+For more information, refer to the [Parquet design document](https://github.com/grafana/tempo/blob/main/docs/design-proposals/2022-04%20Parquet.md) and [Issue 1480](https://github.com/grafana/tempo/issues/1480).
+Additionally, there is now a [Parquet v3 design document](https://github.com/grafana/tempo/blob/main/docs/design-proposals/2023-05%20vParquet3.md).
 
 ## Considerations
 
-The Parquet block format is enabled by default in Tempo 2.0. No data conversion or upgrade process is necessary. As soon as the format is enabled, Tempo starts writing data in that format, leaving existing data as-is.
+The Parquet block format is enabled by default since Tempo 2.0.
+
+If you install using the [Tempo Helm charts](https://grafana.com/docs/tempo/<TEMPO_VERSION>/setup/helm-chart/), then Parquet is enabled by default.
+No data conversion or upgrade process is necessary.
+As soon as a block format is enabled, Tempo starts writing data in that format, leaving existing data as-is.
 
 Block formats based on Parquet require more CPU and memory resources than the previous `v2` format but provide search and TraceQL functionality.
 
 ## Choose a different block format
 
-It is possible to disable Parquet and use the previous `v2` block format. This disables all forms of search, but also reduces resource consumption, and may be desired for a high-throughput cluster that does not need these capabilities. Set the block version option to `v2` in the Storage section of the configuration file.
+The default block format is `vParquet4`, which is the latest iteration of the Parquet-based columnar block format in Tempo.
+vParquet4 introduces new columns which enable querying for data in array attributes as well as events and links.
+For more information, refer to [Dedicated attribute columns](https://grafana.com/docs/tempo/<TEMPO_VERSION>/operations/dedicated_columns/).
+
+
+You can still use the previous format `vParquet3`.
+To enable it, set the block version option to `vParquet3` in the [Storage section](https://grafana.com/docs/tempo/<TEMPO_VERSION>/configuration/#storage) of the configuration file.
 
 ```yaml
-# block format version. options: v2, vParquet, vParquet2
+# block format version. options: v2, vParquet2, vParquet3, vParquet4
+[version: vParquet4]
+```
+
+In some cases, you may choose to disable Parquet and use the old `v2` block format.
+Using the `v2` block format disables all forms of search, but also reduces resource consumption, and may be desired for a high-throughput cluster that doesn't need these capabilities.
+To make this change, set the block version option to `v2` in the Storage section of the configuration file.
+
+```yaml
+# block format version. options: v2, vParquet2, vParquet3, vParquet4
 [version: v2]
 ```
 
-There is also a revised version of the Parquet base block format `vParquet2`. This version improves the interoperability with other tools based on Parquet. `vParquet2` is still experimental and not enabled by default yet. To enable it, set the block format version to `vParquet2` in the Storage section of the configuration file.
-
-```yaml
-# block format version. options: v2, vParquet, vParquet2
-[version: vParquet2]
-```
-
-To re-enable Parquet, set the block version option to `vParquet` in the Storage section of the configuration file.
-
-```yaml
-# block format version. options: v2, vParquet, vParquet2
-[version: vParquet]
-```
+To re-enable the default `vParquet4` format, remove the block version option from the [Storage section](https://grafana.com/docs/tempo/<TEMPO_VERSION>/configuration/#storage) of the configuration file or set the option to `vParquet4`.
 
 ## Parquet configuration parameters
 
 Some parameters in the Tempo configuration are specific to Parquet.
-For more information, refer to the [storage configuration documentation](https://grafana.com/docs/tempo/latest/configuration/#storage).
+For more information, refer to the [storage configuration documentation]({{< relref "../configuration#storage" >}}).
 
 ### Trace search parameters
 
@@ -67,9 +73,3 @@ The `cache_control` section contains the follow parameters for Parquet metadata 
 | <code>[footer: <bool> \| default = false]</code> | `false` | Specifies if the footer should be cached |
 | `[column_index: <bool> \| default = false]` | `false` | Specifies if the column index should be cached |
 | `[offset_index: <bool> \| default = false]` | `false` | Specifies if the offset index should be cached |
-
-## Convert to Parquet
-
-If you have used an earlier version of the Parquet format, you can use `tempo-cli` to convert a Parquet file from its existing schema to the one used in Tempo 2.0.
-
-For instructions, refer to the [Parquet convert command documentation]({{< relref "../operations/tempo_cli#parquet-convert-command" >}}).

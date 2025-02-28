@@ -19,11 +19,11 @@ package credentials
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -31,7 +31,6 @@ import (
 	"time"
 
 	"github.com/minio/minio-go/v7/pkg/signer"
-	sha256 "github.com/minio/sha256-simd"
 )
 
 // AssumeRoleResponse contains the result of successful AssumeRole request.
@@ -77,7 +76,8 @@ type AssumeRoleResult struct {
 type STSAssumeRole struct {
 	Expiry
 
-	// Required http Client to use when connecting to MinIO STS service.
+	// Optional http Client to use when connecting to MinIO STS service
+	// (overrides default client in CredContext)
 	Client *http.Client
 
 	// STS endpoint to fetch STS credentials.
@@ -94,27 +94,25 @@ type STSAssumeRoleOptions struct {
 	AccessKey string
 	SecretKey string
 
+	SessionToken string // Optional if the first request is made with temporary credentials.
+	Policy       string // Optional to assign a policy to the assumed role
+
 	Location        string // Optional commonly needed with AWS STS.
 	DurationSeconds int    // Optional defaults to 1 hour.
 
 	// Optional only valid if using with AWS STS
 	RoleARN         string
 	RoleSessionName string
+	ExternalID      string
 }
 
 // NewSTSAssumeRole returns a pointer to a new
 // Credentials object wrapping the STSAssumeRole.
 func NewSTSAssumeRole(stsEndpoint string, opts STSAssumeRoleOptions) (*Credentials, error) {
-	if stsEndpoint == "" {
-		return nil, errors.New("STS endpoint cannot be empty")
-	}
 	if opts.AccessKey == "" || opts.SecretKey == "" {
 		return nil, errors.New("AssumeRole credentials access/secretkey is mandatory")
 	}
 	return New(&STSAssumeRole{
-		Client: &http.Client{
-			Transport: http.DefaultTransport,
-		},
 		STSEndpoint: stsEndpoint,
 		Options:     opts,
 	}), nil
@@ -137,7 +135,7 @@ func closeResponse(resp *http.Response) {
 		// Without this closing connection would disallow re-using
 		// the same connection for future uses.
 		//  - http://stackoverflow.com/a/17961593/4465767
-		io.Copy(ioutil.Discard, resp.Body)
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
 }
@@ -156,6 +154,12 @@ func getAssumeRoleCredentials(clnt *http.Client, endpoint string, opts STSAssume
 		v.Set("DurationSeconds", strconv.Itoa(opts.DurationSeconds))
 	} else {
 		v.Set("DurationSeconds", strconv.Itoa(defaultDurationSeconds))
+	}
+	if opts.Policy != "" {
+		v.Set("Policy", opts.Policy)
+	}
+	if opts.ExternalID != "" {
+		v.Set("ExternalId", opts.ExternalID)
 	}
 
 	u, err := url.Parse(endpoint)
@@ -177,6 +181,9 @@ func getAssumeRoleCredentials(clnt *http.Client, endpoint string, opts STSAssume
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("X-Amz-Content-Sha256", hex.EncodeToString(hash.Sum(nil)))
+	if opts.SessionToken != "" {
+		req.Header.Set("X-Amz-Security-Token", opts.SessionToken)
+	}
 	req = signer.SignV4STS(*req, opts.AccessKey, opts.SecretKey, opts.Location)
 
 	resp, err := clnt.Do(req)
@@ -186,7 +193,7 @@ func getAssumeRoleCredentials(clnt *http.Client, endpoint string, opts STSAssume
 	defer closeResponse(resp)
 	if resp.StatusCode != http.StatusOK {
 		var errResp ErrorResponse
-		buf, err := ioutil.ReadAll(resp.Body)
+		buf, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return AssumeRoleResponse{}, err
 		}
@@ -210,10 +217,30 @@ func getAssumeRoleCredentials(clnt *http.Client, endpoint string, opts STSAssume
 	return a, nil
 }
 
-// Retrieve retrieves credentials from the MinIO service.
-// Error will be returned if the request fails.
-func (m *STSAssumeRole) Retrieve() (Value, error) {
-	a, err := getAssumeRoleCredentials(m.Client, m.STSEndpoint, m.Options)
+// RetrieveWithCredContext retrieves credentials from the MinIO service.
+// Error will be returned if the request fails, optional cred context.
+func (m *STSAssumeRole) RetrieveWithCredContext(cc *CredContext) (Value, error) {
+	if cc == nil {
+		cc = defaultCredContext
+	}
+
+	client := m.Client
+	if client == nil {
+		client = cc.Client
+	}
+	if client == nil {
+		client = defaultCredContext.Client
+	}
+
+	stsEndpoint := m.STSEndpoint
+	if stsEndpoint == "" {
+		stsEndpoint = cc.Endpoint
+	}
+	if stsEndpoint == "" {
+		return Value{}, errors.New("STS endpoint unknown")
+	}
+
+	a, err := getAssumeRoleCredentials(client, stsEndpoint, m.Options)
 	if err != nil {
 		return Value{}, err
 	}
@@ -225,6 +252,13 @@ func (m *STSAssumeRole) Retrieve() (Value, error) {
 		AccessKeyID:     a.Result.Credentials.AccessKey,
 		SecretAccessKey: a.Result.Credentials.SecretKey,
 		SessionToken:    a.Result.Credentials.SessionToken,
+		Expiration:      a.Result.Credentials.Expiration,
 		SignerType:      SignatureV4,
 	}, nil
+}
+
+// Retrieve retrieves credentials from the MinIO service.
+// Error will be returned if the request fails.
+func (m *STSAssumeRole) Retrieve() (Value, error) {
+	return m.RetrieveWithCredContext(nil)
 }

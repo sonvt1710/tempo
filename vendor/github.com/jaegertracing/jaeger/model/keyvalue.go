@@ -1,17 +1,6 @@
 // Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package model
 
@@ -36,7 +25,31 @@ const (
 	Float64Type = ValueType_FLOAT64
 	// BinaryType indicates the value is binary blob stored as a byte array
 	BinaryType = ValueType_BINARY
+
+	SpanKindKey     = "span.kind"
+	SamplerTypeKey  = "sampler.type"
+	SamplerParamKey = "sampler.param"
 )
+
+type SpanKind string
+
+const (
+	SpanKindClient      SpanKind = "client"
+	SpanKindServer      SpanKind = "server"
+	SpanKindProducer    SpanKind = "producer"
+	SpanKindConsumer    SpanKind = "consumer"
+	SpanKindInternal    SpanKind = "internal"
+	SpanKindUnspecified SpanKind = ""
+)
+
+func SpanKindFromString(kind string) (SpanKind, error) {
+	switch SpanKind(kind) {
+	case SpanKindClient, SpanKindServer, SpanKindProducer, SpanKindConsumer, SpanKindInternal, SpanKindUnspecified:
+		return SpanKind(kind), nil
+	default:
+		return SpanKindUnspecified, fmt.Errorf("unknown span kind %q", kind)
+	}
+}
 
 // KeyValues is a type alias that exposes convenience functions like Sort, FindByKey.
 type KeyValues []KeyValue
@@ -102,8 +115,8 @@ func (kv *KeyValue) Binary() []byte {
 	return nil
 }
 
-// Value returns typed values stored in KeyValue as interface{}.
-func (kv *KeyValue) Value() interface{} {
+// Value returns typed values stored in KeyValue as any.
+func (kv *KeyValue) Value() any {
 	switch kv.VType {
 	case StringType:
 		return kv.VStr
@@ -210,6 +223,7 @@ func (kv KeyValue) Hash(w io.Writer) error {
 	if _, err := w.Write([]byte(kv.Key)); err != nil {
 		return err
 	}
+	//nolint: gosec // G115
 	if err := binary.Write(w, binary.BigEndian, uint16(kv.VType)); err != nil {
 		return err
 	}

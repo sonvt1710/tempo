@@ -3,14 +3,15 @@ package vparquet2
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 
 	"github.com/google/uuid"
 	tempo_io "github.com/grafana/tempo/pkg/io"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-	"github.com/pkg/errors"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 )
 
 type backendWriter struct {
@@ -47,7 +48,7 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		sch := parquet.SchemaOf(trp)
 		next = func(context.Context) (common.ID, parquet.Row, error) {
 			id, tr, err := i.Next(ctx)
-			if err == io.EOF || tr == nil {
+			if errors.Is(err, io.EOF) || tr == nil {
 				return id, nil, err
 			}
 
@@ -64,7 +65,7 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 
 	for {
 		id, row, err := next(ctx)
-		if err == io.EOF || row == nil {
+		if errors.Is(err, io.EOF) || row == nil {
 			break
 		}
 
@@ -99,13 +100,14 @@ type streamingBlock struct {
 	w     *backendWriter
 	r     backend.Reader
 	to    backend.Writer
+	index *index
 
 	currentBufferedTraces int
 	currentBufferedBytes  int
 }
 
 func newStreamingBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.BlockMeta, r backend.Reader, to backend.Writer, createBufferedWriter func(w io.Writer) tempo_io.BufferedWriteFlusher) *streamingBlock {
-	newMeta := backend.NewBlockMeta(meta.TenantID, meta.BlockID, VersionString, backend.EncNone, "")
+	newMeta := backend.NewBlockMeta(meta.TenantID, (uuid.UUID)(meta.BlockID), VersionString, backend.EncNone, "")
 	newMeta.StartTime = meta.StartTime
 	newMeta.EndTime = meta.EndTime
 
@@ -113,7 +115,7 @@ func newStreamingBlock(ctx context.Context, cfg *common.BlockConfig, meta *backe
 	// The real number of objects is tracked below.
 	bloom := common.NewBloom(cfg.BloomFP, uint(cfg.BloomShardSizeBytes), uint(meta.TotalObjects))
 
-	w := &backendWriter{ctx, to, DataFileName, meta.BlockID, meta.TenantID, nil}
+	w := &backendWriter{ctx, to, DataFileName, (uuid.UUID)(meta.BlockID), meta.TenantID, nil}
 	bw := createBufferedWriter(w)
 	pw := parquet.NewGenericWriter[*Trace](bw)
 
@@ -126,6 +128,7 @@ func newStreamingBlock(ctx context.Context, cfg *common.BlockConfig, meta *backe
 		w:     w,
 		r:     r,
 		to:    to,
+		index: &index{},
 	}
 }
 
@@ -136,8 +139,9 @@ func (b *streamingBlock) Add(tr *Trace, start, end uint32) error {
 	}
 	id := tr.TraceID
 
+	b.index.Add(id)
 	b.bloom.Add(id)
-	b.meta.ObjectAdded(id, start, end)
+	b.meta.ObjectAdded(start, end)
 	b.currentBufferedTraces++
 	b.currentBufferedBytes += estimateMarshalledSizeFromTrace(tr)
 
@@ -150,8 +154,9 @@ func (b *streamingBlock) AddRaw(id []byte, row parquet.Row, start, end uint32) e
 		return err
 	}
 
+	b.index.Add(id)
 	b.bloom.Add(id)
-	b.meta.ObjectAdded(id, start, end)
+	b.meta.ObjectAdded(start, end)
 	b.currentBufferedTraces++
 	b.currentBufferedBytes += estimateMarshalledSizeFromParquetRow(row)
 
@@ -168,13 +173,14 @@ func (b *streamingBlock) CurrentBufferedObjects() int {
 
 func (b *streamingBlock) Flush() (int, error) {
 	// Flush row group
+	b.index.Flush()
 	err := b.pw.Flush()
 	if err != nil {
 		return 0, err
 	}
 
 	n := b.bw.Len()
-	b.meta.Size += uint64(n)
+	b.meta.Size_ += uint64(n)
 	b.meta.TotalRecords++
 	b.currentBufferedTraces = 0
 	b.currentBufferedBytes = 0
@@ -185,6 +191,7 @@ func (b *streamingBlock) Flush() (int, error) {
 
 func (b *streamingBlock) Complete() (int, error) {
 	// Flush final row group
+	b.index.Flush()
 	b.meta.TotalRecords++
 	err := b.pw.Flush()
 	if err != nil {
@@ -199,7 +206,7 @@ func (b *streamingBlock) Complete() (int, error) {
 
 	// Now Flush and close out in-memory buffer
 	n := b.bw.Len()
-	b.meta.Size += uint64(n)
+	b.meta.Size_ += uint64(n)
 	err = b.bw.Flush()
 	if err != nil {
 		return 0, err
@@ -217,18 +224,18 @@ func (b *streamingBlock) Complete() (int, error) {
 
 	// Read the footer size out of the parquet footer
 	buf := make([]byte, 8)
-	err = b.r.ReadRange(b.ctx, DataFileName, b.meta.BlockID, b.meta.TenantID, b.meta.Size-8, buf, false)
+	err = b.r.ReadRange(b.ctx, DataFileName, (uuid.UUID)(b.meta.BlockID), b.meta.TenantID, b.meta.Size_-8, buf, nil)
 	if err != nil {
-		return 0, errors.Wrap(err, "error reading parquet file footer")
+		return 0, fmt.Errorf("error reading parquet file footer: %w", err)
 	}
 	if string(buf[4:8]) != "PAR1" {
 		return 0, errors.New("Failed to confirm magic footer while writing a new parquet block")
 	}
 	b.meta.FooterSize = binary.LittleEndian.Uint32(buf[0:4])
 
-	b.meta.BloomShardCount = uint16(b.bloom.GetShardCount())
+	b.meta.BloomShardCount = uint32(b.bloom.GetShardCount())
 
-	return n, writeBlockMeta(b.ctx, b.to, b.meta, b.bloom)
+	return n, writeBlockMeta(b.ctx, b.to, b.meta, b.bloom, b.index)
 }
 
 // estimateMarshalledSizeFromTrace attempts to estimate the size of trace in bytes. This is used to make choose

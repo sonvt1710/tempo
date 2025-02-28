@@ -28,13 +28,17 @@ const (
 	LabelK8sPodName       = "k8s.pod.name"
 	LabelK8sContainerName = "k8s.container.name"
 
-	LabelName           = "name"
-	LabelHTTPMethod     = "http.method"
-	LabelHTTPUrl        = "http.url"
-	LabelHTTPStatusCode = "http.status_code"
-	LabelStatusCode     = "status.code"
-	LabelStatus         = "status"
-	LabelKind           = "kind"
+	LabelName                   = "name"
+	LabelHTTPMethod             = "http.method"
+	LabelHTTPUrl                = "http.url"
+	LabelHTTPStatusCode         = "http.status_code"
+	LabelStatusCode             = "status.code"
+	LabelStatus                 = "status"
+	LabelKind                   = "kind"
+	LabelTraceQLRootServiceName = "rootServiceName"
+	LabelTraceQLRootName        = "rootName"
+	LabelTraceID                = "trace:id"
+	LabelSpanID                 = "span:id"
 )
 
 // These definition levels match the schema below
@@ -133,8 +137,8 @@ type Span struct {
 	// friendly like trace ID, and []byte is half the size of string.
 	SpanID                 []byte      `parquet:","`
 	ParentSpanID           []byte      `parquet:","`
-	ParentID               int32       `parquet:",delta"`
-	NestedSetLeft          int32       `parquet:",delta"`
+	ParentID               int32       `parquet:",delta"` // can be zero for non-root spans, use IsRoot to check for root spans
+	NestedSetLeft          int32       `parquet:",delta"` // doubles as numeric ID and is used to fill ParentID of child spans
 	NestedSetRight         int32       `parquet:",delta"`
 	Name                   string      `parquet:",snappy,dict"`
 	Kind                   int         `parquet:",delta"`
@@ -154,6 +158,10 @@ type Span struct {
 	HttpMethod     *string `parquet:",snappy,optional,dict"`
 	HttpUrl        *string `parquet:",snappy,optional,dict"`
 	HttpStatusCode *int64  `parquet:",snappy,optional"`
+}
+
+func (s *Span) IsRoot() bool {
+	return len(s.ParentSpanID) == 0
 }
 
 type InstrumentationScope struct {
@@ -248,8 +256,8 @@ func traceToParquet(id common.ID, tr *tempopb.Trace, ot *Trace) *Trace {
 	var rootSpan *v1_trace.Span
 	var rootBatch *v1_trace.ResourceSpans
 
-	ot.ResourceSpans = extendReuseSlice(len(tr.Batches), ot.ResourceSpans)
-	for ib, b := range tr.Batches {
+	ot.ResourceSpans = extendReuseSlice(len(tr.ResourceSpans), ot.ResourceSpans)
+	for ib, b := range tr.ResourceSpans {
 		ob := &ot.ResourceSpans[ib]
 		// clear out any existing fields in case they were set on the original
 		ob.Resource.ServiceName = ""
@@ -336,6 +344,12 @@ func traceToParquet(id common.ID, tr *tempopb.Trace, ot *Trace) *Trace {
 					eventToParquet(e, &ss.Events[ie])
 				}
 
+				// nested set values do not come from the proto, they are calculated
+				// later. set all to 0
+				ss.NestedSetLeft = 0
+				ss.NestedSetRight = 0
+				ss.ParentID = 0
+
 				ss.SpanID = s.SpanId
 				ss.ParentSpanID = s.ParentSpanId
 				ss.Name = s.Name
@@ -419,6 +433,8 @@ func traceToParquet(id common.ID, tr *tempopb.Trace, ot *Trace) *Trace {
 			}
 		}
 	}
+
+	assignNestedSetModelBounds(ot)
 
 	return ot
 }
@@ -515,9 +531,9 @@ func parquetToProtoEvents(parquetEvents []Event) []*v1_trace.Span_Event {
 	return protoEvents
 }
 
-func parquetTraceToTempopbTrace(parquetTrace *Trace) *tempopb.Trace {
+func ParquetTraceToTempopbTrace(parquetTrace *Trace) *tempopb.Trace {
 	protoTrace := &tempopb.Trace{}
-	protoTrace.Batches = make([]*v1_trace.ResourceSpans, 0, len(parquetTrace.ResourceSpans))
+	protoTrace.ResourceSpans = make([]*v1_trace.ResourceSpans, 0, len(parquetTrace.ResourceSpans))
 
 	for _, rs := range parquetTrace.ResourceSpans {
 		protoBatch := &v1_trace.ResourceSpans{}
@@ -638,7 +654,7 @@ func parquetTraceToTempopbTrace(parquetTrace *Trace) *tempopb.Trace {
 
 			protoBatch.ScopeSpans = append(protoBatch.ScopeSpans, protoSS)
 		}
-		protoTrace.Batches = append(protoTrace.Batches, protoBatch)
+		protoTrace.ResourceSpans = append(protoTrace.ResourceSpans, protoBatch)
 	}
 
 	return protoTrace

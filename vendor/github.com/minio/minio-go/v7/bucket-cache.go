@@ -58,7 +58,7 @@ func (r *bucketLocationCache) Get(bucketName string) (location string, ok bool) 
 }
 
 // Set - Will persist a value into cache.
-func (r *bucketLocationCache) Set(bucketName string, location string) {
+func (r *bucketLocationCache) Set(bucketName, location string) {
 	r.Lock()
 	defer r.Unlock()
 	r.items[bucketName] = location
@@ -127,8 +127,11 @@ func processBucketLocationResponse(resp *http.Response, bucketName string) (buck
 			// succeed if possible based on their policy.
 			switch errResp.Code {
 			case "NotImplemented":
-				if errResp.Server == "AmazonSnowball" {
+				switch errResp.Server {
+				case "AmazonSnowball":
 					return "snowball", nil
+				case "cloudflare":
+					return "us-east-1", nil
 				}
 			case "AuthorizationHeaderMalformed":
 				fallthrough
@@ -181,15 +184,17 @@ func (c *Client) getBucketLocationRequest(ctx context.Context, bucketName string
 	if h, p, err := net.SplitHostPort(targetURL.Host); err == nil {
 		if targetURL.Scheme == "http" && p == "80" || targetURL.Scheme == "https" && p == "443" {
 			targetURL.Host = h
+			if ip := net.ParseIP(h); ip != nil && ip.To16() != nil {
+				targetURL.Host = "[" + h + "]"
+			}
 		}
 	}
 
-	isVirtualHost := s3utils.IsVirtualHostSupported(targetURL, bucketName)
+	isVirtualStyle := c.isVirtualHostStyleRequest(targetURL, bucketName)
 
 	var urlStr string
 
-	// only support Aliyun OSS for virtual hosted path,  compatible  Amazon & Google Endpoint
-	if isVirtualHost && s3utils.IsAliyunOSSEndpoint(targetURL) {
+	if isVirtualStyle {
 		urlStr = c.endpointURL.Scheme + "://" + bucketName + "." + targetURL.Host + "/?location"
 	} else {
 		targetURL.Path = path.Join(bucketName, "") + "/"
@@ -207,7 +212,7 @@ func (c *Client) getBucketLocationRequest(ctx context.Context, bucketName string
 	c.setUserAgent(req)
 
 	// Get credentials from the configured credentials provider.
-	value, err := c.credsProvider.Get()
+	value, err := c.credsProvider.GetWithContext(c.CredContext())
 	if err != nil {
 		return nil, err
 	}
@@ -235,9 +240,7 @@ func (c *Client) getBucketLocationRequest(ctx context.Context, bucketName string
 	}
 
 	if signerType.IsV2() {
-		// Get Bucket Location calls should be always path style
-		isVirtualHost := false
-		req = signer.SignV2(*req, accessKeyID, secretAccessKey, isVirtualHost)
+		req = signer.SignV2(*req, accessKeyID, secretAccessKey, isVirtualStyle)
 		return req, nil
 	}
 

@@ -8,10 +8,17 @@ jobs:
     # this action keeps failing in all forks, only run in grafana/tempo.
     # stats collection action is only useful in main repo.
     if: github.repository == 'grafana/tempo'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
+      - name: Get app token
+        uses: actions/create-github-app-token@v1
+        id: get-github-app-token
+        with:
+          app-id: ${{secrets.APP_ID}}
+          private-key: ${{secrets.APP_PRIVATE_KEY}}
+          owner: ${{ github.repository_owner }}
       - name: Checkout Actions
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: "grafana/grafana-github-actions"
           path: ./actions
@@ -22,4 +29,4 @@ jobs:
         uses: ./actions/metrics-collector
         with:
           metricsWriteAPIKey: ${{secrets.GRAFANA_MISC_STATS_API_KEY}}
-          token: ${{secrets.GH_BOT_ACCESS_TOKEN}}
+          token: ${{ steps.get-github-app-token.outputs.token }}

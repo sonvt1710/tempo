@@ -6,8 +6,8 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/grafana/tempo/pkg/collector"
 	"github.com/grafana/tempo/pkg/traceql"
-	"github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
 	"github.com/grafana/tempo/tempodb/encoding/common"
@@ -21,13 +21,16 @@ func TestBackendBlockSearchTags(t *testing.T) {
 
 	testVals := func(scope traceql.AttributeScope, attrs map[string]string) {
 		foundAttrs := map[string]struct{}{}
-		cb := func(s string) {
+		cb := func(s string, _ traceql.AttributeScope) {
 			foundAttrs[s] = struct{}{}
 		}
+		mc := collector.NewMetricsCollector()
 
 		ctx := context.Background()
-		err := block.SearchTags(ctx, scope, cb, common.DefaultSearchOptions())
+		err := block.SearchTags(ctx, scope, cb, mc.Add, common.DefaultSearchOptions())
 		require.NoError(t, err)
+		// test that callback is recording bytes read
+		require.Greater(t, mc.TotalValue(), uint64(100))
 
 		// test that all attrs are in found attrs
 		for k := range attrs {
@@ -66,14 +69,18 @@ func TestBackendBlockSearchTagValues(t *testing.T) {
 	ctx := context.Background()
 	for tag, val := range attrs {
 		wasCalled := false
-		cb := func(s string) {
+		cb := func(s string) bool {
 			wasCalled = true
 			assert.Equal(t, val, s, tag)
+			return true
 		}
+		mc := collector.NewMetricsCollector()
 
-		err := block.SearchTagValues(ctx, tag, cb, common.DefaultSearchOptions())
+		err := block.SearchTagValues(ctx, tag, cb, mc.Add, common.DefaultSearchOptions())
 		require.NoError(t, err)
 		require.True(t, wasCalled, tag)
+		// test that callback is recording bytes read
+		require.Greater(t, mc.TotalValue(), uint64(100))
 	}
 }
 
@@ -88,6 +95,12 @@ func TestBackendBlockSearchTagValuesV2(t *testing.T) {
 		{traceql.MustParseIdentifier("name"), []traceql.Static{
 			traceql.NewStaticString("hello"),
 			traceql.NewStaticString("world"),
+		}},
+		{traceql.MustParseIdentifier("rootName"), []traceql.Static{
+			traceql.NewStaticString("RootSpan"),
+		}},
+		{traceql.MustParseIdentifier("rootServiceName"), []traceql.Static{
+			traceql.NewStaticString("RootService"),
 		}},
 
 		// Attribute that conflicts with intrinsic
@@ -138,10 +151,13 @@ func TestBackendBlockSearchTagValuesV2(t *testing.T) {
 			got = append(got, v)
 			return false
 		}
+		mc := collector.NewMetricsCollector()
 
-		err := block.SearchTagValuesV2(ctx, tc.tag, cb, common.DefaultSearchOptions())
+		err := block.SearchTagValuesV2(ctx, tc.tag, cb, mc.Add, common.DefaultSearchOptions())
 		require.NoError(t, err, tc.tag)
 		require.Equal(t, tc.vals, got, "tag=%v", tc.tag)
+		// test that callback is recording bytes read
+		require.Greater(t, mc.TotalValue(), uint64(100))
 	}
 }
 
@@ -161,12 +177,13 @@ func BenchmarkBackendBlockSearchTags(b *testing.B) {
 
 	block := newBackendBlock(meta, rr)
 	opts := common.DefaultSearchOptions()
-	d := util.NewDistinctStringCollector(1_000_000)
+	d := collector.NewDistinctString(1_000_000, 0, 0)
+	mc := collector.NewMetricsCollector()
 
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		err := block.SearchTags(ctx, traceql.AttributeScopeNone, d.Collect, opts)
+		err := block.SearchTags(ctx, traceql.AttributeScopeNone, func(s string, _ traceql.AttributeScope) { d.Collect(s) }, mc.Add, opts)
 		require.NoError(b, err)
 	}
 }
@@ -195,10 +212,11 @@ func BenchmarkBackendBlockSearchTagValues(b *testing.B) {
 
 	for _, tc := range testCases {
 		b.Run(tc, func(b *testing.B) {
-			d := util.NewDistinctStringCollector(1_000_000)
+			d := collector.NewDistinctString(1_000_000, 0, 0)
+			mc := collector.NewMetricsCollector()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				err := block.SearchTagValues(ctx, tc, d.Collect, opts)
+				err := block.SearchTagValues(ctx, tc, d.Collect, mc.Add, opts)
 				require.NoError(b, err)
 			}
 		})

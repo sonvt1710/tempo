@@ -5,38 +5,45 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
-	"strings"
+	"net/http"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/gogo/protobuf/proto"
 	"github.com/gogo/status"
 	"github.com/grafana/dskit/limiter"
+	dslog "github.com/grafana/dskit/log"
 	"github.com/grafana/dskit/ring"
 	ring_client "github.com/grafana/dskit/ring/client"
 	"github.com/grafana/dskit/services"
-	"github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
+	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/util/strutil"
 	"github.com/segmentio/fasthash/fnv1a"
-	"github.com/weaveworks/common/logging"
-	"github.com/weaveworks/common/user"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/otel"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/grafana/tempo/modules/distributor/forwarder"
 	"github.com/grafana/tempo/modules/distributor/receiver"
+	"github.com/grafana/tempo/modules/distributor/usage"
 	generator_client "github.com/grafana/tempo/modules/generator/client"
 	ingester_client "github.com/grafana/tempo/modules/ingester/client"
 	"github.com/grafana/tempo/modules/overrides"
-	_ "github.com/grafana/tempo/pkg/gogocodec" // force gogo codec registration
+	"github.com/grafana/tempo/pkg/ingest"
 	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/tempopb"
+	v1_common "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	v1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
+	"github.com/grafana/tempo/pkg/usagestats"
 	tempo_util "github.com/grafana/tempo/pkg/util"
+
 	"github.com/grafana/tempo/pkg/validation"
 )
 
@@ -47,8 +54,8 @@ const (
 	reasonTraceTooLarge = "trace_too_large"
 	// reasonLiveTracesExceeded indicates that tempo is already tracking too many live traces in the ingesters for this user
 	reasonLiveTracesExceeded = "live_traces_exceeded"
-	// reasonInternalError indicates an unexpected error occurred processing these spans. analogous to a 500
-	reasonInternalError = "internal_error"
+	// reasonUnknown indicates a pushByte error at the ingester level not related to GRPC
+	reasonUnknown = "unknown_error"
 
 	distributorRingKey = "distributor"
 )
@@ -79,16 +86,24 @@ var (
 		Name:      "distributor_spans_received_total",
 		Help:      "The total number of spans received per tenant",
 	}, []string{"tenant"})
+	metricDebugSpansIngested = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "tempo",
+		Name:      "distributor_debug_spans_received_total",
+		Help:      "Debug counters for spans received per tenant",
+	}, []string{"tenant", "name", "service"})
 	metricBytesIngested = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "tempo",
 		Name:      "distributor_bytes_received_total",
 		Help:      "The total number of proto bytes received per tenant",
 	}, []string{"tenant"})
 	metricTracesPerBatch = promauto.NewHistogram(prometheus.HistogramOpts{
-		Namespace: "tempo",
-		Name:      "distributor_traces_per_batch",
-		Help:      "The number of traces in each batch",
-		Buckets:   prometheus.ExponentialBuckets(2, 2, 10),
+		Namespace:                       "tempo",
+		Name:                            "distributor_traces_per_batch",
+		Help:                            "The number of traces in each batch",
+		Buckets:                         prometheus.ExponentialBuckets(2, 2, 10),
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: 1 * time.Hour,
 	})
 	metricIngesterClients = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: "tempo",
@@ -100,14 +115,49 @@ var (
 		Name:      "distributor_metrics_generator_clients",
 		Help:      "The current number of metrics-generator clients.",
 	})
+	metricAttributesTruncated = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "tempo",
+		Name:      "distributor_attributes_truncated_total",
+		Help:      "The total number of attribute keys or values truncated per tenant",
+	}, []string{"tenant"})
+	metricKafkaRecordsPerRequest = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "tempo",
+		Subsystem: "distributor",
+		Name:      "kafka_records_per_request",
+		Help:      "The number of records in each kafka request",
+	})
+	metricKafkaWriteLatency = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "tempo",
+		Subsystem: "distributor",
+		Name:      "kafka_write_latency_seconds",
+		Help:      "The latency of writing to kafka",
+	})
+	metricKafkaWriteBytesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "tempo",
+		Subsystem: "distributor",
+		Name:      "kafka_write_bytes_total",
+		Help:      "The total number of bytes written to kafka",
+	}, []string{"partition"})
+	metricKafkaAppends = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "tempo",
+		Subsystem: "distributor",
+		Name:      "kafka_appends_total",
+		Help:      "The total number of appends sent to kafka",
+	}, []string{"partition", "status"})
+
+	statBytesReceived = usagestats.NewCounter("distributor_bytes_received")
+	statSpansReceived = usagestats.NewCounter("distributor_spans_received")
 )
+
+var tracer = otel.Tracer("modules/distributor")
 
 // rebatchedTrace is used to more cleanly pass the set of data
 type rebatchedTrace struct {
-	id    []byte
-	trace *tempopb.Trace
-	start uint32 // unix epoch seconds
-	end   uint32 // unix epoch seconds
+	id        []byte
+	trace     *tempopb.Trace
+	start     uint32 // unix epoch seconds
+	end       uint32 // unix epoch seconds
+	spanCount int
 }
 
 // Distributor coordinates replicates and distribution of log streams.
@@ -119,7 +169,7 @@ type Distributor struct {
 	ingestersRing   ring.ReadRing
 	pool            *ring_client.Pool
 	DistributorRing *ring.Ring
-	overrides       *overrides.Overrides
+	overrides       overrides.Interface
 	traceEncoder    model.SegmentDecoder
 
 	// metrics-generator
@@ -131,6 +181,10 @@ type Distributor struct {
 	// Generic Forwarder
 	forwardersManager *forwarder.Manager
 
+	// Kafka
+	kafkaProducer *ingest.Producer
+	partitionRing ring.PartitionRingReader
+
 	// Per-user rate limiter.
 	ingestionRateLimiter *limiter.RateLimiter
 
@@ -138,11 +192,33 @@ type Distributor struct {
 	subservices        *services.Manager
 	subservicesWatcher *services.FailureWatcher
 
+	usage *usage.Tracker
+
 	logger log.Logger
+
+	// For testing functionality that relies on timing without having to sleep in unit tests.
+	sleep func(time.Duration)
+	now   func() time.Time
 }
 
 // New a distributor creates.
-func New(cfg Config, clientCfg ingester_client.Config, ingestersRing ring.ReadRing, generatorClientCfg generator_client.Config, generatorsRing ring.ReadRing, o *overrides.Overrides, middleware receiver.Middleware, logger log.Logger, loggingLevel logging.Level, reg prometheus.Registerer) (*Distributor, error) {
+func New(
+	cfg Config,
+	clientCfg ingester_client.Config,
+	ingestersRing ring.ReadRing,
+	generatorClientCfg generator_client.Config,
+	generatorsRing ring.ReadRing,
+	partitionRing ring.PartitionRingReader,
+	o overrides.Interface,
+	middleware receiver.Middleware,
+	logger log.Logger,
+	loggingLevel dslog.Level,
+	reg prometheus.Registerer,
+) (*Distributor, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
 	factory := cfg.factory
 	if factory == nil {
 		factory = func(addr string) (ring_client.PoolClient, error) {
@@ -167,7 +243,7 @@ func New(cfg Config, clientCfg ingester_client.Config, ingestersRing ring.ReadRi
 
 		ring, err := ring.New(lifecyclerCfg.RingConfig, "distributor", cfg.OverrideRingKey, logger, prometheus.WrapRegistererWithPrefix("tempo_", reg))
 		if err != nil {
-			return nil, errors.Wrap(err, "unable to initialize distributor ring")
+			return nil, fmt.Errorf("unable to initialize distributor ring: %w", err)
 		}
 		distributorRing = ring
 		subservices = append(subservices, distributorRing)
@@ -193,18 +269,30 @@ func New(cfg Config, clientCfg ingester_client.Config, ingestersRing ring.ReadRi
 		ingestionRateLimiter: limiter.NewRateLimiter(ingestionRateStrategy, 10*time.Second),
 		generatorClientCfg:   generatorClientCfg,
 		generatorsRing:       generatorsRing,
+		partitionRing:        partitionRing,
 		overrides:            o,
 		traceEncoder:         model.MustNewSegmentDecoder(model.CurrentEncoding),
 		logger:               logger,
+		sleep:                time.Sleep,
+		now:                  time.Now,
 	}
 
+	if cfg.Usage.CostAttribution.Enabled {
+		usage, err := usage.NewTracker(cfg.Usage.CostAttribution, "cost-attribution", o.CostAttributionDimensions, o.CostAttributionMaxCardinality)
+		if err != nil {
+			return nil, fmt.Errorf("creating usage tracker: %w", err)
+		}
+		d.usage = usage
+	}
+
+	var generatorsPoolFactory ring_client.PoolAddrFunc = func(addr string) (ring_client.PoolClient, error) {
+		return generator_client.New(addr, generatorClientCfg)
+	}
 	d.generatorsPool = ring_client.NewPool(
 		"distributor_metrics_generator_pool",
 		generatorClientCfg.PoolConfig,
 		ring_client.NewRingServiceDiscovery(generatorsRing),
-		func(addr string) (ring_client.PoolClient, error) {
-			return generator_client.New(addr, generatorClientCfg)
-		},
+		generatorsPoolFactory,
 		metricGeneratorClients,
 		logger,
 	)
@@ -214,7 +302,7 @@ func New(cfg Config, clientCfg ingester_client.Config, ingestersRing ring.ReadRi
 	d.generatorForwarder = newGeneratorForwarder(logger, d.sendToGenerators, o)
 	subservices = append(subservices, d.generatorForwarder)
 
-	forwardersManager, err := forwarder.NewManager(d.cfg.Forwarders, logger, o)
+	forwardersManager, err := forwarder.NewManager(d.cfg.Forwarders, logger, o, loggingLevel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create forwarders manager: %w", err)
 	}
@@ -227,15 +315,23 @@ func New(cfg Config, clientCfg ingester_client.Config, ingestersRing ring.ReadRi
 		cfgReceivers = defaultReceivers
 	}
 
-	receivers, err := receiver.New(cfgReceivers, d, middleware, loggingLevel)
+	receivers, err := receiver.New(cfgReceivers, d, middleware, cfg.RetryAfterOnResourceExhausted, loggingLevel, reg)
 	if err != nil {
 		return nil, err
 	}
 	subservices = append(subservices, receivers)
 
+	if cfg.KafkaWritePathEnabled {
+		client, err := ingest.NewWriterClient(cfg.KafkaConfig, 10, logger, prometheus.WrapRegistererWithPrefix("tempo_distributor_", reg))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create kafka writer client: %w", err)
+		}
+		d.kafkaProducer = ingest.NewProducer(client, d.cfg.KafkaConfig.ProducerMaxBufferedBytes, reg)
+	}
+
 	d.subservices, err = services.NewManager(subservices...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create subservices %w", err)
+		return nil, fmt.Errorf("failed to create subservices: %w", err)
 	}
 	d.subservicesWatcher = services.NewFailureWatcher()
 	d.subservicesWatcher.WatchManager(d.subservices)
@@ -248,7 +344,7 @@ func (d *Distributor) starting(ctx context.Context) error {
 	// Only report success if all sub-services start properly
 	err := services.StartManagerAndAwaitHealthy(ctx, d.subservices)
 	if err != nil {
-		return fmt.Errorf("failed to start subservices %w", err)
+		return fmt.Errorf("failed to start subservices: %w", err)
 	}
 
 	return nil
@@ -259,7 +355,7 @@ func (d *Distributor) running(ctx context.Context) error {
 	case <-ctx.Done():
 		return nil
 	case err := <-d.subservicesWatcher.Chan():
-		return fmt.Errorf("distributor subservices failed %w", err)
+		return fmt.Errorf("distributor subservices failed: %w", err)
 	}
 }
 
@@ -268,10 +364,56 @@ func (d *Distributor) stopping(_ error) error {
 	return services.StopManagerAndAwaitStopped(context.Background(), d.subservices)
 }
 
+func (d *Distributor) checkForRateLimits(tracesSize, spanCount int, userID string) error {
+	now := time.Now()
+	if !d.ingestionRateLimiter.AllowN(now, userID, tracesSize) {
+		overrides.RecordDiscardedSpans(spanCount, reasonRateLimited, userID)
+		limit := int(d.ingestionRateLimiter.Limit(now, userID))
+		var globalLimit int
+		if d.overrides.IngestionRateStrategy() == overrides.GlobalIngestionRateStrategy {
+			globalLimit = limit * d.DistributorRing.InstancesCount()
+		}
+		return status.Errorf(codes.ResourceExhausted,
+			"%s: ingestion rate limit (local: %d bytes, global: %d bytes) exceeded while adding %d bytes for user %s",
+			overrides.ErrorPrefixRateLimited,
+			limit,
+			globalLimit,
+			tracesSize, userID)
+	}
+
+	return nil
+}
+
+func (d *Distributor) extractBasicInfo(ctx context.Context, traces ptrace.Traces) (userID string, spanCount, tracesSize int, err error) {
+	user, e := user.ExtractOrgID(ctx)
+	if e != nil {
+		return "", 0, 0, e
+	}
+
+	return user, traces.SpanCount(), (&ptrace.ProtoMarshaler{}).TracesSize(traces), nil
+}
+
 // PushTraces pushes a batch of traces
 func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*tempopb.PushResponse, error) {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "distributor.PushTraces")
-	defer span.Finish()
+	reqStart := time.Now()
+
+	ctx, span := tracer.Start(ctx, "distributor.PushBytes")
+	defer span.End()
+
+	userID, spanCount, size, err := d.extractBasicInfo(ctx, traces)
+	if err != nil {
+		// can't record discarded spans here b/c there's no tenant
+		return nil, err
+	}
+	if spanCount == 0 {
+		return &tempopb.PushResponse{}, nil
+	}
+	// check limits
+	// todo - usage tracker include discarded bytes?
+	err = d.checkForRateLimits(size, spanCount, userID)
+	if err != nil {
+		return nil, err
+	}
 
 	// Convert to bytes and back. This is unfortunate for efficiency, but it works
 	// around the otel-collector internalization of otel-proto which Tempo also uses.
@@ -288,78 +430,68 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 		return nil, err
 	}
 
-	batches := trace.Batches
+	batches := trace.ResourceSpans
 
-	userID, err := user.ExtractOrgID(ctx)
-	if err != nil {
-		// can't record discarded spans here b/c there's no tenant
-		return nil, err
-	}
-
-	if d.cfg.LogReceivedSpans.Enabled || d.cfg.LogReceivedTraces {
-		if d.cfg.LogReceivedSpans.IncludeAllAttributes {
-			logSpansWithAllAttributes(batches, d.cfg.LogReceivedSpans.FilterByStatusError, d.logger)
-		} else {
-			logSpans(batches, d.cfg.LogReceivedSpans.FilterByStatusError, d.logger)
-		}
+	logReceivedSpans(batches, &d.cfg.LogReceivedSpans, d.logger)
+	if d.cfg.MetricReceivedSpans.Enabled {
+		metricSpans(batches, userID, &d.cfg.MetricReceivedSpans)
 	}
 
-	// metric size
-	size := 0
-	spanCount := 0
-	for _, b := range batches {
-		size += b.Size()
-		for _, ils := range b.ScopeSpans {
-			spanCount += len(ils.Spans)
-		}
-	}
-	if spanCount == 0 {
-		return &tempopb.PushResponse{}, nil
-	}
 	metricBytesIngested.WithLabelValues(userID).Add(float64(size))
 	metricSpansIngested.WithLabelValues(userID).Add(float64(spanCount))
+	statBytesReceived.Inc(int64(size))
+	statSpansReceived.Inc(int64(spanCount))
 
-	// check limits
-	now := time.Now()
-	if !d.ingestionRateLimiter.AllowN(now, userID, size) {
-		overrides.RecordDiscardedSpans(spanCount, reasonRateLimited, userID)
-		return nil, status.Errorf(codes.ResourceExhausted,
-			"%s ingestion rate limit (%d bytes) exceeded while adding %d bytes",
-			overrides.ErrorPrefixRateLimited,
-			int(d.ingestionRateLimiter.Limit(now, userID)),
-			size)
+	// Usage tracking
+	if d.usage != nil {
+		d.usage.Observe(userID, batches)
 	}
 
-	keys, rebatchedTraces, err := requestsByTraceID(batches, userID, spanCount)
+	maxAttributeBytes := d.getMaxAttributeBytes(userID)
+
+	keys, rebatchedTraces, truncatedAttributeCount, err := requestsByTraceID(batches, userID, spanCount, maxAttributeBytes)
 	if err != nil {
-		overrides.RecordDiscardedSpans(spanCount, reasonInternalError, userID)
+		logDiscardedResourceSpans(batches, userID, &d.cfg.LogDiscardedSpans, d.logger)
 		return nil, err
 	}
 
-	err = d.sendToIngestersViaBytes(ctx, userID, rebatchedTraces, keys)
-	if err != nil {
-		recordDiscaredSpans(err, userID, spanCount)
-		return nil, err
+	if truncatedAttributeCount > 0 {
+		metricAttributesTruncated.WithLabelValues(userID).Add(float64(truncatedAttributeCount))
 	}
 
-	if len(d.overrides.MetricsGeneratorProcessors(userID)) > 0 {
-		d.generatorForwarder.SendTraces(ctx, userID, keys, rebatchedTraces)
+	err = d.sendToIngestersViaBytes(ctx, userID, spanCount, rebatchedTraces, keys)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := d.forwardersManager.ForTenant(userID).ForwardTraces(ctx, traces); err != nil {
 		_ = level.Warn(d.logger).Log("msg", "failed to forward batches for tenant=%s: %w", userID, err)
 	}
 
+	if d.kafkaProducer != nil {
+		err := d.sendToKafka(ctx, userID, keys, rebatchedTraces)
+		if err != nil {
+			// TODO: Handle error
+			level.Error(d.logger).Log("msg", "failed to write to kafka", "err", err)
+		}
+	} else {
+		// See if we need to send to the generators
+		if len(d.overrides.MetricsGeneratorProcessors(userID)) > 0 {
+			d.generatorForwarder.SendTraces(ctx, userID, keys, rebatchedTraces)
+		}
+	}
+
+	d.padWithArtificialDelay(reqStart, userID)
+
 	return nil, nil // PushRequest is ignored, so no reason to create one
 }
 
-func (d *Distributor) sendToIngestersViaBytes(ctx context.Context, userID string, traces []*rebatchedTrace, keys []uint32) error {
-	// Marshal to bytes once
+func (d *Distributor) sendToIngestersViaBytes(ctx context.Context, userID string, totalSpanCount int, traces []*rebatchedTrace, keys []uint32) error {
 	marshalledTraces := make([][]byte, len(traces))
 	for i, t := range traces {
 		b, err := d.traceEncoder.PrepareForWrite(t.trace, t.start, t.end)
 		if err != nil {
-			return errors.Wrap(err, "failed to marshal PushRequest")
+			return fmt.Errorf("failed to marshal PushRequest: %w", err)
 		}
 		marshalledTraces[i] = b
 	}
@@ -369,20 +501,27 @@ func (d *Distributor) sendToIngestersViaBytes(ctx context.Context, userID string
 		op = ring.Write
 	}
 
-	err := ring.DoBatch(ctx, op, d.ingestersRing, keys, func(ingester ring.InstanceDesc, indexes []int) error {
+	numOfTraces := len(keys)
+	numSuccessByTraceIndex := make([]int, numOfTraces)
+	lastErrorReasonByTraceIndex := make([]tempopb.PushErrorReason, numOfTraces)
+
+	var mu sync.Mutex
+
+	writeRing := d.ingestersRing.ShuffleShard(userID, d.overrides.IngestionTenantShardSize(userID))
+
+	err := ring.DoBatchWithOptions(ctx, op, writeRing, keys, func(ingester ring.InstanceDesc, indexes []int) error {
 		localCtx, cancel := context.WithTimeout(ctx, d.clientCfg.RemoteTimeout)
 		defer cancel()
 		localCtx = user.InjectOrgID(localCtx, userID)
 
 		req := tempopb.PushBytesRequest{
-			Traces:     make([]tempopb.PreallocBytes, len(indexes)),
-			Ids:        make([]tempopb.PreallocBytes, len(indexes)),
-			SearchData: nil, // support for flatbuffer/v2 search has been removed. todo: cleanup the proto
+			Traces: make([]tempopb.PreallocBytes, len(indexes)),
+			Ids:    make([][]byte, len(indexes)),
 		}
 
 		for i, j := range indexes {
 			req.Traces[i].Slice = marshalledTraces[j][0:]
-			req.Ids[i].Slice = traces[j].id
+			req.Ids[i] = traces[j].id
 		}
 
 		c, err := d.pool.GetClientFor(ingester.Addr)
@@ -390,15 +529,34 @@ func (d *Distributor) sendToIngestersViaBytes(ctx context.Context, userID string
 			return err
 		}
 
-		_, err = c.(tempopb.PusherClient).PushBytesV2(localCtx, &req)
+		pushResponse, err := c.(tempopb.PusherClient).PushBytesV2(localCtx, &req)
 		metricIngesterAppends.WithLabelValues(ingester.Addr).Inc()
-		if err != nil {
-			metricIngesterAppendFailures.WithLabelValues(ingester.Addr).Inc()
-		}
-		return err
-	}, func() {})
 
-	return err
+		if err != nil { // internal error, drop entire batch
+			metricIngesterAppendFailures.WithLabelValues(ingester.Addr).Inc()
+			return err
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		d.processPushResponse(pushResponse, numSuccessByTraceIndex, lastErrorReasonByTraceIndex, numOfTraces, indexes)
+
+		return nil
+	}, ring.DoBatchOptions{})
+	// if err != nil, we discarded everything because of an internal error (like "context cancelled")
+	if err != nil {
+		logDiscardedRebatchedSpans(traces, userID, &d.cfg.LogDiscardedSpans, d.logger)
+		return err
+	}
+
+	// count discarded span count
+	mu.Lock()
+	defer mu.Unlock()
+	recordDiscardedSpans(numSuccessByTraceIndex, lastErrorReasonByTraceIndex, traces, writeRing, userID)
+	logDiscardedSpans(numSuccessByTraceIndex, lastErrorReasonByTraceIndex, traces, writeRing, userID, &d.cfg.LogDiscardedSpans, d.logger)
+
+	return nil
 }
 
 func (d *Distributor) sendToGenerators(ctx context.Context, userID string, keys []uint32, traces []*rebatchedTrace) error {
@@ -407,7 +565,7 @@ func (d *Distributor) sendToGenerators(ctx context.Context, userID string, keys 
 
 	readRing := d.generatorsRing.ShuffleShard(userID, d.overrides.MetricsGeneratorRingSize(userID))
 
-	err := ring.DoBatch(ctx, op, readRing, keys, func(generator ring.InstanceDesc, indexes []int) error {
+	err := ring.DoBatchWithOptions(ctx, op, readRing, keys, func(generator ring.InstanceDesc, indexes []int) error {
 		localCtx, cancel := context.WithTimeout(ctx, d.generatorClientCfg.RemoteTimeout)
 		defer cancel()
 		localCtx = user.InjectOrgID(localCtx, userID)
@@ -416,21 +574,22 @@ func (d *Distributor) sendToGenerators(ctx context.Context, userID string, keys 
 			Batches: nil,
 		}
 		for _, j := range indexes {
-			req.Batches = append(req.Batches, traces[j].trace.Batches...)
+			req.Batches = append(req.Batches, traces[j].trace.ResourceSpans...)
 		}
 
 		c, err := d.generatorsPool.GetClientFor(generator.Addr)
 		if err != nil {
-			return errors.Wrap(err, "failed to get client for generator")
+			return fmt.Errorf("failed to get client for generator: %w", err)
 		}
 
 		_, err = c.(tempopb.MetricsGeneratorClient).PushSpans(localCtx, &req)
 		metricGeneratorPushes.WithLabelValues(generator.Addr).Inc()
 		if err != nil {
 			metricGeneratorPushesFailures.WithLabelValues(generator.Addr).Inc()
+			return fmt.Errorf("failed to push spans to generator: %w", err)
 		}
-		return errors.Wrap(err, "failed to push spans to generator")
-	}, func() {})
+		return nil
+	}, ring.DoBatchOptions{})
 
 	return err
 }
@@ -440,20 +599,136 @@ func (*Distributor) Check(_ context.Context, _ *grpc_health_v1.HealthCheckReques
 	return &grpc_health_v1.HealthCheckResponse{Status: grpc_health_v1.HealthCheckResponse_SERVING}, nil
 }
 
+func (d *Distributor) UsageTrackerHandler() http.Handler {
+	if d.usage != nil {
+		return d.usage.Handler()
+	}
+
+	return nil
+}
+
+func (d *Distributor) sendToKafka(ctx context.Context, userID string, keys []uint32, traces []*rebatchedTrace) error {
+	marshalledTraces := make([][]byte, len(traces))
+	for i, t := range traces {
+		b, err := proto.Marshal(t.trace)
+		if err != nil {
+			return fmt.Errorf("failed to marshal trace: %w", err)
+		}
+		marshalledTraces[i] = b
+	}
+
+	partitionRing, err := d.partitionRing.PartitionRing().ShuffleShard(userID, d.overrides.IngestionTenantShardSize(userID))
+	if err != nil {
+		return fmt.Errorf("failed to shuffle shard: %w", err)
+	}
+	return ring.DoBatchWithOptions(ctx, ring.Write, ring.NewActivePartitionBatchRing(partitionRing), keys, func(partition ring.InstanceDesc, indexes []int) error {
+		localCtx, cancel := context.WithTimeout(ctx, d.clientCfg.RemoteTimeout)
+		defer cancel()
+		localCtx = user.InjectOrgID(localCtx, userID)
+
+		req := &tempopb.PushBytesRequest{
+			Traces: make([]tempopb.PreallocBytes, len(indexes)),
+			Ids:    make([][]byte, len(indexes)),
+		}
+
+		for i, j := range indexes {
+			req.Traces[i].Slice = marshalledTraces[j][0:]
+			req.Ids[i] = traces[j].id
+		}
+
+		// The partition ID is stored in the ring.InstanceDesc ID.
+		partitionID, err := strconv.ParseInt(partition.Id, 10, 31)
+		if err != nil {
+			return err
+		}
+
+		startTime := time.Now()
+
+		records, err := ingest.Encode(int32(partitionID), userID, req, d.cfg.KafkaConfig.ProducerMaxRecordSizeBytes)
+		if err != nil {
+			return fmt.Errorf("failed to encode PushSpansRequest: %w", err)
+		}
+
+		metricKafkaRecordsPerRequest.Observe(float64(len(records)))
+
+		produceResults := d.kafkaProducer.ProduceSync(localCtx, records)
+
+		partitionLabel := fmt.Sprintf("partition_%d", partitionID)
+		if count, sizeBytes := successfulProduceRecordsStats(produceResults); count > 0 {
+			metricKafkaWriteLatency.Observe(time.Since(startTime).Seconds())
+			metricKafkaWriteBytesTotal.WithLabelValues(partitionLabel).Add(float64(sizeBytes))
+			_ = level.Debug(d.logger).Log("msg", "kafka write success stats", "count", count, "size_bytes", sizeBytes, "partition", partitionLabel)
+		}
+
+		var finalErr error
+		for _, result := range produceResults {
+			if result.Err != nil {
+				_ = level.Error(d.logger).Log("msg", "failed to write to kafka", "err", result.Err)
+				metricKafkaAppends.WithLabelValues(partitionLabel, "fail").Inc()
+				finalErr = result.Err
+			} else {
+				metricKafkaAppends.WithLabelValues(partitionLabel, "success").Inc()
+			}
+		}
+
+		return finalErr
+	}, ring.DoBatchOptions{})
+}
+
+func successfulProduceRecordsStats(results kgo.ProduceResults) (count, sizeBytes int) {
+	for _, res := range results {
+		if res.Err == nil && res.Record != nil {
+			count++
+			sizeBytes += len(res.Record.Value)
+		}
+	}
+
+	return count, sizeBytes
+}
+
 // requestsByTraceID takes an incoming tempodb.PushRequest and creates a set of keys for the hash ring
 // and traces to pass onto the ingesters.
-func requestsByTraceID(batches []*v1.ResourceSpans, userID string, spanCount int) ([]uint32, []*rebatchedTrace, error) {
+func requestsByTraceID(batches []*v1.ResourceSpans, userID string, spanCount, maxSpanAttrSize int) ([]uint32, []*rebatchedTrace, int, error) {
 	const tracesPerBatch = 20 // p50 of internal env
 	tracesByID := make(map[uint32]*rebatchedTrace, tracesPerBatch)
+	truncatedAttributeCount := 0
 
 	for _, b := range batches {
 		spansByILS := make(map[uint32]*v1.ScopeSpans)
+		// check resource for large attributes
+		if maxSpanAttrSize > 0 && b.Resource != nil {
+			resourceAttrTruncatedCount := processAttributes(b.Resource.Attributes, maxSpanAttrSize)
+			truncatedAttributeCount += resourceAttrTruncatedCount
+		}
 
 		for _, ils := range b.ScopeSpans {
+
+			// check instrumentation for large attributes
+			if maxSpanAttrSize > 0 && ils.Scope != nil {
+				scopeAttrTruncatedCount := processAttributes(ils.Scope.Attributes, maxSpanAttrSize)
+				truncatedAttributeCount += scopeAttrTruncatedCount
+			}
+
 			for _, span := range ils.Spans {
+				// check spans for large attributes
+				if maxSpanAttrSize > 0 {
+					spanAttrTruncatedCount := processAttributes(span.Attributes, maxSpanAttrSize)
+					truncatedAttributeCount += spanAttrTruncatedCount
+
+					// check large attributes for events and links
+					for _, event := range span.Events {
+						eventAttrTruncatedCount := processAttributes(event.Attributes, maxSpanAttrSize)
+						truncatedAttributeCount += eventAttrTruncatedCount
+					}
+
+					for _, link := range span.Links {
+						linkAttrTruncatedCount := processAttributes(link.Attributes, maxSpanAttrSize)
+						truncatedAttributeCount += linkAttrTruncatedCount
+					}
+				}
 				traceID := span.TraceId
 				if !validation.ValidTraceID(traceID) {
-					return nil, nil, status.Errorf(codes.InvalidArgument, "trace ids must be 128 bit")
+					return nil, nil, 0, status.Errorf(codes.InvalidArgument, "trace ids must be 128 bit, received %d bits", len(traceID)*8)
 				}
 
 				traceKey := tempo_util.TokenFor(userID, traceID)
@@ -479,10 +754,11 @@ func requestsByTraceID(batches []*v1.ResourceSpans, userID string, spanCount int
 					existingTrace = &rebatchedTrace{
 						id: traceID,
 						trace: &tempopb.Trace{
-							Batches: make([]*v1.ResourceSpans, 0, spanCount/tracesPerBatch),
+							ResourceSpans: make([]*v1.ResourceSpans, 0, spanCount/tracesPerBatch),
 						},
-						start: math.MaxUint32,
-						end:   0,
+						start:     math.MaxUint32,
+						end:       0,
+						spanCount: 0,
 					}
 
 					tracesByID[traceKey] = existingTrace
@@ -496,11 +772,14 @@ func requestsByTraceID(batches []*v1.ResourceSpans, userID string, spanCount int
 					existingTrace.start = start
 				}
 				if !ilsAdded {
-					existingTrace.trace.Batches = append(existingTrace.trace.Batches, &v1.ResourceSpans{
+					existingTrace.trace.ResourceSpans = append(existingTrace.trace.ResourceSpans, &v1.ResourceSpans{
 						Resource:   b.Resource,
 						ScopeSpans: []*v1.ScopeSpans{existingILS},
 					})
 				}
+
+				// increase span count for trace
+				existingTrace.spanCount = existingTrace.spanCount + 1
 			}
 		}
 	}
@@ -515,83 +794,237 @@ func requestsByTraceID(batches []*v1.ResourceSpans, userID string, spanCount int
 		traces = append(traces, r)
 	}
 
-	return keys, traces, nil
+	return keys, traces, truncatedAttributeCount, nil
 }
 
-func recordDiscaredSpans(err error, userID string, spanCount int) {
-	s := status.Convert(err)
-	if s == nil {
-		return
-	}
-	desc := s.Message()
+// find and truncate the span attributes that are too large
+func processAttributes(attributes []*v1_common.KeyValue, maxAttrSize int) int {
+	count := 0
+	for _, attr := range attributes {
+		if len(attr.Key) > maxAttrSize {
+			attr.Key = attr.Key[:maxAttrSize]
+			count++
+		}
 
-	if strings.HasPrefix(desc, overrides.ErrorPrefixLiveTracesExceeded) {
-		overrides.RecordDiscardedSpans(spanCount, reasonLiveTracesExceeded, userID)
-	} else if strings.HasPrefix(desc, overrides.ErrorPrefixTraceTooLarge) {
-		overrides.RecordDiscardedSpans(spanCount, reasonTraceTooLarge, userID)
-	} else {
-		overrides.RecordDiscardedSpans(spanCount, reasonInternalError, userID)
-	}
-}
-
-func logSpans(batches []*v1.ResourceSpans, filterByStatusError bool, logger log.Logger) {
-	for _, b := range batches {
-		for _, ils := range b.ScopeSpans {
-			for _, s := range ils.Spans {
-				if filterByStatusError && s.Status.Code != v1.Status_STATUS_CODE_ERROR {
-					continue
-				}
-				level.Info(logger).Log("msg", "received", "spanid", hex.EncodeToString(s.SpanId), "traceid", hex.EncodeToString(s.TraceId))
+		switch value := attr.GetValue().Value.(type) {
+		case *v1_common.AnyValue_StringValue:
+			if len(value.StringValue) > maxAttrSize {
+				value.StringValue = value.StringValue[:maxAttrSize]
+				count++
 			}
+		default:
+			continue
 		}
 	}
+
+	return count
 }
 
-func logSpansWithAllAttributes(batch []*v1.ResourceSpans, filterByStatusError bool, logger log.Logger) {
-	for _, b := range batch {
-		logSpansInResourceWithAllAttributes(b, filterByStatusError, logger)
+// discardedPredicate determines if a trace is discarded based on the number of successful replications.
+type discardedPredicate func(int) bool
+
+func newDiscardedPredicate(repFactor int) discardedPredicate {
+	quorum := int(math.Floor(float64(repFactor)/2)) + 1 // min success required
+	return func(numSuccess int) bool {
+		return numSuccess < quorum
 	}
 }
 
-func logSpansInResourceWithAllAttributes(rs *v1.ResourceSpans, filterByStatusError bool, logger log.Logger) {
-	for _, a := range rs.Resource.GetAttributes() {
-		logger = log.With(
-			logger,
-			"span_"+strutil.SanitizeLabelName(a.GetKey()),
-			tempo_util.StringifyAnyValue(a.GetValue()))
+func countDiscardedSpans(numSuccessByTraceIndex []int, lastErrorReasonByTraceIndex []tempopb.PushErrorReason, traces []*rebatchedTrace, repFactor int) (maxLiveDiscardedCount, traceTooLargeDiscardedCount, unknownErrorCount int) {
+	discarded := newDiscardedPredicate(repFactor)
+
+	for traceIndex, numSuccess := range numSuccessByTraceIndex {
+		if !discarded(numSuccess) {
+			continue
+		}
+		spanCount := traces[traceIndex].spanCount
+		switch lastErrorReasonByTraceIndex[traceIndex] {
+		case tempopb.PushErrorReason_MAX_LIVE_TRACES:
+			maxLiveDiscardedCount += spanCount
+		case tempopb.PushErrorReason_TRACE_TOO_LARGE:
+			traceTooLargeDiscardedCount += spanCount
+		case tempopb.PushErrorReason_UNKNOWN_ERROR:
+			unknownErrorCount += spanCount
+		}
 	}
 
-	for _, ils := range rs.ScopeSpans {
-		for _, s := range ils.Spans {
-			if filterByStatusError && s.Status.Code != v1.Status_STATUS_CODE_ERROR {
+	return maxLiveDiscardedCount, traceTooLargeDiscardedCount, unknownErrorCount
+}
+
+func (d *Distributor) processPushResponse(pushResponse *tempopb.PushResponse, numSuccessByTraceIndex []int, lastErrorReasonByTraceIndex []tempopb.PushErrorReason, numOfTraces int, indexes []int) {
+	// no errors
+	if len(pushResponse.ErrorsByTrace) == 0 {
+		for _, reqBatchIndex := range indexes {
+			if reqBatchIndex > numOfTraces {
+				level.Warn(d.logger).Log("msg", fmt.Sprintf("batch index %d out of bound for length %d", reqBatchIndex, numOfTraces))
 				continue
 			}
+			numSuccessByTraceIndex[reqBatchIndex]++
+		}
+		return
+	}
 
-			logSpanWithAllAttributes(s, logger)
+	for ringIndex, pushError := range pushResponse.ErrorsByTrace {
+		// translate index of ring batch and req batch
+		// since the request batch gets split up into smaller batches based on the indexes
+		// like [0,1] [1] [2] [0,2]
+		reqBatchIndex := indexes[ringIndex]
+		if reqBatchIndex > numOfTraces {
+			level.Warn(d.logger).Log("msg", fmt.Sprintf("batch index %d out of bound for length %d", reqBatchIndex, numOfTraces))
+			continue
+		}
+
+		// if no error, record number of success
+		if pushError == tempopb.PushErrorReason_NO_ERROR {
+			numSuccessByTraceIndex[reqBatchIndex]++
+			continue
+		}
+		// else record last error
+		lastErrorReasonByTraceIndex[reqBatchIndex] = pushError
+	}
+}
+
+func metricSpans(batches []*v1.ResourceSpans, tenantID string, cfg *MetricReceivedSpansConfig) {
+	for _, b := range batches {
+		serviceName := ""
+		if b.Resource != nil {
+			for _, a := range b.Resource.GetAttributes() {
+				if a.GetKey() == "service.name" {
+					serviceName = a.Value.GetStringValue()
+					break
+				}
+			}
+		}
+
+		for _, ils := range b.ScopeSpans {
+			for _, s := range ils.Spans {
+				if cfg.RootOnly && len(s.ParentSpanId) != 0 {
+					continue
+				}
+
+				metricDebugSpansIngested.WithLabelValues(tenantID, s.Name, serviceName).Inc()
+			}
 		}
 	}
 }
 
-func logSpanWithAllAttributes(s *v1.Span, logger log.Logger) {
-	for _, a := range s.GetAttributes() {
+func recordDiscardedSpans(numSuccessByTraceIndex []int, lastErrorReasonByTraceIndex []tempopb.PushErrorReason, traces []*rebatchedTrace, writeRing ring.ReadRing, userID string) {
+	maxLiveDiscardedCount, traceTooLargeDiscardedCount, unknownErrorCount := countDiscardedSpans(numSuccessByTraceIndex, lastErrorReasonByTraceIndex, traces, writeRing.ReplicationFactor())
+	overrides.RecordDiscardedSpans(maxLiveDiscardedCount, reasonLiveTracesExceeded, userID)
+	overrides.RecordDiscardedSpans(traceTooLargeDiscardedCount, reasonTraceTooLarge, userID)
+	overrides.RecordDiscardedSpans(unknownErrorCount, reasonUnknown, userID)
+}
+
+func logDiscardedSpans(numSuccessByTraceIndex []int, lastErrorReasonByTraceIndex []tempopb.PushErrorReason, traces []*rebatchedTrace, writeRing ring.ReadRing, userID string, cfg *LogSpansConfig, logger log.Logger) {
+	if !cfg.Enabled {
+		return
+	}
+	discarded := newDiscardedPredicate(writeRing.ReplicationFactor())
+	for traceIndex, numSuccess := range numSuccessByTraceIndex {
+		if !discarded(numSuccess) {
+			continue
+		}
+		errorReason := lastErrorReasonByTraceIndex[traceIndex]
+		if errorReason != tempopb.PushErrorReason_NO_ERROR {
+			loggerWithAtts := logger
+			loggerWithAtts = log.With(
+				loggerWithAtts,
+				"push_error_reason", fmt.Sprintf("%v", errorReason),
+			)
+			logDiscardedResourceSpans(traces[traceIndex].trace.ResourceSpans, userID, cfg, loggerWithAtts)
+		}
+	}
+}
+
+func logDiscardedRebatchedSpans(batches []*rebatchedTrace, userID string, cfg *LogSpansConfig, logger log.Logger) {
+	if !cfg.Enabled {
+		return
+	}
+	for _, b := range batches {
+		logDiscardedResourceSpans(b.trace.ResourceSpans, userID, cfg, logger)
+	}
+}
+
+func logDiscardedResourceSpans(batches []*v1.ResourceSpans, userID string, cfg *LogSpansConfig, logger log.Logger) {
+	if !cfg.Enabled {
+		return
+	}
+	loggerWithAtts := logger
+	loggerWithAtts = log.With(
+		loggerWithAtts,
+		"msg", "discarded",
+		"tenant", userID,
+	)
+	logSpans(batches, cfg, loggerWithAtts)
+}
+
+func logReceivedSpans(batches []*v1.ResourceSpans, cfg *LogSpansConfig, logger log.Logger) {
+	if !cfg.Enabled {
+		return
+	}
+	loggerWithAtts := logger
+	loggerWithAtts = log.With(
+		loggerWithAtts,
+		"msg", "received",
+	)
+	logSpans(batches, cfg, loggerWithAtts)
+}
+
+func logSpans(batches []*v1.ResourceSpans, cfg *LogSpansConfig, logger log.Logger) {
+	for _, b := range batches {
+		loggerWithAtts := logger
+
+		if cfg.IncludeAllAttributes {
+			for _, a := range b.Resource.GetAttributes() {
+				loggerWithAtts = log.With(
+					loggerWithAtts,
+					"span_"+strutil.SanitizeLabelName(a.GetKey()),
+					tempo_util.StringifyAnyValue(a.GetValue()))
+			}
+		}
+
+		for _, ils := range b.ScopeSpans {
+			for _, s := range ils.Spans {
+				if cfg.FilterByStatusError && s.Status.Code != v1.Status_STATUS_CODE_ERROR {
+					continue
+				}
+
+				logSpan(s, cfg.IncludeAllAttributes, loggerWithAtts)
+			}
+		}
+	}
+}
+
+func logSpan(s *v1.Span, allAttributes bool, logger log.Logger) {
+	if allAttributes {
+		for _, a := range s.GetAttributes() {
+			logger = log.With(
+				logger,
+				"span_"+strutil.SanitizeLabelName(a.GetKey()),
+				tempo_util.StringifyAnyValue(a.GetValue()))
+		}
+
+		latencySeconds := float64(s.GetEndTimeUnixNano()-s.GetStartTimeUnixNano()) / float64(time.Second.Nanoseconds())
 		logger = log.With(
 			logger,
-			"span_"+strutil.SanitizeLabelName(a.GetKey()),
-			tempo_util.StringifyAnyValue(a.GetValue()))
+			"span_name", s.Name,
+			"span_duration_seconds", latencySeconds,
+			"span_kind", s.GetKind().String(),
+			"span_status", s.GetStatus().GetCode().String())
 	}
 
-	latencySeconds := float64(s.GetEndTimeUnixNano()-s.GetStartTimeUnixNano()) / float64(time.Second.Nanoseconds())
-	logger = log.With(
-		logger,
-		"span_name", s.Name,
-		"span_duration_seconds", latencySeconds,
-		"span_kind", s.GetKind().String(),
-		"span_status", s.GetStatus().GetCode().String())
-
-	level.Info(logger).Log("msg", "received", "spanid", hex.EncodeToString(s.SpanId), "traceid", hex.EncodeToString(s.TraceId))
+	level.Info(logger).Log("spanid", hex.EncodeToString(s.SpanId), "traceid", hex.EncodeToString(s.TraceId))
 }
 
 // startEndFromSpan returns a unix epoch timestamp in seconds for the start and end of a span
 func startEndFromSpan(span *v1.Span) (uint32, uint32) {
 	return uint32(span.StartTimeUnixNano / uint64(time.Second)), uint32(span.EndTimeUnixNano / uint64(time.Second))
+}
+
+func (d *Distributor) getMaxAttributeBytes(userID string) int {
+	if tenantMaxAttrByte := d.overrides.IngestionMaxAttributeBytes(userID); tenantMaxAttrByte > 0 {
+		return tenantMaxAttrByte
+	}
+
+	return d.cfg.MaxAttributeBytes
 }

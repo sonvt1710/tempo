@@ -26,7 +26,7 @@ import (
 	"net/url"
 	"time"
 
-	jsoniter "github.com/json-iterator/go"
+	"github.com/goccy/go-json"
 	"github.com/minio/minio-go/v7/pkg/notification"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 )
@@ -103,7 +103,6 @@ func (c *Client) getBucketNotification(ctx context.Context, bucketName string) (
 		return notification.Configuration{}, err
 	}
 	return processBucketNotificationResponse(bucketName, resp)
-
 }
 
 // processes the GetNotification http response from the server.
@@ -167,6 +166,7 @@ func (c *Client) ListenBucketNotification(ctx context.Context, bucketName, prefi
 
 		// Prepare urlValues to pass into the request on every loop
 		urlValues := make(url.Values)
+		urlValues.Set("ping", "10")
 		urlValues.Set("prefix", prefix)
 		urlValues.Set("suffix", suffix)
 		urlValues["events"] = events
@@ -207,7 +207,6 @@ func (c *Client) ListenBucketNotification(ctx context.Context, bucketName, prefi
 			// Use a higher buffer to support unexpected
 			// caching done by proxies
 			bio.Buffer(notificationEventBuffer, notificationCapacity)
-			var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 			// Unmarshal each line, returns marshaled values.
 			for bio.Scan() {
@@ -225,6 +224,12 @@ func (c *Client) ListenBucketNotification(ctx context.Context, bucketName, prefi
 					closeResponse(resp)
 					continue
 				}
+
+				// Empty events pinged from the server
+				if len(notificationInfo.Records) == 0 && notificationInfo.Err == nil {
+					continue
+				}
+
 				// Send notificationInfo
 				select {
 				case notificationInfoCh <- notificationInfo:

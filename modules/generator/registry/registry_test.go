@@ -2,16 +2,20 @@ package registry
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"os"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/grafana/tempo/modules/overrides"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestManagedRegistry_concurrency(t *testing.T) {
+func TestManagedRegistry_concurrency(*testing.T) {
 	cfg := &Config{
 		StaleDuration: 1 * time.Millisecond,
 	}
@@ -32,17 +36,17 @@ func TestManagedRegistry_concurrency(t *testing.T) {
 	}
 
 	// this goroutine constantly creates new counters
-	var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	letters := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 	go accessor(func() {
 		s := make([]rune, 6)
 		for i := range s {
 			s[i] = letters[rand.Intn(len(letters))]
 		}
-		registry.NewCounter(string(s), nil)
+		registry.NewCounter(string(s))
 	})
 
 	go accessor(func() {
-		registry.collectMetrics(context.Background())
+		registry.CollectMetrics(context.Background())
 	})
 
 	go accessor(func() {
@@ -59,9 +63,9 @@ func TestManagedRegistry_counter(t *testing.T) {
 	registry := New(&Config{}, &mockOverrides{}, "test", appender, log.NewNopLogger())
 	defer registry.Close()
 
-	counter := registry.NewCounter("my_counter", []string{"label"})
+	counter := registry.NewCounter("my_counter")
 
-	counter.Inc(newLabelValues([]string{"value-1"}), 1.0)
+	counter.Inc(newLabelValueCombo([]string{"label"}, []string{"value-1"}), 1.0)
 
 	expectedSamples := []sample{
 		newSample(map[string]string{"__name__": "my_counter", "label": "value-1", "__metrics_gen_instance": mustGetHostname()}, 0, 0.0),
@@ -76,16 +80,20 @@ func TestManagedRegistry_histogram(t *testing.T) {
 	registry := New(&Config{}, &mockOverrides{}, "test", appender, log.NewNopLogger())
 	defer registry.Close()
 
-	histogram := registry.NewHistogram("histogram", []string{"label"}, []float64{1.0, 2.0})
+	histogram := registry.NewHistogram("histogram", []float64{1.0, 2.0}, HistogramModeClassic)
 
-	histogram.ObserveWithExemplar(newLabelValues([]string{"value-1"}), 1.0, "", 1.0)
+	histogram.ObserveWithExemplar(newLabelValueCombo([]string{"label"}, []string{"value-1"}), 1.0, "", 1.0)
 
 	expectedSamples := []sample{
-		newSample(map[string]string{"__name__": "histogram_count", "label": "value-1", "__metrics_gen_instance": mustGetHostname()}, 0, 1.0),
-		newSample(map[string]string{"__name__": "histogram_sum", "label": "value-1", "__metrics_gen_instance": mustGetHostname()}, 0, 1.0),
-		newSample(map[string]string{"__name__": "histogram_bucket", "label": "value-1", "__metrics_gen_instance": mustGetHostname(), "le": "1"}, 0, 1.0),
-		newSample(map[string]string{"__name__": "histogram_bucket", "label": "value-1", "__metrics_gen_instance": mustGetHostname(), "le": "2"}, 0, 1.0),
-		newSample(map[string]string{"__name__": "histogram_bucket", "label": "value-1", "__metrics_gen_instance": mustGetHostname(), "le": "+Inf"}, 0, 1.0),
+		newSample(map[string]string{"__name__": "histogram_count", "label": "value-1", "__metrics_gen_instance": mustGetHostname()}, 0, 0),
+		newSample(map[string]string{"__name__": "histogram_count", "label": "value-1", "__metrics_gen_instance": mustGetHostname()}, 1, 1.0),
+		newSample(map[string]string{"__name__": "histogram_sum", "label": "value-1", "__metrics_gen_instance": mustGetHostname()}, 1, 1.0),
+		newSample(map[string]string{"__name__": "histogram_bucket", "label": "value-1", "__metrics_gen_instance": mustGetHostname(), "le": "1"}, 0, 0),
+		newSample(map[string]string{"__name__": "histogram_bucket", "label": "value-1", "__metrics_gen_instance": mustGetHostname(), "le": "1"}, 1, 1.0),
+		newSample(map[string]string{"__name__": "histogram_bucket", "label": "value-1", "__metrics_gen_instance": mustGetHostname(), "le": "2"}, 0, 0),
+		newSample(map[string]string{"__name__": "histogram_bucket", "label": "value-1", "__metrics_gen_instance": mustGetHostname(), "le": "2"}, 1, 1.0),
+		newSample(map[string]string{"__name__": "histogram_bucket", "label": "value-1", "__metrics_gen_instance": mustGetHostname(), "le": "+Inf"}, 0, 0),
+		newSample(map[string]string{"__name__": "histogram_bucket", "label": "value-1", "__metrics_gen_instance": mustGetHostname(), "le": "+Inf"}, 1, 1.0),
 	}
 	collectRegistryMetricsAndAssert(t, registry, appender, expectedSamples)
 }
@@ -99,8 +107,8 @@ func TestManagedRegistry_removeStaleSeries(t *testing.T) {
 	registry := New(cfg, &mockOverrides{}, "test", appender, log.NewNopLogger())
 	defer registry.Close()
 
-	counter1 := registry.NewCounter("metric_1", nil)
-	counter2 := registry.NewCounter("metric_2", nil)
+	counter1 := registry.NewCounter("metric_1")
+	counter2 := registry.NewCounter("metric_2")
 
 	counter1.Inc(nil, 1)
 	counter2.Inc(nil, 2)
@@ -134,18 +142,37 @@ func TestManagedRegistry_externalLabels(t *testing.T) {
 
 	cfg := &Config{
 		ExternalLabels: map[string]string{
-			"foo": "bar",
+			"__foo": "bar",
 		},
 	}
 	registry := New(cfg, &mockOverrides{}, "test", appender, log.NewNopLogger())
 	defer registry.Close()
 
-	counter := registry.NewCounter("my_counter", nil)
+	counter := registry.NewCounter("my_counter")
 	counter.Inc(nil, 1.0)
 
 	expectedSamples := []sample{
-		newSample(map[string]string{"__name__": "my_counter", "__metrics_gen_instance": mustGetHostname(), "foo": "bar"}, 0, 0),
-		newSample(map[string]string{"__name__": "my_counter", "__metrics_gen_instance": mustGetHostname(), "foo": "bar"}, 0, 1),
+		newSample(map[string]string{"__name__": "my_counter", "__metrics_gen_instance": mustGetHostname(), "__foo": "bar"}, 0, 0),
+		newSample(map[string]string{"__name__": "my_counter", "__metrics_gen_instance": mustGetHostname(), "__foo": "bar"}, 0, 1),
+	}
+	collectRegistryMetricsAndAssert(t, registry, appender, expectedSamples)
+}
+
+func TestManagedRegistry_injectTenantIDAs(t *testing.T) {
+	appender := &capturingAppender{}
+
+	cfg := &Config{
+		InjectTenantIDAs: "__tempo_tenant",
+	}
+	registry := New(cfg, &mockOverrides{}, "test", appender, log.NewNopLogger())
+	defer registry.Close()
+
+	counter := registry.NewCounter("my_counter")
+	counter.Inc(nil, 1.0)
+
+	expectedSamples := []sample{
+		newSample(map[string]string{"__name__": "my_counter", "__metrics_gen_instance": mustGetHostname(), "__tempo_tenant": "test"}, 0, 0),
+		newSample(map[string]string{"__name__": "my_counter", "__metrics_gen_instance": mustGetHostname(), "__tempo_tenant": "test"}, 0, 1),
 	}
 	collectRegistryMetricsAndAssert(t, registry, appender, expectedSamples)
 }
@@ -159,12 +186,12 @@ func TestManagedRegistry_maxSeries(t *testing.T) {
 	registry := New(&Config{}, overrides, "test", appender, log.NewNopLogger())
 	defer registry.Close()
 
-	counter1 := registry.NewCounter("metric_1", []string{"label"})
-	counter2 := registry.NewCounter("metric_2", nil)
+	counter1 := registry.NewCounter("metric_1")
+	counter2 := registry.NewCounter("metric_2")
 
-	counter1.Inc(newLabelValues([]string{"value-1"}), 1.0)
+	counter1.Inc(newLabelValueCombo([]string{"label"}, []string{"value-1"}), 1.0)
 	// these series should be discarded
-	counter1.Inc(newLabelValues([]string{"value-2"}), 1.0)
+	counter1.Inc(newLabelValueCombo(nil, []string{"value-2"}), 1.0)
 	counter2.Inc(nil, 1.0)
 
 	assert.Equal(t, uint32(1), registry.activeSeries.Load())
@@ -184,13 +211,13 @@ func TestManagedRegistry_disableCollection(t *testing.T) {
 	registry := New(&Config{}, overrides, "test", appender, log.NewNopLogger())
 	defer registry.Close()
 
-	counter := registry.NewCounter("metric_1", nil)
+	counter := registry.NewCounter("metric_1")
 	counter.Inc(nil, 1.0)
 
 	// active series are still tracked
 	assert.Equal(t, uint32(1), registry.activeSeries.Load())
 	// but no samples are collected and sent out
-	registry.collectMetrics(context.Background())
+	registry.CollectMetrics(context.Background())
 	assert.Empty(t, appender.samples)
 	assert.Empty(t, appender.exemplars)
 }
@@ -205,26 +232,76 @@ func TestManagedRegistry_maxLabelNameLength(t *testing.T) {
 	registry := New(cfg, &mockOverrides{}, "test", appender, log.NewNopLogger())
 	defer registry.Close()
 
-	counter := registry.NewCounter("counter", []string{"very_lengthy_label"})
-	histogram := registry.NewHistogram("histogram", []string{"another_very_lengthy_label"}, []float64{1.0})
+	counter := registry.NewCounter("counter")
+	histogram := registry.NewHistogram("histogram", []float64{1.0}, HistogramModeClassic)
 
-	counter.Inc(registry.NewLabelValues([]string{"very_length_value"}), 1.0)
-	histogram.ObserveWithExemplar(registry.NewLabelValues([]string{"another_very_lengthy_value"}), 1.0, "", 1.0)
+	counter.Inc(registry.NewLabelValueCombo([]string{"very_lengthy_label"}, []string{"very_length_value"}), 1.0)
+	histogram.ObserveWithExemplar(registry.NewLabelValueCombo([]string{"another_very_lengthy_label"}, []string{"another_very_lengthy_value"}), 1.0, "", 1.0)
 
 	expectedSamples := []sample{
 		newSample(map[string]string{"__name__": "counter", "very_len": "very_", "__metrics_gen_instance": mustGetHostname()}, 0, 0.0),
-		newSample(map[string]string{"__name__": "counter", "very_len": "very_", "__metrics_gen_instance": mustGetHostname()}, 0, 1.0),
-		newSample(map[string]string{"__name__": "histogram_count", "another_": "anoth", "__metrics_gen_instance": mustGetHostname()}, 0, 1.0),
-		newSample(map[string]string{"__name__": "histogram_sum", "another_": "anoth", "__metrics_gen_instance": mustGetHostname()}, 0, 1.0),
-		newSample(map[string]string{"__name__": "histogram_bucket", "another_": "anoth", "__metrics_gen_instance": mustGetHostname(), "le": "1"}, 0, 1.0),
-		newSample(map[string]string{"__name__": "histogram_bucket", "another_": "anoth", "__metrics_gen_instance": mustGetHostname(), "le": "+Inf"}, 0, 1.0),
+		newSample(map[string]string{"__name__": "counter", "very_len": "very_", "__metrics_gen_instance": mustGetHostname()}, 1, 1.0),
+		newSample(map[string]string{"__name__": "histogram_count", "another_": "anoth", "__metrics_gen_instance": mustGetHostname()}, 0, 0),
+		newSample(map[string]string{"__name__": "histogram_count", "another_": "anoth", "__metrics_gen_instance": mustGetHostname()}, 1, 1.0),
+		newSample(map[string]string{"__name__": "histogram_sum", "another_": "anoth", "__metrics_gen_instance": mustGetHostname()}, 1, 1.0),
+		newSample(map[string]string{"__name__": "histogram_bucket", "another_": "anoth", "__metrics_gen_instance": mustGetHostname(), "le": "1"}, 0, 0),
+		newSample(map[string]string{"__name__": "histogram_bucket", "another_": "anoth", "__metrics_gen_instance": mustGetHostname(), "le": "1"}, 1, 1.0),
+		newSample(map[string]string{"__name__": "histogram_bucket", "another_": "anoth", "__metrics_gen_instance": mustGetHostname(), "le": "+Inf"}, 0, 0),
+		newSample(map[string]string{"__name__": "histogram_bucket", "another_": "anoth", "__metrics_gen_instance": mustGetHostname(), "le": "+Inf"}, 1, 1.0),
 	}
 	collectRegistryMetricsAndAssert(t, registry, appender, expectedSamples)
 }
 
+func TestValidLabelValueCombo(t *testing.T) {
+	appender := &capturingAppender{}
+
+	registry := New(&Config{}, &mockOverrides{}, "test", appender, log.NewNopLogger())
+	defer registry.Close()
+
+	assert.Panics(t, func() {
+		registry.NewLabelValueCombo([]string{"one-label"}, []string{"one-value", "two-value"})
+	})
+}
+
+func TestHistogramOverridesConfig(t *testing.T) {
+	cases := []struct {
+		name                string
+		nativeHistogramMode HistogramMode
+		typeOfHistogram     interface{}
+	}{
+		{
+			"classic",
+			HistogramModeClassic,
+			&histogram{},
+		},
+		{
+			"native",
+			HistogramModeNative,
+			&nativeHistogram{},
+		},
+		{
+			"both",
+			HistogramModeBoth,
+			&nativeHistogram{},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			appender := &capturingAppender{}
+			overrides := &mockOverrides{}
+			registry := New(&Config{}, overrides, "test", appender, log.NewNopLogger())
+			defer registry.Close()
+
+			tt := registry.NewHistogram("histogram", []float64{1.0, 2.0}, c.nativeHistogramMode)
+			require.IsType(t, c.typeOfHistogram, tt)
+		})
+	}
+}
+
 func collectRegistryMetricsAndAssert(t *testing.T, r *ManagedRegistry, appender *capturingAppender, expectedSamples []sample) {
 	collectionTimeMs := time.Now().UnixMilli()
-	r.collectMetrics(context.Background())
+	r.CollectMetrics(context.Background())
 
 	// Ignore the collection time on expected samples, since we won't know when the collection will actually take place.
 	for i := range expectedSamples {
@@ -238,26 +315,58 @@ func collectRegistryMetricsAndAssert(t *testing.T, r *ManagedRegistry, appender 
 
 	assert.Equal(t, true, appender.isCommitted)
 	assert.Equal(t, false, appender.isRolledback)
-	assert.ElementsMatch(t, expectedSamples, appender.samples)
+
+	actualSamples := appender.samples
+	require.Equal(t, len(expectedSamples), len(actualSamples))
+
+	// Ensure that both slices are ordered consistently.
+	for _, slice := range [][]sample{expectedSamples, actualSamples} {
+		sort.Slice(slice, func(i, j int) bool {
+			this := slice[i]
+			next := slice[j]
+
+			// The actual order doesn't matter, the only thing that matters is that it is consistent.
+			return this.String() < next.String()
+		})
+	}
+
+	for i, expected := range expectedSamples {
+		actual := actualSamples[i]
+
+		assert.Equal(t, expected.t, actual.t)
+		assert.Equal(t, expected.v, actual.v)
+		// Rely on the fact that Go prints map keys in sorted order.
+		// See https://tip.golang.org/doc/go1.12#fmt.
+		assert.Equal(t, fmt.Sprint(expected.l.Map()), fmt.Sprint(actual.l.Map()))
+	}
 }
 
 type mockOverrides struct {
-	maxActiveSeries   uint32
-	disableCollection bool
+	maxActiveSeries          uint32
+	disableCollection        bool
+	generateNativeHistograms overrides.HistogramMethod
 }
 
 var _ Overrides = (*mockOverrides)(nil)
 
-func (m *mockOverrides) MetricsGeneratorMaxActiveSeries(userID string) uint32 {
+func (m *mockOverrides) MetricsGeneratorMaxActiveSeries(string) uint32 {
 	return m.maxActiveSeries
 }
 
-func (m *mockOverrides) MetricsGeneratorCollectionInterval(userID string) time.Duration {
+func (m *mockOverrides) MetricsGeneratorCollectionInterval(string) time.Duration {
 	return 15 * time.Second
 }
 
-func (m *mockOverrides) MetricsGeneratorDisableCollection(userID string) bool {
+func (m *mockOverrides) MetricsGeneratorDisableCollection(string) bool {
 	return m.disableCollection
+}
+
+func (m *mockOverrides) MetricsGeneratorGenerateNativeHistograms(_ string) overrides.HistogramMethod {
+	return m.generateNativeHistograms
+}
+
+func (m *mockOverrides) MetricsGenerationTraceIDLabelName(string) string {
+	return ""
 }
 
 func mustGetHostname() string {

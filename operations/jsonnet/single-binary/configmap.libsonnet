@@ -30,7 +30,7 @@
           path: '/var/tempo/wal',
         },
         'local': {
-          path: '/tmp/tempo/traces',
+          path: '/var/tempo/traces',
         },
       },
     },
@@ -52,7 +52,7 @@
       |||,
     }),
 
-  tempo_query_configmap:
+  tempo_query_configmap: if $._config.tempo_query.enabled then
     configMap.new('tempo-query') +
     configMap.withData({
       'tempo-query.yaml': k.util.manifestYaml({

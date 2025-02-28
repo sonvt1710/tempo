@@ -6,10 +6,10 @@ import (
 	"math/rand"
 	"time"
 
-	jaeger_grpc "github.com/jaegertracing/jaeger/cmd/agent/app/reporter/grpc"
+	"github.com/grafana/dskit/user"
 	thrift "github.com/jaegertracing/jaeger/thrift-gen/jaeger"
+	zipkincore "github.com/jaegertracing/jaeger/thrift-gen/zipkincore"
 	jaegerTrans "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/jaeger"
-	"github.com/weaveworks/common/user"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/grafana/tempo/pkg/tempopb"
@@ -37,6 +37,12 @@ type TraceInfo struct {
 	tempoOrgID          string
 }
 
+// JaegerClient is an interface used to mock the underlying client in tests.
+type JaegerClient interface {
+	EmitBatch(ctx context.Context, b *thrift.Batch) error
+	EmitZipkinBatch(ctx context.Context, zSpans []*zipkincore.Span) error
+}
+
 // NewTraceInfo is used to produce a new TraceInfo.
 func NewTraceInfo(timestamp time.Time, tempoOrgID string) *TraceInfo {
 	r := newRand(timestamp)
@@ -51,15 +57,27 @@ func NewTraceInfo(timestamp time.Time, tempoOrgID string) *TraceInfo {
 	}
 }
 
-func (t *TraceInfo) Ready(now time.Time, writeBackoff, longWriteBackoff time.Duration) bool {
+func NewTraceInfoWithMaxLongWrites(timestamp time.Time, maxLongWrites int64, tempoOrgID string) *TraceInfo {
+	r := newRand(timestamp)
 
+	return &TraceInfo{
+		timestamp:           timestamp,
+		r:                   r,
+		traceIDHigh:         r.Int63(),
+		traceIDLow:          r.Int63(),
+		longWritesRemaining: maxLongWrites,
+		tempoOrgID:          tempoOrgID,
+	}
+}
+
+func (t *TraceInfo) Ready(now time.Time, writeBackoff, longWriteBackoff time.Duration) bool {
 	// Don't use the last time interval to allow the write loop to finish before
 	// we try to read it.
 	if t.timestamp.After(now.Add(-writeBackoff)) {
 		return false
 	}
 
-	// Compare a new instance with the same timstamp to know how many longWritesRemaining.
+	// Compare a new instance with the same timestamp to know how many longWritesRemaining.
 	totalWrites := NewTraceInfo(t.timestamp, t.tempoOrgID).longWritesRemaining
 	// We are not ready if not all writes have had a chance to send.
 	lastWrite := t.timestamp.Add(time.Duration(totalWrites) * longWriteBackoff)
@@ -86,7 +104,7 @@ func (t *TraceInfo) Done() {
 	t.longWritesRemaining--
 }
 
-func (t *TraceInfo) EmitBatches(c *jaeger_grpc.Reporter) error {
+func (t *TraceInfo) EmitBatches(c JaegerClient) error {
 	for i := int64(0); i < t.generateRandomInt(1, maxBatchesPerWrite); i++ {
 		ctx := user.InjectOrgID(context.Background(), t.tempoOrgID)
 		ctx, err := user.InjectIntoGRPCRequest(ctx)
@@ -105,7 +123,7 @@ func (t *TraceInfo) EmitBatches(c *jaeger_grpc.Reporter) error {
 
 // EmitAllBatches sends all the batches that would normally be sent at some
 // interval when using EmitBatches.
-func (t *TraceInfo) EmitAllBatches(c *jaeger_grpc.Reporter) error {
+func (t *TraceInfo) EmitAllBatches(c JaegerClient) error {
 	err := t.EmitBatches(c)
 	if err != nil {
 		return err
@@ -123,13 +141,13 @@ func (t *TraceInfo) EmitAllBatches(c *jaeger_grpc.Reporter) error {
 	return nil
 }
 
-func (t *TraceInfo) generateRandomInt(min int64, max int64) int64 {
+func (t *TraceInfo) generateRandomInt(min, max int64) int64 {
 	min++
 	number := min + t.r.Int63n(max-min)
 	return number
 }
 
-func (t *TraceInfo) makeThriftBatch(TraceIDHigh int64, TraceIDLow int64) *thrift.Batch {
+func (t *TraceInfo) makeThriftBatch(TraceIDHigh, TraceIDLow int64) *thrift.Batch {
 	var spans []*thrift.Span
 	count := t.generateRandomInt(1, 5)
 	for i := int64(0); i < count; i++ {
@@ -150,13 +168,14 @@ func (t *TraceInfo) makeThriftBatch(TraceIDHigh int64, TraceIDLow int64) *thrift
 
 	process := &thrift.Process{
 		ServiceName: "tempo-vulture",
+		Tags:        t.generateRandomTagsWithPrefix("vulture-process"),
 	}
 
 	return &thrift.Batch{Process: process, Spans: spans}
 }
 
 func (t *TraceInfo) generateRandomString() string {
-	var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	letters := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 	s := make([]rune, t.generateRandomInt(5, 20))
 	for i := range s {
@@ -166,12 +185,16 @@ func (t *TraceInfo) generateRandomString() string {
 }
 
 func (t *TraceInfo) generateRandomTags() []*thrift.Tag {
+	return t.generateRandomTagsWithPrefix("vulture")
+}
+
+func (t *TraceInfo) generateRandomTagsWithPrefix(prefix string) []*thrift.Tag {
 	var tags []*thrift.Tag
 	count := t.generateRandomInt(1, 5)
 	for i := int64(0); i < count; i++ {
 		value := t.generateRandomString()
 		tags = append(tags, &thrift.Tag{
-			Key:  fmt.Sprintf("vulture-%d", i),
+			Key:  fmt.Sprintf("%s-%d", prefix, i),
 			VStr: &value,
 		})
 	}
@@ -219,7 +242,7 @@ func (t *TraceInfo) ConstructTraceFromEpoch() (*tempopb.Trace, error) {
 			// get the parentSpanID to match.  In the case of an empty []byte in place
 			// for the ParentSpanId, we set to nil here to ensure that the final result
 			// matches the json.Unmarshal value when tempo is queried.
-			for _, b := range t.Batches {
+			for _, b := range t.ResourceSpans {
 				for _, l := range b.ScopeSpans {
 					for _, s := range l.Spans {
 						if len(s.GetParentSpanId()) == 0 {
@@ -229,7 +252,7 @@ func (t *TraceInfo) ConstructTraceFromEpoch() (*tempopb.Trace, error) {
 				}
 			}
 
-			trace.Batches = append(trace.Batches, t.Batches...)
+			trace.ResourceSpans = append(trace.ResourceSpans, t.ResourceSpans...)
 		}
 
 		return nil
@@ -254,27 +277,41 @@ func (t *TraceInfo) ConstructTraceFromEpoch() (*tempopb.Trace, error) {
 func RandomAttrFromTrace(t *tempopb.Trace) *v1common.KeyValue {
 	r := newRand(time.Now())
 
-	if len(t.Batches) == 0 {
+	if len(t.ResourceSpans) == 0 {
 		return nil
 	}
-	iBatch := r.Intn(len(t.Batches))
+	batch := randFrom(r, t.ResourceSpans)
 
-	if len(t.Batches[iBatch].ScopeSpans) == 0 {
+	// maybe choose resource attribute
+	res := batch.Resource
+	if len(res.Attributes) > 0 && r.Int()%2 == 1 {
+		attr := randFrom(r, res.Attributes)
+		// skip service.name because service names have low cardinality and produce queries with
+		// too many results in tempo-vulture
+		if attr.Key != "service.name" {
+			return attr
+		}
+	}
+
+	if len(batch.ScopeSpans) == 0 {
 		return nil
 	}
-	iSpans := r.Intn(len(t.Batches[iBatch].ScopeSpans))
+	ss := randFrom(r, batch.ScopeSpans)
 
-	if len(t.Batches[iBatch].ScopeSpans[iSpans].Spans) == 0 {
+	if len(ss.Spans) == 0 {
 		return nil
 	}
-	iSpan := r.Intn(len(t.Batches[iBatch].ScopeSpans[iSpans].Spans))
+	span := randFrom(r, ss.Spans)
 
-	if len(t.Batches[iBatch].ScopeSpans[iSpans].Spans[iSpan].Attributes) == 0 {
+	if len(span.Attributes) == 0 {
 		return nil
 	}
-	iAttr := r.Intn(len(t.Batches[iBatch].ScopeSpans[iSpans].Spans[iSpan].Attributes))
 
-	return t.Batches[iBatch].ScopeSpans[iSpans].Spans[iSpan].Attributes[iAttr]
+	return randFrom(r, span.Attributes)
+}
+
+func randFrom[T any](r *rand.Rand, s []T) T {
+	return s[r.Intn(len(s))]
 }
 
 func newRand(t time.Time) *rand.Rand {

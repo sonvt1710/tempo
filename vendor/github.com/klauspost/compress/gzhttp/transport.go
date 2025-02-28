@@ -14,7 +14,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// Transport will wrap a transport with a custom handler
+// Transport will wrap an HTTP transport with a custom handler
 // that will request gzip and automatically decompress it.
 // Using this is significantly faster than using the default transport.
 func Transport(parent http.RoundTripper, opts ...transportOption) http.RoundTripper {
@@ -51,10 +51,32 @@ func TransportEnableGzip(b bool) transportOption {
 	}
 }
 
+// TransportCustomEval will send the header of a response to a custom function.
+// If the function returns false, the response will be returned as-is,
+// Otherwise it will be decompressed based on Content-Encoding field, regardless
+// of whether the transport added the encoding.
+func TransportCustomEval(fn func(header http.Header) bool) transportOption {
+	return func(c *gzRoundtripper) {
+		c.customEval = fn
+	}
+}
+
+// TransportAlwaysDecompress will always decompress the response,
+// regardless of whether we requested it or not.
+// Default is false, which will pass compressed data through
+// if we did not request compression.
+func TransportAlwaysDecompress(enabled bool) transportOption {
+	return func(c *gzRoundtripper) {
+		c.alwaysDecomp = enabled
+	}
+}
+
 type gzRoundtripper struct {
 	parent             http.RoundTripper
 	acceptEncoding     string
 	withZstd, withGzip bool
+	alwaysDecomp       bool
+	customEval         func(header http.Header) bool
 }
 
 func (g *gzRoundtripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -79,19 +101,29 @@ func (g *gzRoundtripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	resp, err := g.parent.RoundTrip(req)
-	if err != nil || !requestedComp {
+	if err != nil {
 		return resp, err
 	}
-
+	decompress := g.alwaysDecomp
+	if g.customEval != nil {
+		if !g.customEval(resp.Header) {
+			return resp, nil
+		}
+		decompress = true
+	} else {
+		if !requestedComp && !g.alwaysDecomp {
+			return resp, nil
+		}
+	}
 	// Decompress
-	if g.withGzip && asciiEqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+	if (decompress || g.withGzip) && asciiEqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
 		resp.Body = &gzipReader{body: resp.Body}
 		resp.Header.Del("Content-Encoding")
 		resp.Header.Del("Content-Length")
 		resp.ContentLength = -1
 		resp.Uncompressed = true
 	}
-	if g.withZstd && asciiEqualFold(resp.Header.Get("Content-Encoding"), "zstd") {
+	if (decompress || g.withZstd) && asciiEqualFold(resp.Header.Get("Content-Encoding"), "zstd") {
 		resp.Body = &zstdReader{body: resp.Body}
 		resp.Header.Del("Content-Encoding")
 		resp.Header.Del("Content-Length")

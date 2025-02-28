@@ -1,19 +1,9 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-// Package service handles the command-line, configuration, and runs the
-// OpenTelemetry Collector.
+// Package otelcol handles the command-line, configuration, and runs the OpenTelemetry Collector.
+// It contains the main [Collector] struct and its constructor [NewCollector].
+// [Collector.Run] starts the Collector and then blocks until it shuts down.
 package otelcol // import "go.opentelemetry.io/collector/otelcol"
 
 import (
@@ -27,14 +17,12 @@ import (
 
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/connector"
-	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/extension"
 	"go.opentelemetry.io/collector/otelcol/internal/grpclog"
-	"go.opentelemetry.io/collector/processor"
-	"go.opentelemetry.io/collector/receiver"
 	"go.opentelemetry.io/collector/service"
 )
 
@@ -65,7 +53,7 @@ func (s State) String() string {
 // CollectorSettings holds configuration for creating a new Collector.
 type CollectorSettings struct {
 	// Factories service factories.
-	Factories Factories
+	Factories func() (Factories, error)
 
 	// BuildInfo provides collector start information.
 	BuildInfo component.BuildInfo
@@ -76,9 +64,13 @@ type CollectorSettings struct {
 	// and manually handle the signals to shutdown the collector.
 	DisableGracefulShutdown bool
 
-	// ConfigProvider provides the service configuration.
-	// If the provider watches for configuration change, collector may reload the new configuration upon changes.
-	ConfigProvider ConfigProvider
+	// ConfigProviderSettings allows configuring the way the Collector retrieves its configuration
+	// The Collector will reload based on configuration changes from the ConfigProvider if any
+	// confmap.Providers watch for configuration changes.
+	ConfigProviderSettings ConfigProviderSettings
+
+	// ProviderModules maps provider schemes to their respective go modules.
+	ProviderModules map[string]string
 
 	// LoggingOptions provides a way to change behavior of zap logging.
 	LoggingOptions []zap.Option
@@ -102,33 +94,49 @@ type CollectorSettings struct {
 type Collector struct {
 	set CollectorSettings
 
-	service *service.Service
-	state   *atomic.Int32
+	configProvider ConfigProvider
+
+	serviceConfig *service.Config
+	service       *service.Service
+	state         *atomic.Int64
 
 	// shutdownChan is used to terminate the collector.
 	shutdownChan chan struct{}
 	// signalsChannel is used to receive termination signals from the OS.
 	signalsChannel chan os.Signal
 	// asyncErrorChannel is used to signal a fatal error from any component.
-	asyncErrorChannel chan error
+	asyncErrorChannel          chan error
+	bc                         *bufferedCore
+	updateConfigProviderLogger func(core zapcore.Core)
 }
 
 // NewCollector creates and returns a new instance of Collector.
 func NewCollector(set CollectorSettings) (*Collector, error) {
-	if set.ConfigProvider == nil {
-		return nil, errors.New("invalid nil config provider")
+	bc := newBufferedCore(zapcore.DebugLevel)
+	cc := &collectorCore{core: bc}
+	options := append([]zap.Option{zap.WithCaller(true)}, set.LoggingOptions...)
+	logger := zap.New(cc, options...)
+	set.ConfigProviderSettings.ResolverSettings.ProviderSettings = confmap.ProviderSettings{Logger: logger}
+	set.ConfigProviderSettings.ResolverSettings.ConverterSettings = confmap.ConverterSettings{Logger: logger}
+
+	configProvider, err := NewConfigProvider(set.ConfigProviderSettings)
+	if err != nil {
+		return nil, err
 	}
 
-	state := &atomic.Int32{}
-	state.Store(int32(StateStarting))
+	state := new(atomic.Int64)
+	state.Store(int64(StateStarting))
 	return &Collector{
 		set:          set,
 		state:        state,
 		shutdownChan: make(chan struct{}),
 		// Per signal.Notify documentation, a size of the channel equaled with
 		// the number of signals getting notified on is recommended.
-		signalsChannel:    make(chan os.Signal, 3),
-		asyncErrorChannel: make(chan error),
+		signalsChannel:             make(chan os.Signal, 3),
+		asyncErrorChannel:          make(chan error),
+		configProvider:             configProvider,
+		bc:                         bc,
+		updateConfigProviderLogger: cc.SetCore,
 	}, nil
 }
 
@@ -143,38 +151,77 @@ func (col *Collector) Shutdown() {
 	state := col.GetState()
 	if state == StateRunning || state == StateStarting {
 		defer func() {
-			recover() // nolint:errcheck
+			_ = recover()
 		}()
 		close(col.shutdownChan)
 	}
 }
 
-// setupConfigurationComponents loads the config and starts the components. If all the steps succeeds it
+// setupConfigurationComponents loads the config, creates the graph, and starts the components. If all the steps succeeds it
 // sets the col.service with the service currently running.
 func (col *Collector) setupConfigurationComponents(ctx context.Context) error {
 	col.setCollectorState(StateStarting)
 
-	cfg, err := col.set.ConfigProvider.Get(ctx, col.set.Factories)
+	factories, err := col.set.Factories()
+	if err != nil {
+		return fmt.Errorf("failed to initialize factories: %w", err)
+	}
+	cfg, err := col.configProvider.Get(ctx, factories)
 	if err != nil {
 		return fmt.Errorf("failed to get config: %w", err)
 	}
 
-	if err = cfg.Validate(); err != nil {
+	if err = component.ValidateConfig(cfg); err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
 
+	col.serviceConfig = &cfg.Service
+
+	conf := confmap.New()
+
+	if err = conf.Marshal(cfg); err != nil {
+		return fmt.Errorf("could not marshal configuration: %w", err)
+	}
+
 	col.service, err = service.New(ctx, service.Settings{
-		BuildInfo:         col.set.BuildInfo,
-		Receivers:         receiver.NewBuilder(cfg.Receivers, col.set.Factories.Receivers),
-		Processors:        processor.NewBuilder(cfg.Processors, col.set.Factories.Processors),
-		Exporters:         exporter.NewBuilder(cfg.Exporters, col.set.Factories.Exporters),
-		Connectors:        connector.NewBuilder(cfg.Connectors, col.set.Factories.Connectors),
-		Extensions:        extension.NewBuilder(cfg.Extensions, col.set.Factories.Extensions),
+		BuildInfo:     col.set.BuildInfo,
+		CollectorConf: conf,
+
+		ReceiversConfigs:    cfg.Receivers,
+		ReceiversFactories:  factories.Receivers,
+		ProcessorsConfigs:   cfg.Processors,
+		ProcessorsFactories: factories.Processors,
+		ExportersConfigs:    cfg.Exporters,
+		ExportersFactories:  factories.Exporters,
+		ConnectorsConfigs:   cfg.Connectors,
+		ConnectorsFactories: factories.Connectors,
+		ExtensionsConfigs:   cfg.Extensions,
+		ExtensionsFactories: factories.Extensions,
+
+		ModuleInfo: extension.ModuleInfo{
+			Receiver:  factories.ReceiverModules,
+			Processor: factories.ProcessorModules,
+			Exporter:  factories.ExporterModules,
+			Extension: factories.ExtensionModules,
+			Connector: factories.ConnectorModules,
+		},
 		AsyncErrorChannel: col.asyncErrorChannel,
 		LoggingOptions:    col.set.LoggingOptions,
 	}, cfg.Service)
 	if err != nil {
 		return err
+	}
+	if col.updateConfigProviderLogger != nil {
+		col.updateConfigProviderLogger(col.service.Logger().Core())
+	}
+	if col.bc != nil {
+		x := col.bc.TakeLogs()
+		for _, log := range x {
+			ce := col.service.Logger().Core().Check(log.Entry, nil)
+			if ce != nil {
+				ce.Write(log.Context...)
+			}
+		}
 	}
 
 	if !col.set.SkipSettingGRPCLogger {
@@ -185,6 +232,7 @@ func (col *Collector) setupConfigurationComponents(ctx context.Context) error {
 		return multierr.Combine(err, col.service.Shutdown(ctx))
 	}
 	col.setCollectorState(StateRunning)
+
 	return nil
 }
 
@@ -203,11 +251,54 @@ func (col *Collector) reloadConfiguration(ctx context.Context) error {
 	return nil
 }
 
+func (col *Collector) DryRun(ctx context.Context) error {
+	factories, err := col.set.Factories()
+	if err != nil {
+		return fmt.Errorf("failed to initialize factories: %w", err)
+	}
+	cfg, err := col.configProvider.Get(ctx, factories)
+	if err != nil {
+		return fmt.Errorf("failed to get config: %w", err)
+	}
+
+	return component.ValidateConfig(cfg)
+}
+
+func newFallbackLogger(options []zap.Option) (*zap.Logger, error) {
+	ec := zap.NewProductionEncoderConfig()
+	ec.EncodeTime = zapcore.ISO8601TimeEncoder
+	zapCfg := &zap.Config{
+		Level:            zap.NewAtomicLevelAt(zapcore.DebugLevel),
+		Encoding:         "console",
+		EncoderConfig:    ec,
+		OutputPaths:      []string{"stderr"},
+		ErrorOutputPaths: []string{"stderr"},
+	}
+	return zapCfg.Build(options...)
+}
+
 // Run starts the collector according to the given configuration, and waits for it to complete.
 // Consecutive calls to Run are not allowed, Run shouldn't be called once a collector is shut down.
+// Sets up the control logic for config reloading and shutdown.
 func (col *Collector) Run(ctx context.Context) error {
+	// setupConfigurationComponents is the "main" function responsible for startup
 	if err := col.setupConfigurationComponents(ctx); err != nil {
 		col.setCollectorState(StateClosed)
+		logger, loggerErr := newFallbackLogger(col.set.LoggingOptions)
+		if loggerErr != nil {
+			return errors.Join(err, fmt.Errorf("unable to create fallback logger: %w", loggerErr))
+		}
+
+		if col.bc != nil {
+			x := col.bc.TakeLogs()
+			for _, log := range x {
+				ce := logger.Core().Check(log.Entry, nil)
+				if ce != nil {
+					ce.Write(log.Context...)
+				}
+			}
+		}
+
 		return err
 	}
 
@@ -220,10 +311,12 @@ func (col *Collector) Run(ctx context.Context) error {
 		signal.Notify(col.signalsChannel, os.Interrupt, syscall.SIGTERM)
 	}
 
+	// Control loop: selects between channels for various interrupts - when this loop is broken, the collector exits.
+	// If a configuration reload fails, we return without waiting for graceful shutdown.
 LOOP:
 	for {
 		select {
-		case err := <-col.set.ConfigProvider.Watch():
+		case err := <-col.configProvider.Watch():
 			if err != nil {
 				col.service.Logger().Error("Config watch failed", zap.Error(err))
 				break LOOP
@@ -260,7 +353,7 @@ func (col *Collector) shutdown(ctx context.Context) error {
 	// Accumulate errors and proceed with shutting down remaining components.
 	var errs error
 
-	if err := col.set.ConfigProvider.Shutdown(ctx); err != nil {
+	if err := col.configProvider.Shutdown(ctx); err != nil {
 		errs = multierr.Append(errs, fmt.Errorf("failed to shutdown config provider: %w", err))
 	}
 
@@ -276,5 +369,5 @@ func (col *Collector) shutdown(ctx context.Context) error {
 
 // setCollectorState provides current state of the collector
 func (col *Collector) setCollectorState(state State) {
-	col.state.Store(int32(state))
+	col.state.Store(int64(state))
 }

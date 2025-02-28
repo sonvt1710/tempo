@@ -13,11 +13,13 @@
       metrics_generator: 'metrics-generator',
       distributor: 'distributor',
       compactor: 'compactor',
+      block_builder: 'block-builder',
     },
     alerts: {
       compactions_per_hour_failed: 2,
       flushes_per_hour_failed: 2,
       polls_per_hour_failed: 2,
+      user_configurable_overrides_polls_per_hour_failed: 5,
       max_tenant_index_age_seconds: 600,
       p99_request_threshold_seconds: 3,
       p99_request_exclude_regex: 'metrics|/frontend.Frontend/Process|debug_pprof',
@@ -42,5 +44,11 @@
     group_by_cluster: makeGroupBy($._config.cluster_selectors),
     group_by_job: makeGroupBy($._config.job_selectors),
     group_by_tenant: makeGroupBy($._config.tenant_selectors),
+
+    // Tunes histogram recording rules to aggregate over this interval.
+    // Set to at least twice the scrape interval; otherwise, recording rules will output no data.
+    // Set to four times the scrape interval to account for edge cases: https://www.robustperception.io/what-range-should-i-use-with-rate/
+    recording_rules_range_interval: '1m',
+
   },
 }

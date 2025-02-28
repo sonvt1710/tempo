@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -14,35 +16,57 @@ import (
 )
 
 const (
+	// JSON
 	MetaName          = "meta.json"
 	CompactedMetaName = "meta.compacted.json"
 	TenantIndexName   = "index.json.gz"
+
+	// Proto
+	TenantIndexNamePb = "index.pb.zst"
+
 	// File name for the cluster seed file.
 	ClusterSeedFileName = "tempo_cluster_seed.json"
 )
 
-// KeyPath is an ordered set of strings that govern where data is read/written from the backend
+// KeyPath is an ordered set of strings that govern where data is read/written
+// from the backend
 type KeyPath []string
+
+// FundFunc is executed for each object in the backend.  The provided FindMatch
+// are used to determine how to handle the object.  Any collection of these
+// objects is the callers responsibility.
+type FindFunc func(FindMatch)
+
+type FindMatch struct {
+	Modified time.Time
+	Key      string
+}
 
 // RawWriter is a collection of methods to write data to tempodb backends
 type RawWriter interface {
 	// Write is for in memory data. shouldCache specifies whether or not caching should be attempted.
-	Write(ctx context.Context, name string, keypath KeyPath, data io.Reader, size int64, shouldCache bool) error
+	Write(ctx context.Context, name string, keypath KeyPath, data io.Reader, size int64, cacheInfo *CacheInfo) error
 	// Append starts or continues an Append job. Pass nil to AppendTracker to start a job.
 	Append(ctx context.Context, name string, keypath KeyPath, tracker AppendTracker, buffer []byte) (AppendTracker, error)
 	// CloseAppend closes any resources associated with the AppendTracker.
 	CloseAppend(ctx context.Context, tracker AppendTracker) error
+	// Delete deletes a file.
+	Delete(ctx context.Context, name string, keypath KeyPath, cacheInfo *CacheInfo) error
 }
 
 // RawReader is a collection of methods to read data from tempodb backends
 type RawReader interface {
 	// List returns all objects one level beneath the provided keypath
 	List(ctx context.Context, keypath KeyPath) ([]string, error)
+	// ListBlocks returns all blockIDs and compactedBlockIDs for a tenant.
+	ListBlocks(ctx context.Context, tenant string) (blockIDs []uuid.UUID, compactedBlockIDs []uuid.UUID, err error)
+	// Find executes the FindFunc for each object in the backend starting at the specified keypath.  Collection of these objects is the callers responsibility.
+	Find(ctx context.Context, keypath KeyPath, f FindFunc) error
 	// Read is for streaming entire objects from the backend.  There will be an attempt to retrieve this from cache if shouldCache is true.
-	Read(ctx context.Context, name string, keyPath KeyPath, shouldCache bool) (io.ReadCloser, int64, error)
+	Read(ctx context.Context, name string, keyPath KeyPath, cacheInfo *CacheInfo) (io.ReadCloser, int64, error)
 	// ReadRange is for reading parts of large objects from the backend.
 	// There will be an attempt to retrieve this from cache if shouldCache is true. Cache key will be tenantID:blockID:offset:bufferLength
-	ReadRange(ctx context.Context, name string, keypath KeyPath, offset uint64, buffer []byte, shouldCache bool) error
+	ReadRange(ctx context.Context, name string, keypath KeyPath, offset uint64, buffer []byte, cacheInfo *CacheInfo) error
 	// Shutdown must be called when the Reader is finished and cleans up any associated resources.
 	Shutdown()
 }
@@ -58,48 +82,90 @@ func NewWriter(w RawWriter) Writer {
 	}
 }
 
-func (w *writer) Write(ctx context.Context, name string, blockID uuid.UUID, tenantID string, buffer []byte, shouldCache bool) error {
-	return w.w.Write(ctx, name, KeyPathForBlock(blockID, tenantID), bytes.NewReader(buffer), int64(len(buffer)), shouldCache)
+// TODO: these objects are not raw, so perhaps they could move somewhere else.
+// var (
+// 	x RawReader = reader{}
+// 	y RawWriter = writer{}
+// )
+
+// Write implements backend.Writer
+func (w *writer) Write(ctx context.Context, name string, blockID uuid.UUID, tenantID string, buffer []byte, cacheInfo *CacheInfo) error {
+	return w.w.Write(ctx, name, KeyPathForBlock(blockID, tenantID), bytes.NewReader(buffer), int64(len(buffer)), cacheInfo)
 }
 
+// Write implements backend.Writer
 func (w *writer) StreamWriter(ctx context.Context, name string, blockID uuid.UUID, tenantID string, data io.Reader, size int64) error {
-	return w.w.Write(ctx, name, KeyPathForBlock(blockID, tenantID), data, size, false)
+	return w.w.Write(ctx, name, KeyPathForBlock(blockID, tenantID), data, size, nil)
 }
 
+// Write implements backend.Writer
 func (w *writer) WriteBlockMeta(ctx context.Context, meta *BlockMeta) error {
-	blockID := meta.BlockID
-	tenantID := meta.TenantID
+	var (
+		blockID  = meta.BlockID
+		tenantID = meta.TenantID
+	)
 
 	bMeta, err := json.Marshal(meta)
 	if err != nil {
 		return err
 	}
 
-	return w.w.Write(ctx, MetaName, KeyPathForBlock(blockID, tenantID), bytes.NewReader(bMeta), int64(len(bMeta)), false)
+	return w.w.Write(ctx, MetaName, KeyPathForBlock((uuid.UUID)(blockID), tenantID), bytes.NewReader(bMeta), int64(len(bMeta)), nil)
 }
 
+// Write implements backend.Writer
 func (w *writer) Append(ctx context.Context, name string, blockID uuid.UUID, tenantID string, tracker AppendTracker, buffer []byte) (AppendTracker, error) {
 	return w.w.Append(ctx, name, KeyPathForBlock(blockID, tenantID), tracker, buffer)
 }
 
+// Write implements backend.Writer
 func (w *writer) CloseAppend(ctx context.Context, tracker AppendTracker) error {
 	return w.w.CloseAppend(ctx, tracker)
 }
 
+// Write implements backend.Writer
 func (w *writer) WriteTenantIndex(ctx context.Context, tenantID string, meta []*BlockMeta, compactedMeta []*CompactedBlockMeta) error {
+	// If meta and compactedMeta are empty, call delete the tenant index.
+	if len(meta) == 0 && len(compactedMeta) == 0 {
+		// Skip returning an error when the object is already deleted.
+		err := w.w.Delete(ctx, TenantIndexName, []string{tenantID}, nil)
+		if err != nil && !errors.Is(err, ErrDoesNotExist) {
+			return err
+		}
+
+		err = w.w.Delete(ctx, TenantIndexNamePb, []string{tenantID}, nil)
+		if err != nil && !errors.Is(err, ErrDoesNotExist) {
+			return err
+		}
+
+		return nil
+	}
+
 	b := newTenantIndex(meta, compactedMeta)
 
-	indexBytes, err := b.marshal()
+	// Marshal and write the proto object.
+	indexBytesPb, err := b.marshalPb()
 	if err != nil {
 		return err
 	}
 
-	err = w.w.Write(ctx, TenantIndexName, KeyPath([]string{tenantID}), bytes.NewReader(indexBytes), int64(len(indexBytes)), false)
+	err = w.w.Write(ctx, TenantIndexNamePb, KeyPath([]string{tenantID}), bytes.NewReader(indexBytesPb), int64(len(indexBytesPb)), nil)
 	if err != nil {
 		return err
 	}
 
-	return nil
+	// Marshal and write the JSON object.
+	indexBytesJSON, err := b.marshal()
+	if err != nil {
+		return err
+	}
+
+	return w.w.Write(ctx, TenantIndexName, KeyPath([]string{tenantID}), bytes.NewReader(indexBytesJSON), int64(len(indexBytesJSON)), nil)
+}
+
+// Delete implements backend.Writer
+func (w *writer) Delete(ctx context.Context, name string, keypath KeyPath) error {
+	return w.w.Delete(ctx, name, keypath, nil)
 }
 
 type reader struct {
@@ -113,8 +179,9 @@ func NewReader(r RawReader) Reader {
 	}
 }
 
-func (r *reader) Read(ctx context.Context, name string, blockID uuid.UUID, tenantID string, shouldCache bool) ([]byte, error) {
-	objReader, size, err := r.r.Read(ctx, name, KeyPathForBlock(blockID, tenantID), shouldCache)
+// Read implements backend.Reader
+func (r *reader) Read(ctx context.Context, name string, blockID uuid.UUID, tenantID string, cacheInfo *CacheInfo) ([]byte, error) {
+	objReader, size, err := r.r.Read(ctx, name, KeyPathForBlock(blockID, tenantID), cacheInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -122,14 +189,17 @@ func (r *reader) Read(ctx context.Context, name string, blockID uuid.UUID, tenan
 	return tempo_io.ReadAllWithEstimate(objReader, size)
 }
 
+// StreamReader implements backend.Reader
 func (r *reader) StreamReader(ctx context.Context, name string, blockID uuid.UUID, tenantID string) (io.ReadCloser, int64, error) {
-	return r.r.Read(ctx, name, KeyPathForBlock(blockID, tenantID), false)
+	return r.r.Read(ctx, name, KeyPathForBlock(blockID, tenantID), nil)
 }
 
-func (r *reader) ReadRange(ctx context.Context, name string, blockID uuid.UUID, tenantID string, offset uint64, buffer []byte, shouldCache bool) error {
-	return r.r.ReadRange(ctx, name, KeyPathForBlock(blockID, tenantID), offset, buffer, shouldCache)
+// ReadRange implements backend.Reader
+func (r *reader) ReadRange(ctx context.Context, name string, blockID uuid.UUID, tenantID string, offset uint64, buffer []byte, cacheInfo *CacheInfo) error {
+	return r.r.ReadRange(ctx, name, KeyPathForBlock(blockID, tenantID), offset, buffer, cacheInfo)
 }
 
+// Tenants implements backend.Reader
 func (r *reader) Tenants(ctx context.Context) ([]string, error) {
 	list, err := r.r.List(ctx, nil)
 
@@ -144,32 +214,14 @@ func (r *reader) Tenants(ctx context.Context) ([]string, error) {
 	return filteredList, err
 }
 
-func (r *reader) Blocks(ctx context.Context, tenantID string) ([]uuid.UUID, error) {
-	objects, err := r.r.List(ctx, KeyPath{tenantID})
-	if err != nil {
-		return nil, err
-	}
-
-	// translate everything to UUIDs, if we see a bucket index we can skip that
-	blockIDs := make([]uuid.UUID, 0, len(objects))
-	for _, id := range objects {
-		// TODO: this line exists due to behavior differences in backends: https://github.com/grafana/tempo/issues/880
-		// revisit once #880 is resolved.
-		if id == TenantIndexName || id == "" {
-			continue
-		}
-		uuid, err := uuid.Parse(id)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse %s: %w", id, err)
-		}
-		blockIDs = append(blockIDs, uuid)
-	}
-
-	return blockIDs, nil
+// Blocks implements backend.Reader
+func (r *reader) Blocks(ctx context.Context, tenantID string) ([]uuid.UUID, []uuid.UUID, error) {
+	return r.r.ListBlocks(ctx, tenantID)
 }
 
+// BlockMeta implements backend.Reader
 func (r *reader) BlockMeta(ctx context.Context, blockID uuid.UUID, tenantID string) (*BlockMeta, error) {
-	reader, size, err := r.r.Read(ctx, MetaName, KeyPathForBlock(blockID, tenantID), false)
+	reader, size, err := r.r.Read(ctx, MetaName, KeyPathForBlock(blockID, tenantID), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -189,21 +241,35 @@ func (r *reader) BlockMeta(ctx context.Context, blockID uuid.UUID, tenantID stri
 	return out, nil
 }
 
+// TenantIndex implements backend.Reader
 func (r *reader) TenantIndex(ctx context.Context, tenantID string) (*TenantIndex, error) {
-	reader, size, err := r.r.Read(ctx, TenantIndexName, KeyPath([]string{tenantID}), false)
-	if err != nil {
+	ctx, span := tracer.Start(ctx, "reader.TenantIndex")
+	defer span.End()
+
+	outPb, err := r.tenantIndexProto(ctx, tenantID)
+	if err == nil {
+		return outPb, nil
+	}
+
+	if !errors.Is(err, ErrDoesNotExist) {
 		return nil, err
 	}
 
-	defer reader.Close()
+	span.AddEvent(EventJSONFallback)
 
-	bytes, err := tempo_io.ReadAllWithEstimate(reader, size)
+	readerJ, size, err := r.r.Read(ctx, TenantIndexName, KeyPath([]string{tenantID}), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer readerJ.Close()
+
+	bytesJ, err := tempo_io.ReadAllWithEstimate(readerJ, size)
 	if err != nil {
 		return nil, err
 	}
 
 	i := &TenantIndex{}
-	err = i.unmarshal(bytes)
+	err = i.unmarshal(bytesJ)
 	if err != nil {
 		return nil, err
 	}
@@ -211,6 +277,33 @@ func (r *reader) TenantIndex(ctx context.Context, tenantID string) (*TenantIndex
 	return i, nil
 }
 
+func (r *reader) tenantIndexProto(ctx context.Context, tenantID string) (*TenantIndex, error) {
+	readerPb, size, err := r.r.Read(ctx, TenantIndexNamePb, KeyPath([]string{tenantID}), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read tenant index proto: %w", err)
+	}
+	defer readerPb.Close()
+
+	bytesPb, err := tempo_io.ReadAllWithEstimate(readerPb, size)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read all with estimate: %w", err)
+	}
+
+	out := &TenantIndex{}
+	err = out.unmarshalPb(bytesPb)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal tenant index proto: %w", err)
+	}
+
+	return out, nil
+}
+
+// Find implements backend.Reader
+func (r *reader) Find(ctx context.Context, keypath KeyPath, f FindFunc) error {
+	return r.r.Find(ctx, keypath, f)
+}
+
+// Shutdown implements backend.Reader
 func (r *reader) Shutdown() {
 	r.r.Shutdown()
 }
@@ -235,16 +328,16 @@ func KeyPathWithPrefix(keypath KeyPath, prefix string) KeyPath {
 }
 
 // MetaFileName returns the object name for the block meta given a block id and tenantid
-func MetaFileName(blockID uuid.UUID, tenantID string) string {
-	return path.Join(RootPath(blockID, tenantID), MetaName)
+func MetaFileName(blockID uuid.UUID, tenantID, prefix string) string {
+	return path.Join(prefix, tenantID, blockID.String(), MetaName)
 }
 
 // CompactedMetaFileName returns the object name for the compacted block meta given a block id and tenantid
-func CompactedMetaFileName(blockID uuid.UUID, tenantID string) string {
-	return path.Join(RootPath(blockID, tenantID), CompactedMetaName)
+func CompactedMetaFileName(blockID uuid.UUID, tenantID, prefix string) string {
+	return path.Join(prefix, tenantID, blockID.String(), CompactedMetaName)
 }
 
 // RootPath returns the root path for a block given a block id and tenantid
-func RootPath(blockID uuid.UUID, tenantID string) string {
-	return path.Join(tenantID, blockID.String())
+func RootPath(blockID uuid.UUID, tenantID, prefix string) string {
+	return path.Join(prefix, tenantID, blockID.String())
 }

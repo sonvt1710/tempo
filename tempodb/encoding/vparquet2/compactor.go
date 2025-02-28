@@ -2,6 +2,7 @@ package vparquet2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"runtime"
@@ -10,11 +11,8 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/google/uuid"
 	tempoUtil "github.com/grafana/tempo/pkg/util"
-	"github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 
 	tempo_io "github.com/grafana/tempo/pkg/io"
 	"github.com/grafana/tempo/tempodb/backend"
@@ -29,11 +27,10 @@ type Compactor struct {
 	opts common.CompactionOptions
 }
 
-func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader, writerCallback func(*backend.BlockMeta, time.Time) backend.Writer, inputs []*backend.BlockMeta) (newCompactedBlocks []*backend.BlockMeta, err error) {
-
+func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader, w backend.Writer, inputs []*backend.BlockMeta) (newCompactedBlocks []*backend.BlockMeta, err error) {
 	var (
-		compactionLevel uint8
-		totalRecords    int
+		compactionLevel uint32
+		totalRecords    int64
 		minBlockStart   time.Time
 		maxBlockEnd     time.Time
 		bookmarks       = make([]*bookmark[parquet.Row], 0, len(inputs))
@@ -57,10 +54,10 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 
 		block := newBackendBlock(blockMeta, r)
 
-		span, derivedCtx := opentracing.StartSpanFromContext(ctx, "vparquet.compactor.iterator")
-		defer span.Finish()
+		derivedCtx, span := tracer.Start(ctx, "vparquet.compactor.iterator")
+		defer span.End()
 
-		iter, err := block.RawIterator(derivedCtx, pool)
+		iter, err := block.rawIter(derivedCtx, pool)
 		if err != nil {
 			return nil, err
 		}
@@ -129,31 +126,34 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 
 	var (
 		m               = newMultiblockIterator(bookmarks, combine)
-		recordsPerBlock = (totalRecords / int(c.opts.OutputBlocks))
+		recordsPerBlock = (totalRecords / int64(c.opts.OutputBlocks))
 		currentBlock    *streamingBlock
 	)
 	defer m.Close()
 
 	for {
 		lowestID, lowestObject, err := m.Next(ctx)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 
 		if err != nil {
-			return nil, errors.Wrap(err, "error iterating input blocks")
+			return nil, fmt.Errorf("error iterating input blocks: %w", err)
+		}
+
+		if c.opts.DropObject != nil && c.opts.DropObject(lowestID) {
+			continue
 		}
 
 		// make a new block if necessary
 		if currentBlock == nil {
 			// Start with a copy and then customize
 			newMeta := &backend.BlockMeta{
-				BlockID:         uuid.New(),
+				BlockID:         backend.NewUUID(),
 				TenantID:        inputs[0].TenantID,
 				CompactionLevel: nextCompactionLevel,
 				TotalObjects:    recordsPerBlock, // Just an estimate
 			}
-			w := writerCallback(newMeta, time.Now())
 
 			currentBlock = newStreamingBlock(ctx, &c.opts.BlockConfig, newMeta, r, w, tempo_io.NewBufferedWriter)
 			currentBlock.meta.CompactionLevel = nextCompactionLevel
@@ -165,7 +165,7 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 			runtime.GC()
 			err = c.appendBlock(ctx, currentBlock, l)
 			if err != nil {
-				return nil, errors.Wrap(err, "error writing partial block")
+				return nil, fmt.Errorf("error writing partial block: %w", err)
 			}
 		}
 
@@ -182,7 +182,7 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 			runtime.GC()
 			err = c.appendBlock(ctx, currentBlock, l)
 			if err != nil {
-				return nil, errors.Wrap(err, "error writing partial block")
+				return nil, fmt.Errorf("error writing partial block: %w", err)
 			}
 		}
 
@@ -195,7 +195,7 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 			currentBlockPtrCopy.meta.EndTime = maxBlockEnd
 			err := c.finishBlock(ctx, currentBlockPtrCopy, l)
 			if err != nil {
-				return nil, errors.Wrap(err, fmt.Sprintf("error shipping block to backend, blockID %s", currentBlockPtrCopy.meta.BlockID.String()))
+				return nil, fmt.Errorf("error shipping block to backend, blockID %s: %w", currentBlockPtrCopy.meta.BlockID.String(), err)
 			}
 			currentBlock = nil
 		}
@@ -207,7 +207,7 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 		currentBlock.meta.EndTime = maxBlockEnd
 		err := c.finishBlock(ctx, currentBlock, l)
 		if err != nil {
-			return nil, errors.Wrap(err, fmt.Sprintf("error shipping block to backend, blockID %s", currentBlock.meta.BlockID.String()))
+			return nil, fmt.Errorf("error shipping block to backend, blockID %s: %w", currentBlock.meta.BlockID.String(), err)
 		}
 	}
 
@@ -215,8 +215,8 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 }
 
 func (c *Compactor) appendBlock(ctx context.Context, block *streamingBlock, l log.Logger) error {
-	span, _ := opentracing.StartSpanFromContext(ctx, "vparquet.compactor.appendBlock")
-	defer span.Finish()
+	_, span := tracer.Start(ctx, "vparquet.compactor.appendBlock")
+	defer span.End()
 
 	var (
 		objs            = block.CurrentBufferedObjects()
@@ -243,15 +243,30 @@ func (c *Compactor) appendBlock(ctx context.Context, block *streamingBlock, l lo
 }
 
 func (c *Compactor) finishBlock(ctx context.Context, block *streamingBlock, l log.Logger) error {
-	span, _ := opentracing.StartSpanFromContext(ctx, "vparquet.compactor.finishBlock")
-	defer span.Finish()
+	_, span := tracer.Start(ctx, "vparquet.compactor.finishBlock")
+	defer span.End()
 
 	bytesFlushed, err := block.Complete()
 	if err != nil {
-		return errors.Wrap(err, "error completing block")
+		return fmt.Errorf("error completing block: %w", err)
 	}
 
-	level.Info(l).Log("msg", "wrote compacted block", "meta", fmt.Sprintf("%+v", block.meta))
+	level.Info(l).Log("msg", "wrote compacted block",
+		"version", block.meta.Version,
+		"tenantID", block.meta.TenantID,
+		"blockID", block.meta.BlockID.String(),
+		"startTime", block.meta.StartTime.String(),
+		"endTime", block.meta.EndTime.String(),
+		"totalObjects", block.meta.TotalObjects,
+		"size", block.meta.Size_,
+		"compactionLevel", block.meta.CompactionLevel,
+		"encoding", block.meta.Encoding.String(),
+		"totalRecords", block.meta.TotalObjects,
+		"bloomShardCount", block.meta.BloomShardCount,
+		"footerSize", block.meta.FooterSize,
+		"replicationFactor", block.meta.ReplicationFactor,
+	)
+
 	compactionLevel := int(block.meta.CompactionLevel) - 1
 	if c.opts.BytesWritten != nil {
 		c.opts.BytesWritten(compactionLevel, bytesFlushed)
@@ -318,15 +333,25 @@ func estimateMarshalledSizeFromParquetRow(row parquet.Row) (size int) {
 // countSpans counts the number of spans in the given trace in deconstructed
 // parquet row format and returns traceId.
 // It simply counts the number of values for span ID, which is always present.
-func countSpans(schema *parquet.Schema, row parquet.Row) (traceID string, spans int) {
+func countSpans(schema *parquet.Schema, row parquet.Row) (traceID, rootSpanName, rootServiceName string, spans int) {
 	traceIDColumn, found := schema.Lookup(TraceIDColumnName)
 	if !found {
-		return "", 0
+		return "", "", "", 0
+	}
+
+	rootSpanNameColumn, found := schema.Lookup(columnPathRootSpanName)
+	if !found {
+		return "", "", "", 0
+	}
+
+	rootServiceNameColumn, found := schema.Lookup(columnPathRootServiceName)
+	if !found {
+		return "", "", "", 0
 	}
 
 	spanID, found := schema.Lookup("rs", "list", "element", "ss", "list", "element", "Spans", "list", "element", "SpanID")
 	if !found {
-		return "", 0
+		return "", "", "", 0
 	}
 
 	for _, v := range row {
@@ -336,6 +361,14 @@ func countSpans(schema *parquet.Schema, row parquet.Row) (traceID string, spans 
 
 		if v.Column() == traceIDColumn.ColumnIndex {
 			traceID = tempoUtil.TraceIDToHexString(v.ByteArray())
+		}
+
+		if v.Column() == rootSpanNameColumn.ColumnIndex {
+			rootSpanName = v.String()
+		}
+
+		if v.Column() == rootServiceNameColumn.ColumnIndex {
+			rootServiceName = v.String()
 		}
 	}
 

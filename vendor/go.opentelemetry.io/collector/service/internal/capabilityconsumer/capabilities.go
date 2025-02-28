@@ -1,28 +1,18 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package capabilityconsumer // import "go.opentelemetry.io/collector/service/internal/capabilityconsumer"
 
 import (
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/consumer/xconsumer"
 )
 
-func NewLogs(logs consumer.Logs, cap consumer.Capabilities) consumer.Logs {
-	if logs.Capabilities() == cap {
+func NewLogs(logs consumer.Logs, capabilities consumer.Capabilities) consumer.Logs {
+	if logs.Capabilities() == capabilities {
 		return logs
 	}
-	return capLogs{Logs: logs, cap: cap}
+	return capLogs{Logs: logs, cap: capabilities}
 }
 
 type capLogs struct {
@@ -34,11 +24,11 @@ func (mts capLogs) Capabilities() consumer.Capabilities {
 	return mts.cap
 }
 
-func NewMetrics(metrics consumer.Metrics, cap consumer.Capabilities) consumer.Metrics {
-	if metrics.Capabilities() == cap {
+func NewMetrics(metrics consumer.Metrics, capabilities consumer.Capabilities) consumer.Metrics {
+	if metrics.Capabilities() == capabilities {
 		return metrics
 	}
-	return capMetrics{Metrics: metrics, cap: cap}
+	return capMetrics{Metrics: metrics, cap: capabilities}
 }
 
 type capMetrics struct {
@@ -50,11 +40,11 @@ func (mts capMetrics) Capabilities() consumer.Capabilities {
 	return mts.cap
 }
 
-func NewTraces(traces consumer.Traces, cap consumer.Capabilities) consumer.Traces {
-	if traces.Capabilities() == cap {
+func NewTraces(traces consumer.Traces, capabilities consumer.Capabilities) consumer.Traces {
+	if traces.Capabilities() == capabilities {
 		return traces
 	}
-	return capTraces{Traces: traces, cap: cap}
+	return capTraces{Traces: traces, cap: capabilities}
 }
 
 type capTraces struct {
@@ -63,5 +53,21 @@ type capTraces struct {
 }
 
 func (mts capTraces) Capabilities() consumer.Capabilities {
+	return mts.cap
+}
+
+func NewProfiles(profiles xconsumer.Profiles, capabilities consumer.Capabilities) xconsumer.Profiles {
+	if profiles.Capabilities() == capabilities {
+		return profiles
+	}
+	return capProfiles{Profiles: profiles, cap: capabilities}
+}
+
+type capProfiles struct {
+	xconsumer.Profiles
+	cap consumer.Capabilities
+}
+
+func (mts capProfiles) Capabilities() consumer.Capabilities {
 	return mts.cap
 }

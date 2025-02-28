@@ -5,6 +5,7 @@ package usagestats
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"math"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/grafana/dskit/multierror"
 	"github.com/grafana/dskit/services"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel"
 
 	"github.com/grafana/tempo/cmd/tempo/build"
 	"github.com/grafana/tempo/tempodb/backend"
@@ -35,6 +37,8 @@ var (
 
 	stabilityCheckInterval   = 5 * time.Second
 	stabilityMinimumRequired = 6
+
+	tracer = otel.Tracer("usagestats/Reporter")
 )
 
 type Reporter struct {
@@ -103,10 +107,10 @@ func (rep *Reporter) initLeader(ctx context.Context) *ClusterSeed {
 		remoteSeed, err := rep.fetchSeed(ctx,
 			func(err error) bool {
 				// we only want to retry if the error is not an object not found error or a bad see file error
-				return err != backend.ErrDoesNotExist && err != backend.ErrBadSeedFile
+				return !errors.Is(err, backend.ErrDoesNotExist) && !errors.Is(err, backend.ErrBadSeedFile)
 			})
 		if err != nil {
-			if err == backend.ErrDoesNotExist || err == backend.ErrBadSeedFile {
+			if errors.Is(err, backend.ErrDoesNotExist) || errors.Is(err, backend.ErrBadSeedFile) {
 				// we are the leader and we need to save the file.
 				if err := rep.writeSeedFile(ctx, seed); err != nil {
 					level.Warn(rep.logger).Log("msg", "failed to CAS cluster seed key", "err", err)
@@ -157,6 +161,9 @@ func ensureStableKey(ctx context.Context, kvClient kv.Client, logger log.Logger)
 }
 
 func (rep *Reporter) init(ctx context.Context) {
+	ctx, span := tracer.Start(ctx, "UsageReporter.init")
+	defer span.End()
+
 	if rep.conf.Leader {
 		rep.cluster = rep.initLeader(ctx)
 		return
@@ -177,12 +184,12 @@ func (rep *Reporter) fetchSeed(ctx context.Context, continueFn func(err error) b
 	for backoff.Ongoing() {
 		seed, err := rep.readSeedFile(ctx)
 		if err != nil {
-			if err != backend.ErrDoesNotExist {
+			if !errors.Is(err, backend.ErrDoesNotExist) {
 				readingErr++
 			}
 			level.Debug(rep.logger).Log("msg", "failed to read cluster seed file", "err", err)
 			if readingErr > attemptNumber {
-				if err == backend.ErrBadSeedFile {
+				if errors.Is(err, backend.ErrBadSeedFile) {
 					level.Debug(rep.logger).Log("msg", "seed file corrupted")
 				}
 			}
@@ -199,7 +206,7 @@ func (rep *Reporter) fetchSeed(ctx context.Context, continueFn func(err error) b
 
 // readSeedFile reads the cluster seed file from the object store.
 func (rep *Reporter) readSeedFile(ctx context.Context) (*ClusterSeed, error) {
-	reader, _, err := rep.reader.Read(ctx, backend.ClusterSeedFileName, backend.KeyPath{}, false)
+	reader, _, err := rep.reader.Read(ctx, backend.ClusterSeedFileName, backend.KeyPath{}, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +232,7 @@ func (rep *Reporter) writeSeedFile(ctx context.Context, seed ClusterSeed) error 
 	if err != nil {
 		return err
 	}
-	return rep.writer.Write(ctx, backend.ClusterSeedFileName, []string{}, bytes.NewReader(data), -1, false)
+	return rep.writer.Write(ctx, backend.ClusterSeedFileName, []string{}, bytes.NewReader(data), -1, nil)
 }
 
 // running inits the reporter seed and start sending report for every interval
@@ -261,12 +268,10 @@ func (rep *Reporter) running(ctx context.Context) error {
 			rep.lastReport = next
 			next = next.Add(reportInterval)
 		case <-ctx.Done():
-			switch ctx.Err() {
-			case context.Canceled:
+			if errors.Is(ctx.Err(), context.Canceled) {
 				return nil
-			default:
-				return ctx.Err()
 			}
+			return ctx.Err()
 		}
 	}
 }

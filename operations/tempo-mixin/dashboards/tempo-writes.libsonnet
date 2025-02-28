@@ -29,7 +29,7 @@ dashboard_utils {
                           {%s, __name__=~"envoy_cluster_grpc_proto_collector_trace_v1_TraceService_[0-9]+"},
                           "grpc_status", "$1", "__name__", "envoy_cluster_grpc_proto_collector_trace_v1_TraceService_(.+)"
                       )
-                      [$__interval:$__interval]
+                      [$__rate_interval:30s]
                   )
               )
             ||| % $.jobMatcher($._config.jobs.gateway),
@@ -72,8 +72,8 @@ dashboard_utils {
         g.row('Distributor')
         .addPanel(
           $.panel('Spans/Second') +
-          $.queryPanel('sum(rate(tempo_receiver_accepted_spans{%s}[$__interval]))' % $.jobMatcher($._config.jobs.distributor), 'accepted') +
-          $.queryPanel('sum(rate(tempo_receiver_refused_spans{%s}[$__interval]))' % $.jobMatcher($._config.jobs.distributor), 'refused')
+          $.queryPanel('sum(rate(tempo_receiver_accepted_spans{%s}[$__rate_interval]))' % $.jobMatcher($._config.jobs.distributor), 'accepted') +
+          $.queryPanel('sum(rate(tempo_receiver_refused_spans{%s}[$__rate_interval]))' % $.jobMatcher($._config.jobs.distributor), 'refused')
         )
         .addPanel(
           $.panel('Latency') +

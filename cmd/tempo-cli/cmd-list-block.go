@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/dustin/go-humanize"
 	"github.com/google/uuid"
+
 	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/util"
@@ -52,12 +54,12 @@ func dumpBlock(r tempodb_backend.Reader, c tempodb_backend.Compactor, tenantID s
 	id := uuid.MustParse(blockID)
 
 	meta, err := r.BlockMeta(context.TODO(), id, tenantID)
-	if err != nil && err != tempodb_backend.ErrDoesNotExist {
+	if err != nil && !errors.Is(err, tempodb_backend.ErrDoesNotExist) {
 		return err
 	}
 
 	compactedMeta, err := c.CompactedBlockMeta(id, tenantID)
-	if err != nil && err != tempodb_backend.ErrDoesNotExist {
+	if err != nil && !errors.Is(err, tempodb_backend.ErrDoesNotExist) {
 		return err
 	}
 
@@ -71,7 +73,7 @@ func dumpBlock(r tempodb_backend.Reader, c tempodb_backend.Compactor, tenantID s
 	fmt.Println("ID            : ", unifiedMeta.BlockID)
 	fmt.Println("Version       : ", unifiedMeta.Version)
 	fmt.Println("Total Objects : ", unifiedMeta.TotalObjects)
-	fmt.Println("Data Size     : ", humanize.Bytes(unifiedMeta.Size))
+	fmt.Println("Data Size     : ", humanize.Bytes(unifiedMeta.Size_))
 	fmt.Println("Encoding      : ", unifiedMeta.Encoding)
 	fmt.Println("Level         : ", unifiedMeta.CompactionLevel)
 	fmt.Println("Window        : ", unifiedMeta.window)
@@ -132,7 +134,7 @@ func dumpBlock(r tempodb_backend.Reader, c tempodb_backend.Compactor, tenantID s
 		prevID := make([]byte, 16)
 		for {
 			objID, obj, err := iter.NextBytes(ctx)
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			} else if err != nil {
 				return err
@@ -200,9 +202,10 @@ func printKVPairs(kvp kvPairs) {
 func relativeValue(v values) float64 {
 	return (float64(v.count) * float64(v.count)) / float64(len(v.all))
 }
+
 func extractKVPairs(t *tempopb.Trace) kvPairs {
 	kvp := kvPairs{}
-	for _, b := range t.Batches {
+	for _, b := range t.ResourceSpans {
 		spanCount := 0
 		for _, ils := range b.ScopeSpans {
 			for _, s := range ils.Spans {
@@ -228,6 +231,7 @@ func extractKVPairs(t *tempopb.Trace) kvPairs {
 	}
 	return kvp
 }
+
 func addKey(kvp kvPairs, key string, count int) {
 	v, ok := kvp[key]
 	if !ok {
@@ -239,7 +243,8 @@ func addKey(kvp kvPairs, key string, count int) {
 	v.count += count
 	kvp[key] = v
 }
-func addVal(kvp kvPairs, key string, val string, count int) {
+
+func addVal(kvp kvPairs, key, val string, count int) {
 	v := kvp[key]
 	stats, ok := v.all[val]
 	if !ok {

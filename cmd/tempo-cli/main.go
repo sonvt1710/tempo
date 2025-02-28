@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/grafana/dskit/flagext"
+
 	"github.com/alecthomas/kong"
 	"gopkg.in/yaml.v2"
 
@@ -27,12 +29,13 @@ type globalOptions struct {
 }
 
 type backendOptions struct {
-	Backend string `help:"backend to connect to (s3/gcs/local/azure), optional, overrides backend in config file" enum:",s3,gcs,local,azure"`
+	Backend string `help:"backend to connect to (s3/gcs/local/azure), optional, overrides backend in config file" enum:",s3,gcs,local,azure" default:""`
 	Bucket  string `help:"bucket (or path on local backend) to scan, optional, overrides bucket in config file"`
 
-	S3Endpoint string `name:"s3-endpoint" help:"s3 endpoint (s3.dualstack.us-east-2.amazonaws.com), optional, overrides endpoint in config file"`
-	S3User     string `name:"s3-user" help:"s3 username, optional, overrides username in config file"`
-	S3Pass     string `name:"s3-pass" help:"s3 password, optional, overrides password in config file"`
+	S3Endpoint         string `name:"s3-endpoint" help:"s3 endpoint (s3.dualstack.us-east-2.amazonaws.com), optional, overrides endpoint in config file"`
+	S3User             string `name:"s3-user" help:"s3 username, optional, overrides username in config file"`
+	S3Pass             string `name:"s3-pass" help:"s3 password, optional, overrides password in config file"`
+	InsecureSkipVerify bool   `name:"insecure-skip-verify" help:"skip TLS verification, only applies to S3 and GCS" default:"false"`
 }
 
 var cli struct {
@@ -45,6 +48,11 @@ var cli struct {
 		CacheSummary      listCacheSummaryCmd      `cmd:"" help:"List summary of bloom sizes per day per compaction level"`
 		Index             listIndexCmd             `cmd:"" help:"List information about a block index"`
 		Column            listColumnCmd            `cmd:"" help:"List values in a given column"`
+	} `cmd:""`
+
+	Analyse struct {
+		Block  analyseBlockCmd  `cmd:"" help:"Analyse block in a bucket"`
+		Blocks analyseBlocksCmd `cmd:"" help:"Analyse blocks in a bucket"`
 	} `cmd:""`
 
 	View struct {
@@ -63,21 +71,25 @@ var cli struct {
 			SearchTags      querySearchTagsCmd      `cmd:"" help:"query Tempo search tags"`
 			SearchTagValues querySearchTagValuesCmd `cmd:"" help:"query Tempo search tag values"`
 			Search          querySearchCmd          `cmd:"" help:"query Tempo search"`
+			Metrics         metricsQueryCmd         `cmd:"" help:"query Tempo metrics query range"`
 		} `cmd:""`
-		Blocks queryBlocksCmd `cmd:"" help:"query for a traceid directly from backend blocks"`
+		TraceID      queryBlocksCmd       `cmd:"" help:"query for a traceid directly from backend blocks"`
+		TraceSummary queryTraceSummaryCmd `cmd:"" help:"query summary for a traceid directly from backend blocks"`
+		Search       searchBlocksCmd      `cmd:"" help:"search for a traceid directly from backend blocks"`
 	} `cmd:""`
 
-	Search struct {
-		Blocks searchBlocksCmd `cmd:"" help:"search for a traceid directly from backend blocks"`
+	RewriteBlocks struct {
+		DropTraces dropTracesCmd `cmd:"" help:"rewrite blocks with given trace ids redacted"`
 	} `cmd:""`
 
 	Parquet struct {
-		Convert     convertParquet     `cmd:"" help:"convert from an existing file to tempodb parquet schema"`
-		Convert1to2 convertParquet1to2 `cmd:"" help:"convert an exiting vParquet file to vParquet2 schema"`
+		Convert2to3 convertParquet2to3 `cmd:"" help:"convert an existing vParquet2 file to vParquet3 block"`
+		Convert3to4 convertParquet3to4 `cmd:"" help:"convert an existing vParquet3 file to vParquet4 block"`
 	} `cmd:""`
 
 	Migrate struct {
-		Tenant migrateTenantCmd `cmd:"" help:"migrate tenant between two backends"`
+		Tenant          migrateTenantCmd          `cmd:"" help:"migrate tenant between two backends"`
+		OverridesConfig migrateOverridesConfigCmd `cmd:"" help:"migrate overrides config"`
 	} `cmd:""`
 }
 
@@ -85,7 +97,7 @@ func main() {
 	ctx := kong.Parse(&cli,
 		kong.UsageOnError(),
 		kong.ConfigureHelp(kong.HelpOptions{
-			//Compact: true,
+			Compact: true,
 		}),
 	)
 	err := ctx.Run(&cli.globalOptions)
@@ -122,6 +134,17 @@ func loadBackend(b *backendOptions, g *globalOptions) (backend.Reader, backend.W
 		cfg.StorageConfig.Trace.Azure.ContainerName = b.Bucket
 	}
 
+	cfg.StorageConfig.Trace.S3.InsecureSkipVerify = b.InsecureSkipVerify
+	cfg.StorageConfig.Trace.GCS.Insecure = b.InsecureSkipVerify
+
+	if b.S3User != "" {
+		cfg.StorageConfig.Trace.S3.AccessKey = b.S3User
+	}
+
+	if b.S3Pass != "" {
+		cfg.StorageConfig.Trace.S3.SecretKey = flagext.SecretWithValue(b.S3Pass)
+	}
+
 	if b.S3Endpoint != "" {
 		cfg.StorageConfig.Trace.S3.Endpoint = b.S3Endpoint
 	}
@@ -132,13 +155,13 @@ func loadBackend(b *backendOptions, g *globalOptions) (backend.Reader, backend.W
 	var c backend.Compactor
 
 	switch cfg.StorageConfig.Trace.Backend {
-	case "local":
+	case backend.Local:
 		r, w, c, err = local.New(cfg.StorageConfig.Trace.Local)
-	case "gcs":
+	case backend.GCS:
 		r, w, c, err = gcs.New(cfg.StorageConfig.Trace.GCS)
-	case "s3":
+	case backend.S3:
 		r, w, c, err = s3.New(cfg.StorageConfig.Trace.S3)
-	case "azure":
+	case backend.Azure:
 		r, w, c, err = azure.New(cfg.StorageConfig.Trace.Azure)
 	default:
 		err = fmt.Errorf("unknown backend %s", cfg.StorageConfig.Trace.Backend)

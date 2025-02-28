@@ -1,16 +1,5 @@
 // Copyright (c) 2018-2019 The Jaeger Authors.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package grpc
 
@@ -20,7 +9,8 @@ import (
 	"fmt"
 	"strings"
 
-	grpc_retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/retry"
+	"go.opentelemetry.io/collector/config/configtls"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
@@ -30,23 +20,21 @@ import (
 	"google.golang.org/grpc/resolver/manual"
 
 	"github.com/jaegertracing/jaeger/cmd/agent/app/reporter"
-	"github.com/jaegertracing/jaeger/pkg/config/tlscfg"
 	"github.com/jaegertracing/jaeger/pkg/discovery"
 	"github.com/jaegertracing/jaeger/pkg/discovery/grpcresolver"
 	"github.com/jaegertracing/jaeger/pkg/metrics"
+	"github.com/jaegertracing/jaeger/pkg/netutils"
 )
 
 // ConnBuilder Struct to hold configurations
 type ConnBuilder struct {
 	// CollectorHostPorts is list of host:port Jaeger Collectors.
 	CollectorHostPorts []string `yaml:"collectorHostPorts"`
-
-	MaxRetry uint
-	TLS      tlscfg.Options
-
-	DiscoveryMinPeers int
-	Notifier          discovery.Notifier
-	Discoverer        discovery.Discoverer
+	TLS                *configtls.ClientConfig
+	MaxRetry           uint
+	DiscoveryMinPeers  int
+	Notifier           discovery.Notifier
+	Discoverer         discovery.Discoverer
 
 	AdditionalDialOptions []grpc.DialOption
 }
@@ -57,16 +45,15 @@ func NewConnBuilder() *ConnBuilder {
 }
 
 // CreateConnection creates the gRPC connection
-func (b *ConnBuilder) CreateConnection(logger *zap.Logger, mFactory metrics.Factory) (*grpc.ClientConn, error) {
+func (b *ConnBuilder) CreateConnection(ctx context.Context, logger *zap.Logger, mFactory metrics.Factory) (*grpc.ClientConn, error) {
 	var dialOptions []grpc.DialOption
 	var dialTarget string
-	if b.TLS.Enabled { // user requested a secure connection
+	if b.TLS != nil { // user requested a secure connection
 		logger.Info("Agent requested secure grpc connection to collector(s)")
-		tlsConf, err := b.TLS.Config(logger)
+		tlsConf, err := b.TLS.LoadTLSConfig(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load TLS config: %w", err)
 		}
-
 		creds := credentials.NewTLS(tlsConf)
 		dialOptions = append(dialOptions, grpc.WithTransportCredentials(creds))
 	} else { // insecure connection
@@ -82,6 +69,7 @@ func (b *ConnBuilder) CreateConnection(logger *zap.Logger, mFactory metrics.Fact
 		if b.CollectorHostPorts == nil {
 			return nil, errors.New("at least one collector hostPort address is required when resolver is not available")
 		}
+		b.CollectorHostPorts = netutils.FixLocalhost(b.CollectorHostPorts)
 		if len(b.CollectorHostPorts) > 1 {
 			r := manual.NewBuilderWithScheme("jaeger-manual")
 			dialOptions = append(dialOptions, grpc.WithResolvers(r))
@@ -97,10 +85,10 @@ func (b *ConnBuilder) CreateConnection(logger *zap.Logger, mFactory metrics.Fact
 		}
 	}
 	dialOptions = append(dialOptions, grpc.WithDefaultServiceConfig(grpcresolver.GRPCServiceConfig))
-	dialOptions = append(dialOptions, grpc.WithUnaryInterceptor(grpc_retry.UnaryClientInterceptor(grpc_retry.WithMax(b.MaxRetry))))
+	dialOptions = append(dialOptions, grpc.WithUnaryInterceptor(retry.UnaryClientInterceptor(retry.WithMax(b.MaxRetry))))
 	dialOptions = append(dialOptions, b.AdditionalDialOptions...)
 
-	conn, err := grpc.Dial(dialTarget, dialOptions...)
+	conn, err := grpc.NewClient(dialTarget, dialOptions...)
 	if err != nil {
 		return nil, err
 	}
@@ -113,16 +101,22 @@ func (b *ConnBuilder) CreateConnection(logger *zap.Logger, mFactory metrics.Fact
 		logger.Info("Checking connection to collector")
 
 		for {
-			s := cc.GetState()
-			if s == connectivity.Ready {
-				cm.OnConnectionStatusChange(true)
-				cm.RecordTarget(cc.Target())
-			} else {
-				cm.OnConnectionStatusChange(false)
-			}
+			select {
+			case <-ctx.Done():
+				logger.Info("Stopping connection")
+				return
+			default:
+				s := cc.GetState()
+				if s == connectivity.Ready {
+					cm.OnConnectionStatusChange(true)
+					cm.RecordTarget(cc.Target())
+				} else {
+					cm.OnConnectionStatusChange(false)
+				}
 
-			logger.Info("Agent collector connection state change", zap.String("dialTarget", dialTarget), zap.Stringer("status", s))
-			cc.WaitForStateChange(context.Background(), s)
+				logger.Info("Agent collector connection state change", zap.String("dialTarget", dialTarget), zap.Stringer("status", s))
+				cc.WaitForStateChange(ctx, s)
+			}
 		}
 	}(conn, connectMetrics)
 

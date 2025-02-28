@@ -4,6 +4,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	"encoding/binary"
+	"errors"
 	"io"
 	"math/rand"
 	"os"
@@ -12,12 +13,13 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/util/test"
 	"github.com/grafana/tempo/tempodb/backend"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // Note: Standard wal block functionality (appending, searching, finding, etc.) is tested with all other wal blocks
@@ -164,11 +166,20 @@ func TestAdjustTimeRangeForSlack(t *testing.T) {
 	actualStart, actualEnd = a.adjustTimeRangeForSlack(start, end, time.Hour)
 	assert.Equal(t, start, actualStart)
 	assert.Equal(t, end, actualEnd)
+
+	// test start and end out of range
+	now = uint32(time.Now().Unix())
+	start = uint32(time.Now().Add(5 * -time.Hour).Unix())
+	end = uint32(time.Now().Add(4 * -time.Hour).Unix())
+	actualStart, actualEnd = a.adjustTimeRangeForSlack(start, end, 0)
+	assert.Equal(t, now, actualStart)
+	assert.Equal(t, now, actualEnd)
 }
 
 func TestPartialBlock(t *testing.T) {
 	blockID := uuid.New()
-	block, err := createWALBlock(blockID, testTenantID, t.TempDir(), backend.EncSnappy, "v2", 0)
+	meta := backend.NewBlockMeta(testTenantID, blockID, "v2", backend.EncSnappy, model.CurrentEncoding)
+	block, err := createWALBlock(meta, t.TempDir(), model.CurrentEncoding, 0)
 	require.NoError(t, err, "unexpected error creating block")
 
 	enc := model.MustNewSegmentDecoder(model.CurrentEncoding)
@@ -190,7 +201,7 @@ func TestPartialBlock(t *testing.T) {
 		b2, err := enc.ToObject([][]byte{b1})
 		require.NoError(t, err)
 
-		err = block.Append(id, b2, 0, 0)
+		err = block.Append(id, b2, 0, 0, true)
 		require.NoError(t, err)
 	}
 
@@ -200,7 +211,7 @@ func TestPartialBlock(t *testing.T) {
 	_, err = crand.Read(garbo)
 	require.NoError(t, err)
 
-	appendFile, err := os.OpenFile(v2Block.fullFilename(), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	appendFile, err := os.OpenFile(v2Block.fullFilename(), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
 	require.NoError(t, err)
 	_, err = appendFile.Write(garbo)
 	require.NoError(t, err)
@@ -214,7 +225,7 @@ func TestPartialBlock(t *testing.T) {
 	require.NoError(t, err)
 	for {
 		_, bytesObject, err := bytesIter.NextBytes(context.Background())
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		require.NoError(t, err)
@@ -226,7 +237,6 @@ func TestPartialBlock(t *testing.T) {
 		i++
 	}
 	require.Equal(t, numMsgs, i)
-
 }
 
 func TestParseFilename(t *testing.T) {

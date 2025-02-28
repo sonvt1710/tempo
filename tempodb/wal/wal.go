@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,8 +9,6 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/google/uuid"
-
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
 	"github.com/grafana/tempo/tempodb/encoding"
@@ -27,16 +26,18 @@ type WAL struct {
 }
 
 type Config struct {
-	Filepath          string `yaml:"path"`
-	CompletedFilepath string
-	BlocksFilepath    string
-	Encoding          backend.Encoding `yaml:"v2_encoding"`
-	SearchEncoding    backend.Encoding `yaml:"search_encoding"`
-	IngestionSlack    time.Duration    `yaml:"ingestion_time_range_slack"`
-	Version           string           `yaml:"version,omitempty"`
+	Filepath       string           `yaml:"path"`
+	Encoding       backend.Encoding `yaml:"v2_encoding"`
+	SearchEncoding backend.Encoding `yaml:"search_encoding"`
+	IngestionSlack time.Duration    `yaml:"ingestion_time_range_slack"`
+	Version        string           `yaml:"version,omitempty"`
 }
 
-func ValidateConfig(c *Config) error {
+func (c *Config) RegisterFlags(*flag.FlagSet) {
+	c.IngestionSlack = 2 * time.Minute
+}
+
+func (c *Config) Validate() error {
 	if _, err := encoding.FromVersion(c.Version); err != nil {
 		return fmt.Errorf("failed to validate block version %s: %w", c.Version, err)
 	}
@@ -50,34 +51,20 @@ func New(c *Config) (*WAL, error) {
 	}
 
 	// make folder
-	err := os.MkdirAll(c.Filepath, os.ModePerm)
+	err := os.MkdirAll(c.Filepath, 0o700)
 	if err != nil {
 		return nil, err
-	}
-
-	// The /completed/ folder is now obsolete and no new data is written,
-	// but it needs to be cleared out one last time for any files left
-	// from a previous version.
-	if c.CompletedFilepath == "" {
-		completedFilepath := filepath.Join(c.Filepath, completedDir)
-		err = os.RemoveAll(completedFilepath)
-		if err != nil {
-			return nil, err
-		}
-
-		c.CompletedFilepath = completedFilepath
 	}
 
 	// Setup local backend in /blocks/
-	p := filepath.Join(c.Filepath, blocksDir)
-	err = os.MkdirAll(p, os.ModePerm)
+	blocksFolderPath := filepath.Join(c.Filepath, blocksDir)
+	err = os.MkdirAll(blocksFolderPath, 0o700)
 	if err != nil {
 		return nil, err
 	}
-	c.BlocksFilepath = p
 
 	l, err := local.NewBackend(&local.Config{
-		Path: p,
+		Path: blocksFolderPath,
 	})
 	if err != nil {
 		return nil, err
@@ -154,25 +141,20 @@ func (w *WAL) RescanBlocks(additionalStartSlack time.Duration, log log.Logger) (
 	return blocks, nil
 }
 
-func (w *WAL) NewBlock(id uuid.UUID, tenantID string, dataEncoding string) (common.WALBlock, error) {
-	return w.newBlock(id, tenantID, dataEncoding, w.c.Version)
-}
-
-func (w *WAL) newBlock(id uuid.UUID, tenantID string, dataEncoding string, blockVersion string) (common.WALBlock, error) {
-	v, err := encoding.FromVersion(blockVersion)
+func (w *WAL) NewBlock(meta *backend.BlockMeta, dataEncoding string) (common.WALBlock, error) {
+	v, err := encoding.FromVersion(w.c.Version)
 	if err != nil {
 		return nil, err
 	}
-	return v.CreateWALBlock(id, tenantID, w.c.Filepath, w.c.Encoding, dataEncoding, w.c.IngestionSlack)
+	return v.CreateWALBlock(meta, w.c.Filepath, dataEncoding, w.c.IngestionSlack)
 }
 
 func (w *WAL) GetFilepath() string {
 	return w.c.Filepath
 }
 
-func (w *WAL) ClearFolder(dir string) error {
-	p := filepath.Join(w.c.Filepath, dir)
-	return os.RemoveAll(p)
+func (w *WAL) Clear() error {
+	return os.RemoveAll(w.c.Filepath)
 }
 
 func (w *WAL) LocalBackend() *local.Backend {

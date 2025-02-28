@@ -1,16 +1,5 @@
-// Copyright  The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package auth // import "go.opentelemetry.io/collector/extension/auth"
 
@@ -29,7 +18,7 @@ import (
 type Server interface {
 	extension.Extension
 
-	// Authenticate checks whether the given headers map contains valid auth data. Successfully authenticated calls will always return a nil error.
+	// Authenticate checks whether the given map contains valid auth data. Successfully authenticated calls will always return a nil error.
 	// When the authentication fails, an error must be returned and the caller must not retry. This function is typically called from interceptors,
 	// on behalf of receivers, but receivers can still call this directly if the usage of interceptors isn't suitable.
 	// The deadline and cancellation given to this function must be respected, but note that authentication data has to be part of the map, not context.
@@ -37,7 +26,7 @@ type Server interface {
 	// authentication data (if possible). This will allow other components in the pipeline to make decisions based on that data, such as routing based
 	// on tenancy as determined by the group membership, or passing through the authentication data to the next collector/backend.
 	// The context keys to be used are not defined yet.
-	Authenticate(ctx context.Context, headers map[string][]string) (context.Context, error)
+	Authenticate(ctx context.Context, sources map[string][]string) (context.Context, error)
 }
 
 type defaultServer struct {
@@ -47,40 +36,48 @@ type defaultServer struct {
 }
 
 // ServerOption represents the possible options for NewServer.
-type ServerOption func(*defaultServer)
+type ServerOption interface {
+	apply(*defaultServer)
+}
+
+type serverOptionFunc func(*defaultServer)
+
+func (of serverOptionFunc) apply(e *defaultServer) {
+	of(e)
+}
 
 // ServerAuthenticateFunc defines the signature for the function responsible for performing the authentication based
-// on the given headers map. See Server.Authenticate.
-type ServerAuthenticateFunc func(ctx context.Context, headers map[string][]string) (context.Context, error)
+// on the given sources map. See Server.Authenticate.
+type ServerAuthenticateFunc func(ctx context.Context, sources map[string][]string) (context.Context, error)
 
-func (f ServerAuthenticateFunc) Authenticate(ctx context.Context, headers map[string][]string) (context.Context, error) {
+func (f ServerAuthenticateFunc) Authenticate(ctx context.Context, sources map[string][]string) (context.Context, error) {
 	if f == nil {
 		return ctx, nil
 	}
-	return f(ctx, headers)
+	return f(ctx, sources)
 }
 
 // WithServerAuthenticate specifies which function to use to perform the authentication.
 func WithServerAuthenticate(authFunc ServerAuthenticateFunc) ServerOption {
-	return func(o *defaultServer) {
+	return serverOptionFunc(func(o *defaultServer) {
 		o.ServerAuthenticateFunc = authFunc
-	}
+	})
 }
 
 // WithServerStart overrides the default `Start` function for a component.Component.
 // The default always returns nil.
 func WithServerStart(startFunc component.StartFunc) ServerOption {
-	return func(o *defaultServer) {
+	return serverOptionFunc(func(o *defaultServer) {
 		o.StartFunc = startFunc
-	}
+	})
 }
 
 // WithServerShutdown overrides the default `Shutdown` function for a component.Component.
 // The default always returns nil.
 func WithServerShutdown(shutdownFunc component.ShutdownFunc) ServerOption {
-	return func(o *defaultServer) {
+	return serverOptionFunc(func(o *defaultServer) {
 		o.ShutdownFunc = shutdownFunc
-	}
+	})
 }
 
 // NewServer returns a Server configured with the provided options.
@@ -88,7 +85,7 @@ func NewServer(options ...ServerOption) Server {
 	bc := &defaultServer{}
 
 	for _, op := range options {
-		op(bc)
+		op.apply(bc)
 	}
 
 	return bc

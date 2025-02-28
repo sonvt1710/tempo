@@ -1,17 +1,6 @@
 // Copyright (c) 2022 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package metrics
 
@@ -32,7 +21,7 @@ import (
 // of type Counter or Gauge or Timer.
 //
 // Errors during Init lead to a panic.
-func MustInit(metrics interface{}, factory Factory, globalTags map[string]string) {
+func MustInit(metrics any, factory Factory, globalTags map[string]string) {
 	if err := Init(metrics, factory, globalTags); err != nil {
 		panic(err.Error())
 	}
@@ -40,7 +29,7 @@ func MustInit(metrics interface{}, factory Factory, globalTags map[string]string
 
 // Init does the same as MustInit, but returns an error instead of
 // panicking.
-func Init(m interface{}, factory Factory, globalTags map[string]string) error {
+func Init(m any, factory Factory, globalTags map[string]string) error {
 	// Allow user to opt out of reporting metrics by passing in nil.
 	if factory == nil {
 		factory = NullFactory
@@ -77,12 +66,13 @@ func Init(m interface{}, factory Factory, globalTags map[string]string) error {
 			}
 		}
 		if bucketString := field.Tag.Get("buckets"); bucketString != "" {
-			if field.Type.AssignableTo(timerPtrType) {
+			switch {
+			case field.Type.AssignableTo(timerPtrType):
 				// TODO: Parse timer duration buckets
 				return fmt.Errorf(
 					"Field [%s]: Buckets are not currently initialized for timer metrics",
 					field.Name)
-			} else if field.Type.AssignableTo(histogramPtrType) {
+			case field.Type.AssignableTo(histogramPtrType):
 				bucketValues := strings.Split(bucketString, ",")
 				for _, bucket := range bucketValues {
 					b, err := strconv.ParseFloat(bucket, 64)
@@ -93,41 +83,42 @@ func Init(m interface{}, factory Factory, globalTags map[string]string) error {
 					}
 					buckets = append(buckets, b)
 				}
-			} else {
+			default:
 				return fmt.Errorf(
 					"Field [%s]: Buckets should only be defined for Timer and Histogram metric types",
 					field.Name)
 			}
 		}
 		help := field.Tag.Get("help")
-		var obj interface{}
-		if field.Type.AssignableTo(counterPtrType) {
+		var obj any
+		switch {
+		case field.Type.AssignableTo(counterPtrType):
 			obj = factory.Counter(Options{
 				Name: metric,
 				Tags: tags,
 				Help: help,
 			})
-		} else if field.Type.AssignableTo(gaugePtrType) {
+		case field.Type.AssignableTo(gaugePtrType):
 			obj = factory.Gauge(Options{
 				Name: metric,
 				Tags: tags,
 				Help: help,
 			})
-		} else if field.Type.AssignableTo(timerPtrType) {
+		case field.Type.AssignableTo(timerPtrType):
 			// TODO: Add buckets once parsed (see TODO above)
 			obj = factory.Timer(TimerOptions{
 				Name: metric,
 				Tags: tags,
 				Help: help,
 			})
-		} else if field.Type.AssignableTo(histogramPtrType) {
+		case field.Type.AssignableTo(histogramPtrType):
 			obj = factory.Histogram(HistogramOptions{
 				Name:    metric,
 				Tags:    tags,
 				Help:    help,
 				Buckets: buckets,
 			})
-		} else {
+		default:
 			return fmt.Errorf(
 				"Field %s is not a pointer to timer, gauge, or counter",
 				field.Name)

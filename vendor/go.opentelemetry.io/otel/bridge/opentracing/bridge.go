@@ -1,23 +1,12 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package opentracing // import "go.opentelemetry.io/otel/bridge/opentracing"
 
 import (
 	"context"
 	"fmt"
-	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -33,10 +22,11 @@ import (
 	iBaggage "go.opentelemetry.io/otel/internal/baggage"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 var (
-	noopTracer = trace.NewNoopTracerProvider().Tracer("")
+	noopTracer = noop.NewTracerProvider().Tracer("")
 	noopSpan   = func() trace.Span {
 		_, s := noopTracer.Start(context.Background(), "")
 		return s
@@ -44,16 +34,16 @@ var (
 )
 
 type bridgeSpanContext struct {
-	bag             baggage.Baggage
-	otelSpanContext trace.SpanContext
+	bag baggage.Baggage
+	trace.SpanContext
 }
 
 var _ ot.SpanContext = &bridgeSpanContext{}
 
 func newBridgeSpanContext(otelSpanContext trace.SpanContext, parentOtSpanContext ot.SpanContext) *bridgeSpanContext {
 	bCtx := &bridgeSpanContext{
-		bag:             baggage.Baggage{},
-		otelSpanContext: otelSpanContext,
+		bag:         baggage.Baggage{},
+		SpanContext: otelSpanContext,
 	}
 	if parentOtSpanContext != nil {
 		parentOtSpanContext.ForeachBaggageItem(func(key, value string) bool {
@@ -73,8 +63,7 @@ func (c *bridgeSpanContext) ForeachBaggageItem(handler func(k, v string) bool) {
 }
 
 func (c *bridgeSpanContext) setBaggageItem(restrictedKey, value string) {
-	crk := http.CanonicalHeaderKey(restrictedKey)
-	m, err := baggage.NewMember(crk, value)
+	m, err := baggage.NewMemberRaw(restrictedKey, value)
 	if err != nil {
 		return
 	}
@@ -82,8 +71,7 @@ func (c *bridgeSpanContext) setBaggageItem(restrictedKey, value string) {
 }
 
 func (c *bridgeSpanContext) baggageItem(restrictedKey string) baggage.Member {
-	crk := http.CanonicalHeaderKey(restrictedKey)
-	return c.bag.Member(crk)
+	return c.bag.Member(restrictedKey)
 }
 
 type bridgeSpan struct {
@@ -317,8 +305,10 @@ type BridgeTracer struct {
 	propagator propagation.TextMapPropagator
 }
 
-var _ ot.Tracer = &BridgeTracer{}
-var _ ot.TracerContextWithSpanExtension = &BridgeTracer{}
+var (
+	_ ot.Tracer                         = &BridgeTracer{}
+	_ ot.TracerContextWithSpanExtension = &BridgeTracer{}
+)
 
 // NewBridgeTracer creates a new BridgeTracer. The new tracer forwards
 // the calls to the OpenTelemetry Noop tracer, so it should be
@@ -425,7 +415,7 @@ func (t *BridgeTracer) StartSpan(operationName string, opts ...ot.StartSpanOptio
 	attributes, kind, hadTrueErrorTag := otTagsToOTelAttributesKindAndError(sso.Tags)
 	checkCtx := migration.WithDeferredSetup(context.Background())
 	if parentBridgeSC != nil {
-		checkCtx = trace.ContextWithRemoteSpanContext(checkCtx, parentBridgeSC.otelSpanContext)
+		checkCtx = trace.ContextWithRemoteSpanContext(checkCtx, parentBridgeSC.SpanContext)
 	}
 	checkCtx2, otelSpan := t.setTracer.tracer().Start(
 		checkCtx,
@@ -543,9 +533,17 @@ func otTagToOTelAttr(k string, v interface{}) attribute.KeyValue {
 	case int64:
 		return key.Int64(val)
 	case uint64:
-		return key.String(fmt.Sprintf("%d", val))
+		return key.String(strconv.FormatUint(val, 10))
 	case float64:
 		return key.Float64(val)
+	case int8:
+		return key.Int64(int64(val))
+	case uint8:
+		return key.Int64(int64(val))
+	case int16:
+		return key.Int64(int64(val))
+	case uint16:
+		return key.Int64(int64(val))
 	case int32:
 		return key.Int64(int64(val))
 	case uint32:
@@ -555,7 +553,7 @@ func otTagToOTelAttr(k string, v interface{}) attribute.KeyValue {
 	case int:
 		return key.Int(val)
 	case uint:
-		return key.String(fmt.Sprintf("%d", val))
+		return key.String(strconv.FormatUint(uint64(val), 10))
 	case string:
 		return key.String(val)
 	default:
@@ -598,7 +596,7 @@ func otSpanReferencesToParentAndLinks(references []ot.SpanReference) (*bridgeSpa
 
 func otSpanReferenceToOTelLink(bridgeSC *bridgeSpanContext, refType ot.SpanReferenceType) trace.Link {
 	return trace.Link{
-		SpanContext: bridgeSC.otelSpanContext,
+		SpanContext: bridgeSC.SpanContext,
 		Attributes:  otSpanReferenceTypeToOTelLinkAttributes(refType),
 	}
 }
@@ -643,7 +641,7 @@ func (t *BridgeTracer) Inject(sm ot.SpanContext, format interface{}, carrier int
 	if !ok {
 		return ot.ErrInvalidSpanContext
 	}
-	if !bridgeSC.otelSpanContext.IsValid() {
+	if !bridgeSC.IsValid() {
 		return ot.ErrInvalidSpanContext
 	}
 
@@ -653,29 +651,29 @@ func (t *BridgeTracer) Inject(sm ot.SpanContext, format interface{}, carrier int
 	}
 
 	var textCarrier propagation.TextMapCarrier
+	var err error
 
 	switch builtinFormat {
 	case ot.HTTPHeaders:
-		hhcarrier, ok := carrier.(ot.HTTPHeadersCarrier)
-		if !ok {
-			return ot.ErrInvalidCarrier
+		if hhcarrier, ok := carrier.(ot.HTTPHeadersCarrier); ok {
+			textCarrier = propagation.HeaderCarrier(hhcarrier)
+		} else {
+			textCarrier, err = newTextMapWrapperForInject(carrier)
 		}
-
-		textCarrier = propagation.HeaderCarrier(hhcarrier)
 	case ot.TextMap:
 		if textCarrier, ok = carrier.(propagation.TextMapCarrier); !ok {
-			var err error
-			if textCarrier, err = newTextMapWrapperForInject(carrier); err != nil {
-				return err
-			}
+			textCarrier, err = newTextMapWrapperForInject(carrier)
 		}
 	default:
-		return ot.ErrUnsupportedFormat
+		err = ot.ErrUnsupportedFormat
+	}
+	if err != nil {
+		return err
 	}
 
 	fs := fakeSpan{
 		Span: noopSpan,
-		sc:   bridgeSC.otelSpanContext,
+		sc:   bridgeSC.SpanContext,
 	}
 	ctx := trace.ContextWithSpan(context.Background(), fs)
 	ctx = baggage.ContextWithBaggage(ctx, bridgeSC.bag)
@@ -694,33 +692,33 @@ func (t *BridgeTracer) Extract(format interface{}, carrier interface{}) (ot.Span
 	}
 
 	var textCarrier propagation.TextMapCarrier
+	var err error
 
 	switch builtinFormat {
 	case ot.HTTPHeaders:
-		hhcarrier, ok := carrier.(ot.HTTPHeadersCarrier)
-		if !ok {
-			return nil, ot.ErrInvalidCarrier
+		if hhcarrier, ok := carrier.(ot.HTTPHeadersCarrier); ok {
+			textCarrier = propagation.HeaderCarrier(hhcarrier)
+		} else {
+			textCarrier, err = newTextMapWrapperForExtract(carrier)
 		}
-
-		textCarrier = propagation.HeaderCarrier(hhcarrier)
 	case ot.TextMap:
 		if textCarrier, ok = carrier.(propagation.TextMapCarrier); !ok {
-			var err error
-			if textCarrier, err = newTextMapWrapperForExtract(carrier); err != nil {
-				return nil, err
-			}
+			textCarrier, err = newTextMapWrapperForExtract(carrier)
 		}
 	default:
-		return nil, ot.ErrUnsupportedFormat
+		err = ot.ErrUnsupportedFormat
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	ctx := t.getPropagator().Extract(context.Background(), textCarrier)
 	bag := baggage.FromContext(ctx)
 	bridgeSC := &bridgeSpanContext{
-		bag:             bag,
-		otelSpanContext: trace.SpanContextFromContext(ctx),
+		bag:         bag,
+		SpanContext: trace.SpanContextFromContext(ctx),
 	}
-	if !bridgeSC.otelSpanContext.IsValid() {
+	if !bridgeSC.IsValid() {
 		return nil, ot.ErrSpanContextNotFound
 	}
 	return bridgeSC, nil
@@ -821,15 +819,13 @@ func newTextMapWrapperForInject(carrier interface{}) (*textMapWrapper, error) {
 	return t, nil
 }
 
-type textMapWriter struct {
-}
+type textMapWriter struct{}
 
 func (t *textMapWriter) Set(key string, value string) {
 	// maybe print a warning log.
 }
 
-type textMapReader struct {
-}
+type textMapReader struct{}
 
 func (t *textMapReader) ForeachKey(handler func(key, val string) error) error {
 	return nil // maybe print a warning log.

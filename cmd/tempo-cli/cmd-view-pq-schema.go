@@ -6,9 +6,8 @@ import (
 	"sort"
 
 	"github.com/google/uuid"
-	"github.com/segmentio/parquet-go"
-
-	"github.com/grafana/tempo/tempodb/encoding/vparquet"
+	"github.com/grafana/tempo/tempodb/encoding/vparquet3"
+	"github.com/parquet-go/parquet-go"
 )
 
 type viewSchemaCmd struct {
@@ -37,8 +36,8 @@ func (cmd *viewSchemaCmd) Run(ctx *globalOptions) error {
 	fmt.Printf("\n***************     block meta    *********************\n\n\n")
 	fmt.Printf("%+v\n", meta)
 
-	rr := vparquet.NewBackendReaderAt(context.Background(), r, vparquet.DataFileName, meta.BlockID, meta.TenantID)
-	pf, err := parquet.OpenFile(rr, int64(meta.Size))
+	rr := vparquet3.NewBackendReaderAt(context.Background(), r, vparquet3.DataFileName, meta)
+	pf, err := parquet.OpenFile(rr, int64(meta.Size_))
 	if err != nil {
 		return err
 	}
@@ -52,8 +51,12 @@ func (cmd *viewSchemaCmd) Run(ctx *globalOptions) error {
 			path, _ := getNodePathByIndex(pf.Root(), "", cc.Column())
 
 			var size int64
-			for pg := 0; pg < cc.OffsetIndex().NumPages(); pg++ {
-				size += cc.OffsetIndex().CompressedPageSize(pg)
+			idx, err := cc.OffsetIndex()
+			if err != nil {
+				return err
+			}
+			for pg := 0; pg < idx.NumPages(); pg++ {
+				size += idx.CompressedPageSize(pg)
 			}
 
 			columnSizes[path] = columnSizes[path] + size
